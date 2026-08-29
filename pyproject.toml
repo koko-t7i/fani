@@ -1,0 +1,38 @@
+# fani -- unattended documentation sync/translation orchestrator.
+#
+# Runtime is stdlib-only on Python 3.13. Dev tools (ruff) are supplied per-run
+# through `uv run --with`, so nothing lands in the dependency table.
+
+[project]
+name = "fani"
+version = "0.1.0"
+description = "Unattended doc translation orchestrator driving the i18n skill"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+fani = "fani.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fani"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests put src/ on sys.path before importing fani, so those imports cannot sit
+# at the top of the file.
+"tests/*.py" = ["E402"]
+
+[tool.pytest.ini_options]
+# unittest discovery works without this; it is here so `pytest` works too.
+pythonpath = ["src"]
+testpaths = ["tests"]
