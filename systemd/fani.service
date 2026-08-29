@@ -1,0 +1,44 @@
+# A single fani run. Install as a user unit:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/fani.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now fani.timer
+#
+# Check on it with `systemctl --user list-timers fani.timer` and
+# `journalctl --user -u fani.service -n 50`.
+
+[Unit]
+Description=Translate documentation that is out of date
+Documentation=https://github.com/koko/fani
+# Nothing to do without a network: every agent call is a remote API call.
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/fani
+ExecStart=%h/.local/bin/fani sync --config %h/fani/fani.toml --report-dir %h/fani/reports
+
+# Agent CLIs read their credentials from here. Keep the file mode 600; systemd
+# reads it as root before dropping to the user.
+EnvironmentFile=-%h/.config/fani/env
+
+# A run is bounded by max_tasks, but an agent that hangs past its own timeout
+# should not hold the schedule forever.
+TimeoutStartSec=2h
+
+# Exit codes are the interface: 0 nothing to do or done, 1 needs a human,
+# 2 broken, 3 partial (more chunks remain). Only 2 counts as a failure worth
+# alerting on; 1 and 3 are normal outcomes that the report explains.
+SuccessExitStatus=0 1 3
+
+# fani writes only inside the repositories it is configured for and its report
+# directory, so it does not need the rest of the filesystem.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=%h/fani %h/code
+
+[Install]
+WantedBy=default.target

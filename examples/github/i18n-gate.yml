@@ -1,0 +1,63 @@
+# Copy into .github/workflows/ of the repository being translated.
+#
+# This is the gate, not the translator. It runs in seconds and only checks that
+# what landed is structurally sound: placeholders intact, fences balanced, no
+# translation left behind by an edited source. The translating itself happens
+# outside CI, because it takes minutes to hours and CI should not wait for it.
+#
+# The loop closes because fani pushes a branch, the branch becomes a pull
+# request, and the pull request runs this gate.
+
+name: i18n gate
+
+on:
+  pull_request:
+    branches: ["**"]
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [zh-CN, ja]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # plan compares translations against their sources across commits.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Check out the i18n skill
+        uses: actions/checkout@v4
+        with:
+          repository: your-org/i18n-skill
+          path: .i18n-skill
+
+      - name: Verify existing translations
+        run: .i18n-skill/i18n/scripts/run.sh verify --lang ${{ matrix.lang }} --json
+
+      - name: Report what is out of date
+        # Exit 1 means a human edited a translation by hand; that is worth
+        # knowing about but must not fail the gate on an unrelated pull request.
+        run: |
+          .i18n-skill/i18n/scripts/run.sh plan --lang ${{ matrix.lang }} --json \
+            > plan-${{ matrix.lang }}.json || true
+          python - <<'PY'
+          import json, os, pathlib
+          plan = json.loads(pathlib.Path("plan-${{ matrix.lang }}.json").read_text())
+          stale = [f["file"] for f in plan["files"] if f["status"] != "ok"]
+          summary = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a") as fh:
+              fh.write(f"### ${{ matrix.lang }}: {len(stale)} file(s) out of date\n")
+              for path in stale[:50]:
+                  fh.write(f"- `{path}`\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: i18n-plan-${{ matrix.lang }}
+          path: plan-${{ matrix.lang }}.json

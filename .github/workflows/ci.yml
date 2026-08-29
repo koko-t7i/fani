@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv run --with ruff ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      # The end-to-end tests need a real i18n skill; without one they skip, and
+      # a run where they silently skipped is not the run we want on main.
+      - name: Check out the i18n skill
+        uses: actions/checkout@v4
+        with:
+          repository: your-org/i18n-skill
+          path: .i18n-skill
+
+      - name: Run the suite
+        env:
+          FANI_TEST_SKILL: ${{ github.workspace }}/.i18n-skill/i18n
+        run: uv run --python 3.13 --no-project python -m unittest discover tests -v

@@ -23,6 +23,18 @@ translate = "fake"
 """
 
 
+class ExampleConfigTest(unittest.TestCase):
+    """The shipped example is the documentation; it has to stay loadable."""
+
+    def test_example_config_parses(self):
+        path = Path(__file__).resolve().parent.parent / "examples" / "fani.toml"
+        cfg = config.load(path)
+        self.assertEqual(len(cfg.repos), 2)
+        self.assertEqual(cfg.agent_for("translate").name, "claude")
+        self.assertTrue(str(cfg.skill).startswith("/"))  # ~ was expanded
+        self.assertFalse(cfg.repos[1].commit)
+
+
 class ConfigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

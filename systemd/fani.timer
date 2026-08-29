@@ -1,0 +1,24 @@
+# Runs fani.service on a schedule.
+#
+# Hourly is a reasonable starting point: the run exits in seconds when nothing
+# changed, and a run that hit max_tasks exits 3 so the next tick continues it.
+
+[Unit]
+Description=Hourly documentation translation
+Requires=fani.service
+
+[Timer]
+OnCalendar=hourly
+
+# Spread the load and avoid every machine calling the same API on the hour.
+RandomizedDelaySec=10m
+
+# Catch up after a laptop was asleep or the machine was off.
+Persistent=true
+
+# The per-repository lock already refuses a second concurrent run; this keeps
+# the timer from queueing them up in the first place.
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

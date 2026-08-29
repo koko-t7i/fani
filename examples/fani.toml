@@ -1,0 +1,91 @@
+# fani configuration. Copy this next to your repositories and edit the paths.
+#
+# Rule of thumb: this file decides *what* gets translated and *by whom*. It
+# never contains secrets — agent CLIs read their API keys from the environment.
+
+# The i18n skill directory: the one containing scripts/run.sh.
+skill = "~/.claude/skills/i18n"
+
+
+# --- repositories ------------------------------------------------------------
+# One [[repo]] block per repository. Everything except path and languages has a
+# working default.
+
+[[repo]]
+path = "~/code/product-docs"
+languages = ["zh-CN", "ja"]
+
+# Which sources to consider. Empty means "every Markdown file the skill finds".
+paths = ["docs/**/*.md", "README.md"]
+exclude = ["docs/archive/**", "CHANGELOG.md"]
+
+# Where the skill keeps its translation memory, relative to the repository.
+state_dir = ".claude/i18n"
+
+# Chunks per run. A run that hits this ceiling exits 3 (partial) and the next
+# run continues where it stopped; lower it to keep individual runs short.
+max_tasks = 40
+
+# How many times a failed structural check may be sent back to the agent
+# before the run stops and asks for a human.
+repair_budget = 2
+
+# Stop the run when a repository that already has translations suddenly needs
+# this many fresh chunks. That normally means the translation memory was lost,
+# and continuing would re-translate — and re-bill — everything.
+full_retranslate_guard = 30
+
+# Where translations are committed. The branch is reused across runs, so one
+# pull request per language accumulates the work instead of one per run.
+branch = "i18n/{lang}"
+commit = true
+push = false
+remote = "origin"
+
+# Optional quality passes, off by default. revision reads source and
+# translation together and can block a run; proofread only reports.
+[repo.stages]
+revision = false
+proofread = false
+
+
+[[repo]]
+path = "~/code/handbook"
+languages = ["zh-CN"]
+# A repository you only want translated, never committed to: fani writes the
+# files and leaves them in the working tree for you.
+commit = false
+
+
+# --- agents ------------------------------------------------------------------
+# Each agent is a headless CLI that reads a prompt on stdin and prints the
+# answer on stdout. If yours writes to a file instead, put {output_file} in the
+# command and fani will pass a temporary path and read it back.
+
+[agents.claude]
+cmd = ["claude", "-p", "--output-format", "text"]
+stages = ["translate", "revision"]
+concurrency = 6
+timeout_s = 300
+retries = 2
+
+[agents.codex]
+cmd = ["codex", "exec", "--output-last-message", "{output_file}", "-"]
+stages = ["translate"]
+concurrency = 4
+enabled = false
+
+[agents.grok]
+cmd = ["grok", "--no-tui", "--prompt-file", "-"]
+stages = ["proofread"]
+concurrency = 3
+enabled = false
+
+
+# --- routing -----------------------------------------------------------------
+# Which agent handles which stage. Omit a stage to let fani pick any enabled
+# agent that lists it.
+
+[routing]
+translate = "claude"
+revision = "claude"
