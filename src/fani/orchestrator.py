@@ -26,6 +26,7 @@ from pathlib import Path
 
 from .config import Config, RepoConfig
 from .dispatch import Dispatcher, TaskOutcome
+from .gitout import GitError, Published, publish
 from .skill import Skill, SkillError, findings_for_tasks, task_files
 
 
@@ -50,6 +51,7 @@ class LangOutcome:
     conflicts: list[dict] = field(default_factory=list)
     findings: list[dict] = field(default_factory=list)
     dispatch: list[TaskOutcome] = field(default_factory=list)
+    published: Published = field(default_factory=Published)
     repair_rounds: int = 0
     remaining_tasks: int = 0
     fuzzy_matched: int = 0
@@ -73,6 +75,7 @@ class LangOutcome:
                 }
                 for d in self.dispatch
             ],
+            "published": self.published.to_dict(),
             "repair_rounds": self.repair_rounds,
             "remaining_tasks": self.remaining_tasks,
             "fuzzy_matched": self.fuzzy_matched,
@@ -264,6 +267,18 @@ class Orchestrator:
             if out.status is not Status.OK:
                 out.duration_s = time.monotonic() - started
                 return out
+
+        # Only a run that got this far publishes. A run that needs a human leaves
+        # its work in the tree, uncommitted, where the human will see it.
+        try:
+            out.published = publish(self.repo, lang, out.written)
+            if out.published.commit:
+                self.log(f"    committed {out.published.commit[:9]} on {out.published.branch}")
+        except GitError as exc:
+            out.status = Status.NEEDS_HUMAN
+            out.message = f"translated, but could not commit: {exc}"
+            out.duration_s = time.monotonic() - started
+            return out
 
         if out.remaining_tasks:
             out.status = Status.PARTIAL

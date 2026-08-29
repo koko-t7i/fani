@@ -13,6 +13,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -57,6 +58,7 @@ languages = ["zh-CN"]
 state_dir = ".fani-state"
 max_tasks = {max_tasks}
 repair_budget = {repair_budget}
+commit = {commit}
 
 [agents.fake]
 cmd = ["{python}", "{agent}", "{mode}"]
@@ -89,12 +91,13 @@ class EndToEndTest(unittest.TestCase):
         self.config = base / "fani.toml"
 
     def write_config(self, mode="ok", *, max_tasks=5, repair_budget=1, retries=0,
-                     timeout=60, python=None):
+                     timeout=60, python=None, commit=False):
         self.config.write_text(
             CONFIG.format(
                 skill=SKILL, repo=self.repo, agent=FIXTURES / "fake_agent.py",
                 mode=mode, max_tasks=max_tasks, repair_budget=repair_budget,
                 retries=retries, timeout=timeout, python=python or sys.executable,
+                commit="true" if commit else "false",
             ),
             encoding="utf-8",
         )
@@ -190,6 +193,35 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(self.sync(), 2)
         self.assertFalse(self.target.exists())
         self.assertIn("another run holds", self.report()["languages"][0]["message"])
+
+    @unittest.skipIf(shutil.which("git") is None, "git not installed")
+    def test_a_committing_run_leaves_the_checked_out_branch_alone(self):
+        env = {"HOME": str(self.repo), "PATH": "/usr/bin:/bin",
+               "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@e", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@e"}
+
+        def run_git(*args):
+            return subprocess.run(["git", *args], cwd=self.repo, env=env, text=True,
+                                  capture_output=True, check=True).stdout.strip()
+
+        run_git("init", "-q", "-b", "main")
+        run_git("add", "-A")
+        run_git("commit", "-qm", "sources")
+        before = run_git("rev-parse", "HEAD")
+
+        self.write_config(commit=True)
+        self.assertEqual(self.sync(), 0)
+
+        published = self.report()["languages"][0]["published"]
+        self.assertEqual(published["branch"], "i18n/zh-CN")
+        self.assertTrue(published["commit"])
+        self.assertEqual(run_git("rev-parse", "HEAD"), before)
+        self.assertEqual(run_git("rev-parse", "--abbrev-ref", "HEAD"), "main")
+        committed = run_git("ls-tree", "-r", "--name-only", "i18n/zh-CN").splitlines()
+        self.assertIn("docs/guide.zh-CN.md", committed)
+        self.assertIn(".fani-state/state.json", committed)
+        self.assertFalse([p for p in committed if p.startswith(".fani-state/work/")])
 
     def test_status_plans_without_calling_an_agent(self):
         self.write_config(mode="fail")

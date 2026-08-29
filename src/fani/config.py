@@ -48,6 +48,8 @@ class RepoConfig:
     full_retranslate_guard: int = 30
     branch: str = "i18n/{lang}"
     commit: bool = True
+    push: bool = False
+    remote: str = "origin"
     revision: bool = False
     proofread: bool = False
 
@@ -134,6 +136,8 @@ def _repo(index: int, table: dict) -> RepoConfig:
         full_retranslate_guard=int(table.get("full_retranslate_guard", 30)),
         branch=str(table.get("branch", "i18n/{lang}")),
         commit=bool(table.get("commit", True)),
+        push=bool(table.get("push", False)),
+        remote=str(table.get("remote", "origin")),
         revision=bool(stages.get("revision", False)),
         proofread=bool(stages.get("proofread", False)),
     )

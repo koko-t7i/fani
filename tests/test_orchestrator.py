@@ -66,13 +66,16 @@ class OrchestratorTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
-        self.repo = RepoConfig(path=self.root, languages=("zh-CN",), state_dir=".")
+        self.repo = RepoConfig(path=self.root, languages=("zh-CN",), state_dir=".", commit=False)
         self.cfg = Config(skill=self.root, repos=(self.repo,), agents={"fake": AGENT},
                           routing={"translate": "fake", "revision": "fake"})
 
     def build(self, skill, **repo_kw) -> Orchestrator:
         if repo_kw:
-            self.repo = RepoConfig(path=self.root, languages=("zh-CN",), state_dir=".", **repo_kw)
+            self.repo = RepoConfig(
+                path=self.root, languages=("zh-CN",), state_dir=".",
+                **{"commit": False, **repo_kw},
+            )
         orch = Orchestrator(self.cfg, self.repo)
         orch.skill = skill
         orch._dispatch = lambda work, kind, findings, stage: []
@@ -217,6 +220,16 @@ class OrchestratorTest(unittest.TestCase):
         skill = StubSkill(self.root, plans=[plan_result(task_count=1)])
         self.build(skill).run_language("zh-CN")
         self.assertNotIn("review-plan", skill.calls)
+
+    def test_a_repository_that_cannot_be_committed_to_needs_human(self):
+        skill = StubSkill(
+            self.root,
+            plans=[plan_result(task_count=1)],
+            applies=[SkillResult(0, {"written": [{"path": "a.md"}], "rejected": []}, "", "")],
+        )
+        out = self.build(skill, commit=True).run_language("zh-CN")
+        self.assertIs(out.status, Status.NEEDS_HUMAN)
+        self.assertIn("could not commit", out.message)
 
     def test_skill_failure_becomes_error(self):
         class Boom(StubSkill):

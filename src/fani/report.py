@@ -56,6 +56,7 @@ def build(outcomes: list[LangOutcome], started_at: float, config_path: Path) -> 
             "repair_rounds": sum(o.repair_rounds for o in outcomes),
             "remaining_tasks": sum(o.remaining_tasks for o in outcomes),
             "fuzzy_matched": sum(o.fuzzy_matched for o in outcomes),
+            "commits": sum(1 for o in outcomes if o.published.commit),
         },
         "languages": [o.to_dict() for o in outcomes],
     }
@@ -78,15 +79,17 @@ def render(data: dict) -> str:
 
     if data["languages"]:
         lines += [
-            "| repo | lang | status | written | findings | agent calls | time |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| repo | lang | status | written | findings | agent calls | commit | time |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for lang in data["languages"]:
             label = _LABEL[Status(lang["status"])]
+            pub = lang.get("published", {})
+            commit = f"`{pub['commit'][:9]}` on `{pub['branch']}`" if pub.get("commit") else "—"
             lines.append(
                 f"| {Path(lang['repo']).name} | {lang['lang']} | {label} | "
                 f"{len(lang['written'])} | {len(lang['findings'])} | "
-                f"{len(lang['dispatch'])} | {lang['duration_s']:.1f}s |"
+                f"{len(lang['dispatch'])} | {commit} | {lang['duration_s']:.1f}s |"
             )
         lines.append("")
 
