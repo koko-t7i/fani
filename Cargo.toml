@@ -1,0 +1,34 @@
+[package]
+name = "fani"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Unattended documentation translation orchestrator"
+license = "MIT"
+
+[[bin]]
+name = "fani"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+nix = { version = "0.30", features = ["fs", "process", "signal"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+toml = "0.9"
+wait-timeout = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

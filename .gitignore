@@ -6,4 +6,5 @@ venv/
 .pytest_cache/
 uv.lock
 dist/
+target/
 .DS_Store

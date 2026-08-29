@@ -12,7 +12,15 @@ Modes:
     fenced      wrap the answer in a ```markdown fence (tests normalise())
     envelope    print the {"chunk_id", "translated_text"} JSON the prompts ask for
     mangle      corrupt the @@CODE_BLOCK_n@@ tokens (tests apply's rejection)
+    verifyrepair fail verify once, then produce a structurally valid repair
+    pause       hold a sync long enough to exercise the repository lock
     slow        sleep past any sane timeout
+    forkhold    exit leader while a SIGTERM-ignoring child retains output pipes
+    forkescape  keep a setsid descendant alive across process-group signals
+    orphanok    succeed after detaching a background child
+    noread      never read stdin, exercising prompt-write timeout
+    flood       emit pipe-filling stdout and stderr beyond capture limits
+    outputflood write an oversized answer to the configured output file
     fail        exit non-zero
     review      print a findings JSON document
     flaky       fail on the first call, succeed afterwards (uses a counter file)
@@ -21,6 +29,7 @@ Modes:
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -61,10 +70,90 @@ def translate(text: str) -> str:
 
 def main() -> int:
     mode = sys.argv[1] if len(sys.argv) > 1 else "ok"
+    if mode == "noread":
+        time.sleep(30)
+        return 0
     prompt = sys.stdin.read()
 
     if mode == "slow":
         time.sleep(30)
+        return 0
+    if mode == "orphanok":
+        pid_file = os.environ["FAKE_AGENT_CHILD_PID"]
+        child_code = (
+            "import os, time; "
+            "pid=os.fork(); "
+            "os._exit(0) if pid else None; "
+            "os.setsid(); "
+            f"open({pid_file!r}, 'w', encoding='utf-8').write(str(os.getpid())); "
+            "time.sleep(30)"
+        )
+        subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 2
+        while not os.path.exists(pid_file) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        mode = "ok"
+    if mode == "pause":
+        time.sleep(1)
+        mode = "ok"
+    if mode == "forkslow":
+        child = subprocess.Popen(["sleep", "30"])
+        with open(os.environ["FAKE_AGENT_CHILD_PID"], "w", encoding="utf-8") as fh:
+            fh.write(str(child.pid))
+        time.sleep(30)
+        return 0
+    if mode in {"forkhold", "forkescape"}:
+        pid_file = os.environ["FAKE_AGENT_CHILD_PID"]
+        child_code = (
+            "import os, signal, time; "
+            + (
+                "pid=os.fork(); os._exit(0) if pid else None; os.setsid(); "
+                if mode == "forkescape"
+                else ""
+            )
+            + "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            + f"open({pid_file!r}, 'w', encoding='utf-8').write(str(os.getpid())); "
+            + "time.sleep(30)"
+        )
+        subprocess.Popen([sys.executable, "-c", child_code])
+        deadline = time.monotonic() + 2
+        while not os.path.exists(pid_file) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if mode == "forkescape":
+            time.sleep(30)
+        return 0
+    if mode == "concurrency":
+        import fcntl
+        path = os.environ["FAKE_AGENT_CONCURRENCY_FILE"]
+        with open(path, "a+", encoding="utf-8") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.seek(0)
+            parts = (fh.read().strip() or "0 0").split()
+            active, maximum = int(parts[0]), int(parts[1])
+            active += 1
+            maximum = max(maximum, active)
+            fh.seek(0); fh.truncate(); fh.write(f"{active} {maximum}"); fh.flush()
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        time.sleep(0.2)
+        with open(path, "r+", encoding="utf-8") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            active, maximum = map(int, fh.read().split())
+            fh.seek(0); fh.truncate(); fh.write(f"{active - 1} {maximum}"); fh.flush()
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        mode = "ok"
+    if mode == "flood":
+        sys.stderr.write("e" * (1024 * 1024))
+        sys.stderr.flush()
+        sys.stdout.write("x" * (5 * 1024 * 1024))
+        return 0
+    if mode == "outputflood":
+        with open(sys.argv[2], "w", encoding="utf-8") as handle:
+            handle.write("x" * (5 * 1024 * 1024))
         return 0
     if mode == "fail":
         sys.stderr.write("fake agent failing on purpose\n")
@@ -91,6 +180,13 @@ def main() -> int:
 
     if mode == "mangle":
         text = re.sub(r"@@CODE_BLOCK_(\d+)@@", r"@@ CODE_BLOCK_\1 @@", text)
+    if mode == "verifyrepair":
+        counter = os.environ["FAKE_AGENT_COUNTER"]
+        seen = int(open(counter).read() or "0") if os.path.exists(counter) else 0
+        with open(counter, "w", encoding="utf-8") as handle:
+            handle.write(str(seen + 1))
+        if seen == 0:
+            text = text.replace("# [zh] ", "## [zh] ", 1)
     if mode == "fenced":
         print("```markdown")
         print(text)

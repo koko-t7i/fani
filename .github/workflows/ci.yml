@@ -4,30 +4,52 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  lint:
+  rust-quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv run --with ruff ruff check .
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
 
-  test:
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run repository-independent tests
+        run: cargo test --lib --test flow --test process_wrapper
+
+      - name: Install supply-chain checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+      - name: Audit dependencies
+        run: cargo audit
+      - name: Check dependency policy
+        run: cargo deny check
+      - name: Build release binary
+        run: cargo build --release
+
+  real-skill-e2e:
+    if: ${{ vars.FANI_I18N_SKILL_REPOSITORY != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-
-      # The end-to-end tests need a real i18n skill; without one they skip, and
-      # a run where they silently skipped is not the run we want on main.
-      - name: Check out the i18n skill
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check out the external i18n skill
         uses: actions/checkout@v4
         with:
-          repository: your-org/i18n-skill
+          repository: ${{ vars.FANI_I18N_SKILL_REPOSITORY }}
           path: .i18n-skill
-
-      - name: Run the suite
+      - uses: astral-sh/setup-uv@v5
+      - name: Run real-skill end-to-end tests
         env:
-          FANI_TEST_SKILL: ${{ github.workspace }}/.i18n-skill/i18n
-        run: uv run --python 3.13 --no-project python -m unittest discover tests -v
+          FANI_TEST_SKILL: ${{ github.workspace }}/.i18n-skill
+        run: cargo test --test e2e_real_skill -- --nocapture

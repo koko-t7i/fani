@@ -19,7 +19,8 @@ languages = ["zh-CN", "ja"]
 paths = ["docs/**/*.md", "README.md"]
 exclude = ["docs/archive/**", "CHANGELOG.md"]
 
-# Where the skill keeps its translation memory, relative to the repository.
+# Shared state directory, relative to the repository. The external skill keeps
+# translation memory JSON here; fani keeps local run history in fani.db.
 state_dir = ".claude/i18n"
 
 # Chunks per run. A run that hits this ceiling exits 3 (partial) and the next
@@ -43,7 +44,7 @@ push = false
 remote = "origin"
 
 # Optional quality passes, off by default. revision reads source and
-# translation together and can block a run; proofread only reports.
+# translation together and can block a run; proofread runs as advisory only.
 [repo.stages]
 revision = false
 proofread = false

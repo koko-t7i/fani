@@ -17,7 +17,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=%h/fani
-ExecStart=%h/.local/bin/fani sync --config %h/fani/fani.toml --report-dir %h/fani/reports
+ExecStart=%h/.cargo/bin/fani sync --config %h/fani/fani.toml --report-dir %h/fani/reports
 
 # Agent CLIs read their credentials from here. Keep the file mode 600; systemd
 # reads it as root before dropping to the user.
@@ -26,6 +26,9 @@ EnvironmentFile=-%h/.config/fani/env
 # A run is bounded by max_tasks, but an agent that hangs past its own timeout
 # should not hold the schedule forever.
 TimeoutStartSec=2h
+
+# Explicitly terminate every Agent/skill descendant when the service stops.
+KillMode=control-group
 
 # Exit codes are the interface: 0 nothing to do or done, 1 needs a human,
 # 2 broken, 3 partial (more chunks remain). Only 2 counts as a failure worth
