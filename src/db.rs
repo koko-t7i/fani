@@ -1,3 +1,4 @@
+use crate::process::process_identity;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -265,6 +266,22 @@ pub struct AttemptInput<'a> {
     pub request_json: &'a str,
     pub response_json: Option<&'a str>,
     pub error: Option<&'a str>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttemptCandidateInput<'a> {
+    pub attempt: AttemptInput<'a>,
+    pub unit_id: i64,
+    pub locale: &'a str,
+    pub candidate_key: &'a str,
+    pub target_text: &'a str,
+    pub score: Option<f64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredAttempt {
+    pub id: i64,
+    pub output: String,
 }
 
 #[derive(Clone, Debug)]
@@ -742,6 +759,130 @@ impl Database {
         Ok(AttemptReceipt { id, inserted: true })
     }
 
+    pub fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT status FROM attempts WHERE work_item_id=?1 AND dedupe_key=?2",
+                params![work_item_id, dedupe_key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn successful_attempt(
+        &self,
+        work_item_id: i64,
+        dedupe_key: &str,
+    ) -> Result<Option<RecoveredAttempt>> {
+        let row: Option<(i64, String)> = self
+            .connect()?
+            .query_row(
+                "SELECT id,response_json FROM attempts WHERE work_item_id=?1 AND dedupe_key=?2 AND status='succeeded' AND response_json IS NOT NULL",
+                params![work_item_id, dedupe_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(id, response)| {
+            let value: serde_json::Value = serde_json::from_str(&response)
+                .context("durable Agent response is not valid JSON")?;
+            let output = value
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("durable Agent response has no output string"))?;
+            Ok(RecoveredAttempt {
+                id,
+                output: output.to_owned(),
+            })
+        })
+        .transpose()
+    }
+
+    pub fn record_attempt_candidate(
+        &self,
+        input: AttemptCandidateInput<'_>,
+    ) -> Result<AttemptReceipt> {
+        if input.attempt.status != "succeeded" {
+            bail!("only a successful attempt can select a canonical candidate");
+        }
+        require_json(input.attempt.request_json)?;
+        let response = input
+            .attempt
+            .response_json
+            .ok_or_else(|| anyhow!("successful Agent attempt requires a response"))?;
+        require_json(response)?;
+        let persisted_output = serde_json::from_str::<serde_json::Value>(response)?
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("successful Agent response has no output string"))?
+            .to_owned();
+        if persisted_output != input.target_text {
+            bail!("canonical candidate differs from the durable Agent response");
+        }
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(i64, String, String)> = tx
+            .query_row(
+                "SELECT id,status,response_json FROM attempts WHERE work_item_id=?1 AND dedupe_key=?2",
+                params![input.attempt.work_item_id, input.attempt.dedupe_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (attempt_id, inserted) = if let Some((id, status, stored_response)) = existing {
+            if status != "succeeded" || stored_response != response {
+                bail!("durable Agent attempt conflicts with canonical candidate selection");
+            }
+            (id, false)
+        } else {
+            let attempt_no: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(attempt_no),0)+1 FROM attempts WHERE work_item_id=?1",
+                [input.attempt.work_item_id],
+                |row| row.get(0),
+            )?;
+            let now = now_ms();
+            tx.execute(
+                r#"INSERT INTO attempts(work_item_id,dedupe_key,attempt_no,agent,status,request_json,response_json,error,started_at,finished_at)
+                   VALUES (?1,?2,?3,?4,'succeeded',?5,?6,NULL,?7,?7)"#,
+                params![
+                    input.attempt.work_item_id,
+                    input.attempt.dedupe_key,
+                    attempt_no,
+                    input.attempt.agent,
+                    input.attempt.request_json,
+                    response,
+                    now,
+                ],
+            )?;
+            (tx.last_insert_rowid(), true)
+        };
+        tx.execute(
+            "UPDATE canonical_candidates SET selected=0 WHERE unit_id=?1 AND locale=?2 AND selected=1",
+            params![input.unit_id, input.locale],
+        )?;
+        tx.execute(
+            r#"INSERT INTO canonical_candidates(unit_id,locale,candidate_key,target_text,source_attempt_id,score,selected,created_at)
+               VALUES (?1,?2,?3,?4,?5,?6,1,?7)
+               ON CONFLICT(unit_id,locale,candidate_key) DO UPDATE SET
+                 target_text=excluded.target_text,source_attempt_id=excluded.source_attempt_id,
+                 score=excluded.score,selected=1"#,
+            params![
+                input.unit_id,
+                input.locale,
+                input.candidate_key,
+                input.target_text,
+                attempt_id,
+                input.score,
+                now_ms(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(AttemptReceipt {
+            id: attempt_id,
+            inserted,
+        })
+    }
+
     pub fn record_finding(&self, input: FindingInput<'_>) -> Result<i64> {
         let FindingInput {
             work_item_id,
@@ -807,6 +948,44 @@ impl Database {
         Ok(id)
     }
 
+    pub fn supersede_materializations(
+        &self,
+        locale: &str,
+        path: &str,
+        active_dedupe_key: &str,
+    ) -> Result<usize> {
+        let now = now_ms();
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owners = {
+            let mut statement = tx.prepare(
+                r#"SELECT owner FROM materialization_outbox
+                   WHERE dedupe_key<>?3 AND state='processing'
+                     AND json_extract(payload_json,'$.locale')=?1
+                     AND json_extract(payload_json,'$.path')=?2"#,
+            )?;
+            statement
+                .query_map(params![locale, path, active_dedupe_key], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if owners.iter().any(|owner| !dead_process_owner(owner)) {
+            bail!("older materialization for {path} is still owned by a live worker");
+        }
+        let changed = tx.execute(
+            r#"UPDATE materialization_outbox
+               SET state='done',owner=NULL,lease_expires_at=NULL,
+                   last_error='superseded by newer canonical content',completed_at=?4
+               WHERE dedupe_key<>?3 AND state<>'done'
+                 AND json_extract(payload_json,'$.locale')=?1
+                 AND json_extract(payload_json,'$.path')=?2"#,
+            params![locale, path, active_dedupe_key, now],
+        )?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
     pub fn enqueue_materialization(
         &self,
         work_item_id: i64,
@@ -849,6 +1028,24 @@ impl Database {
         )?)
     }
 
+    pub fn update_outbox_payload(
+        &self,
+        kind: OutboxKind,
+        id: i64,
+        owner: &str,
+        payload_json: &str,
+    ) -> Result<bool> {
+        require_json(payload_json)?;
+        let table = outbox_table(kind);
+        let conn = self.connect()?;
+        Ok(conn.execute(
+            &format!(
+                "UPDATE {table} SET payload_json=?3 WHERE id=?1 AND state='processing' AND owner=?2"
+            ),
+            params![id, owner, payload_json],
+        )? == 1)
+    }
+
     pub fn claim_outbox_key(
         &self,
         kind: OutboxKind,
@@ -863,6 +1060,19 @@ impl Database {
         let table = outbox_table(kind);
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let processing_owner: Option<String> = tx
+            .query_row(
+                &format!("SELECT owner FROM {table} WHERE dedupe_key=?1 AND state='processing'"),
+                [dedupe_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if processing_owner.as_deref().is_some_and(dead_process_owner) {
+            tx.execute(
+                &format!("UPDATE {table} SET state='pending',owner=NULL,lease_expires_at=NULL,last_error='worker process exited' WHERE dedupe_key=?1 AND state='processing'"),
+                [dedupe_key],
+            )?;
+        }
         tx.execute(
             &format!("UPDATE {table} SET state='pending',owner=NULL,lease_expires_at=NULL,last_error=COALESCE(last_error,'worker lease expired') WHERE dedupe_key=?1 AND state='processing' AND lease_expires_at<=?2"),
             params![dedupe_key, now],
@@ -901,6 +1111,25 @@ impl Database {
         }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let dead_ids = {
+            let mut statement = tx.prepare(
+                "SELECT id,owner FROM publication_outbox WHERE locale=?1 AND state='processing'",
+            )?;
+            statement
+                .query_map([locale], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter_map(|(id, owner)| dead_process_owner(&owner).then_some(id))
+                .collect::<Vec<_>>()
+        };
+        for id in dead_ids {
+            tx.execute(
+                "UPDATE publication_outbox SET state='pending',owner=NULL,lease_expires_at=NULL,last_error='worker process exited' WHERE id=?1 AND state='processing'",
+                [id],
+            )?;
+        }
         tx.execute(
             "UPDATE publication_outbox SET state='pending',owner=NULL,lease_expires_at=NULL,last_error=COALESCE(last_error,'worker lease expired') WHERE locale=?1 AND state='processing' AND lease_expires_at<=?2",
             params![locale, now],
@@ -1115,7 +1344,12 @@ impl Database {
             )
             .optional()?;
         let lease = match current {
-            Some(current) if current.owner != owner && current.expires_at > now => {
+            Some(current)
+                if current.owner != owner
+                    && current.expires_at > now
+                    && !(resource_type == "repository"
+                        && dead_repository_owner(&current.owner)) =>
+            {
                 tx.commit()?;
                 return Ok(None);
             }
@@ -1260,6 +1494,32 @@ impl Database {
     }
 }
 
+fn process_owner_is_dead(pid: Option<&str>, started_at: Option<&str>) -> bool {
+    let Some((pid, started_at)) = pid
+        .and_then(|value| value.parse::<u32>().ok())
+        .zip(started_at.and_then(|value| value.parse::<u64>().ok()))
+    else {
+        return false;
+    };
+    process_identity(pid).is_none_or(|identity| identity.1 != started_at)
+}
+
+fn dead_repository_owner(owner: &str) -> bool {
+    let mut parts = owner.split(':');
+    process_owner_is_dead(parts.next(), parts.next())
+}
+
+fn dead_process_owner(owner: &str) -> bool {
+    let mut parts = owner.split(':');
+    let Some(kind) = parts.next() else {
+        return false;
+    };
+    if !matches!(kind, "materialize" | "publish") {
+        return false;
+    }
+    process_owner_is_dead(parts.next(), parts.next())
+}
+
 fn outbox_table(kind: OutboxKind) -> &'static str {
     match kind {
         OutboxKind::Materialization => "materialization_outbox",
@@ -1295,4 +1555,26 @@ fn new_id(prefix: &str) -> String {
         std::process::id(),
         ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_owners_detect_pid_reuse_by_start_time() {
+        let (pid, started_at) = process_identity(std::process::id()).unwrap();
+        assert!(!dead_repository_owner(&format!("{pid}:{started_at}:run")));
+        assert!(dead_repository_owner(&format!(
+            "{pid}:{}:run",
+            started_at.saturating_add(1)
+        )));
+        assert!(!dead_process_owner(&format!(
+            "materialize:{pid}:{started_at}:run"
+        )));
+        assert!(dead_process_owner(&format!(
+            "publish:{pid}:{}:run",
+            started_at.saturating_add(1)
+        )));
+    }
 }

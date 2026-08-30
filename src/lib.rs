@@ -2,6 +2,7 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod db;
+mod failpoint;
 pub mod github;
 pub mod gitout;
 pub mod lock;

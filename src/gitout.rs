@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -111,6 +111,43 @@ impl<'a> Git<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_with_date(args, index, check, None)
+    }
+
+    fn run_with_date<I, S>(
+        &self,
+        args: I,
+        index: Option<&Path>,
+        check: bool,
+        commit_date: Option<&str>,
+    ) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_options(args, index, check, commit_date, None)
+    }
+
+    fn run_with_input<I, S>(&self, args: I, input: &[u8], check: bool) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_options(args, None, check, None, Some(input))
+    }
+
+    fn run_with_options<I, S>(
+        &self,
+        args: I,
+        index: Option<&Path>,
+        check: bool,
+        commit_date: Option<&str>,
+        input: Option<&[u8]>,
+    ) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         enable_subreaper()?;
         let started = Instant::now();
         let token = process_token();
@@ -123,6 +160,13 @@ impl<'a> Git<'a> {
             .env("GIT_OPTIONAL_LOCKS", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if input.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        if let Some(commit_date) = commit_date {
+            cmd.env("GIT_AUTHOR_DATE", commit_date)
+                .env("GIT_COMMITTER_DATE", commit_date);
+        }
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
@@ -132,6 +176,10 @@ impl<'a> Git<'a> {
             });
         }
         let (mut child, tracker) = spawn_tracked(&mut cmd, token).context("cannot run git")?;
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().expect("piped Git stdin");
+            stdin.write_all(input)?;
+        }
         let (sender, receiver) = mpsc::channel();
         spawn_git_reader("stdout", child.stdout.take().unwrap(), sender.clone());
         spawn_git_reader("stderr", child.stderr.take().unwrap(), sender);
@@ -325,6 +373,17 @@ pub fn create_candidate(
     changes: &[PathChange],
     message: &str,
 ) -> Result<CandidateCommit> {
+    create_candidate_inner(repo_path, source_ref, branch, changes, message, None)
+}
+
+fn create_candidate_inner(
+    repo_path: &Path,
+    source_ref: &str,
+    branch: &str,
+    changes: &[PathChange],
+    message: &str,
+    contents: Option<&BTreeMap<String, Vec<u8>>>,
+) -> Result<CandidateCommit> {
     let git = Git::new(repo_path);
     if git.run(["rev-parse", "--is-inside-work-tree"], None, false)? != "true" {
         bail!("{} is not a git worktree", repo_path.display());
@@ -335,6 +394,7 @@ pub fn create_candidate(
     let candidate_ref = format!("refs/heads/{branch}");
     let previous_tip = git.rev(&candidate_ref)?;
     let base = source.commit.as_str();
+    let commit_date = git.run(["show", "-s", "--format=%cI", base], None, true)?;
     let base_tree = source.tree.clone();
     let tmp = tempdir().context("cannot create temporary Git index")?;
     let index = tmp.path().join("index");
@@ -376,21 +436,32 @@ pub fn create_candidate(
                 )?;
             }
             ChangeKind::Add | ChangeKind::Modify => {
-                let disk = repo_path.join(&path);
-                let metadata = fs::symlink_metadata(&disk).with_context(|| {
-                    format!("cannot inspect publication path {}", disk.display())
-                })?;
-                if !metadata.file_type().is_file() {
-                    bail!(
-                        "publication path must be a regular file: {}",
-                        disk.display()
-                    );
-                }
-                let oid = git.run(["hash-object", "-w", "--", &path], None, true)?;
-                let mode = if metadata.permissions().mode() & 0o111 == 0 {
-                    "100644"
+                let (oid, mode) = if let Some(contents) = contents {
+                    let content = contents
+                        .get(&path)
+                        .ok_or_else(|| anyhow!("durable publication content is missing {path}"))?;
+                    (
+                        git.run_with_input(["hash-object", "-w", "--stdin"], content, true)?,
+                        "100644",
+                    )
                 } else {
-                    "100755"
+                    let disk = repo_path.join(&path);
+                    let metadata = fs::symlink_metadata(&disk).with_context(|| {
+                        format!("cannot inspect publication path {}", disk.display())
+                    })?;
+                    if !metadata.file_type().is_file() {
+                        bail!(
+                            "publication path must be a regular file: {}",
+                            disk.display()
+                        );
+                    }
+                    let oid = git.run(["hash-object", "-w", "--", &path], None, true)?;
+                    let mode = if metadata.permissions().mode() & 0o111 == 0 {
+                        "100644"
+                    } else {
+                        "100755"
+                    };
+                    (oid, mode)
                 };
                 git.run(
                     ["update-index", "--add", "--cacheinfo", mode, &oid, &path],
@@ -405,10 +476,11 @@ pub fn create_candidate(
     let commit = if tree == base_tree {
         base.to_string()
     } else {
-        git.run(
+        git.run_with_date(
             ["commit-tree", &tree, "-p", base, "-m", message],
             None,
             true,
+            Some(&commit_date),
         )?
     };
     if previous_tip.as_deref() != Some(commit.as_str()) {
@@ -429,6 +501,39 @@ pub fn create_candidate(
         source,
         changes: changes.to_vec(),
     })
+}
+
+pub fn create_candidate_from_contents(
+    repo_path: &Path,
+    source_ref: &str,
+    branch: &str,
+    files: &[(String, Vec<u8>)],
+    message: &str,
+) -> Result<CandidateCommit> {
+    let git = Git::new(repo_path);
+    let source = git.snapshot(source_ref)?;
+    let mut contents = BTreeMap::new();
+    let mut changes = Vec::with_capacity(files.len());
+    for (path, content) in files {
+        let path = checked_path(path)?;
+        if contents.insert(path.clone(), content.clone()).is_some() {
+            bail!("duplicate publication path {path:?}");
+        }
+        let kind = if git.tree_entry(&source.tree, &path)?.is_some() {
+            ChangeKind::Modify
+        } else {
+            ChangeKind::Add
+        };
+        changes.push(PathChange { path, kind });
+    }
+    create_candidate_inner(
+        repo_path,
+        &source.commit,
+        branch,
+        &changes,
+        message,
+        Some(&contents),
+    )
 }
 
 pub fn push_candidate(
@@ -512,6 +617,66 @@ pub fn publish(repo: &RepoConfig, lang: &str, written: &[Value]) -> Result<Publi
                 result.error = format!("could not push commit {}: {error}", result.commit);
             }
         }
+    }
+    Ok(result)
+}
+
+pub fn remote_branch_tip(repo_path: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    Git::new(repo_path).remote_tip(remote, branch)
+}
+
+pub fn publish_pending_with_expected(
+    repo: &RepoConfig,
+    lang: &str,
+    commit: &str,
+    expected_remote_tip: Option<&str>,
+) -> Result<Published> {
+    let branch = repo.publish.branch.replace("{lang}", lang);
+    let mut result = Published {
+        branch: branch.clone(),
+        commit: commit.to_string(),
+        skipped: "retrying a durable publication candidate".into(),
+        ..Published::default()
+    };
+    if !repo.publish.enabled || !repo.publish.push {
+        return Ok(result);
+    }
+    let git = Git::new(&repo.path);
+    let observed = git.remote_tip(&repo.publish.remote, &branch)?;
+    if observed.as_deref() == Some(commit) {
+        result.pushed = true;
+        result.skipped = "the durable publication commit is already remote".into();
+        return Ok(result);
+    }
+    if observed.as_deref() != expected_remote_tip {
+        bail!(
+            "remote publication branch changed: expected {}, found {}",
+            expected_remote_tip.unwrap_or("<absent>"),
+            observed.as_deref().unwrap_or("<absent>")
+        );
+    }
+    let candidate_ref = format!("refs/heads/{branch}");
+    if git.rev(&candidate_ref)?.as_deref() != Some(commit) {
+        bail!("pending commit {commit} is no longer the tip of {candidate_ref}");
+    }
+    let source = git.snapshot(&repo.publish.source_ref)?;
+    let tree = git.run(["rev-parse", &format!("{commit}^{{tree}}")], None, true)?;
+    let candidate = CandidateCommit {
+        branch: branch.clone(),
+        commit: commit.to_string(),
+        tree,
+        previous_tip: Some(commit.to_string()),
+        source,
+        changes: Vec::new(),
+    };
+    match push_candidate(
+        &repo.path,
+        &repo.publish.remote,
+        &candidate,
+        expected_remote_tip,
+    ) {
+        Ok(()) => result.pushed = true,
+        Err(error) => result.error = format!("could not push commit {commit}: {error}"),
     }
     Ok(result)
 }

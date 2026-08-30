@@ -1,4 +1,6 @@
-use fani::gitout::{ChangeKind, PathChange, create_candidate, push_candidate};
+use fani::gitout::{
+    ChangeKind, PathChange, create_candidate, create_candidate_from_contents, push_candidate,
+};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -114,6 +116,65 @@ fn plumbing_publication_preserves_checkout_index_and_unrelated_files() {
     assert!(!deleted.success());
     assert_eq!(git(repo.path(), &["show", "i18n/zh-CN:keep.txt"]), "keep");
     assert_eq!(git(repo.path(), &["show", "i18n/zh-CN:staged.txt"]), "base");
+}
+
+#[test]
+fn durable_content_candidate_ignores_changed_worktree_bytes() {
+    let repo = setup_repo();
+    let source = git(repo.path(), &["rev-parse", "HEAD"]);
+    fs::write(repo.path().join("modify.txt"), "newer worktree bytes\n").unwrap();
+    let candidate = create_candidate_from_contents(
+        repo.path(),
+        &source,
+        "i18n/es",
+        &[("modify.txt".into(), b"durable translation\n".to_vec())],
+        "i18n(es): update",
+    )
+    .unwrap();
+    assert_eq!(
+        git(
+            repo.path(),
+            &["show", &format!("{}:modify.txt", candidate.commit)]
+        ),
+        "durable translation"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("modify.txt")).unwrap(),
+        "newer worktree bytes\n"
+    );
+}
+
+#[test]
+fn candidate_commit_is_stable_across_delayed_replay() {
+    let repo = setup_repo();
+    let source = git(repo.path(), &["rev-parse", "HEAD"]);
+    fs::write(repo.path().join("modify.txt"), "translated\n").unwrap();
+    let changes = [PathChange {
+        path: "modify.txt".into(),
+        kind: ChangeKind::Modify,
+    }];
+    let first = create_candidate(
+        repo.path(),
+        &source,
+        "i18n/de",
+        &changes,
+        "i18n(de): update",
+    )
+    .unwrap();
+    git(
+        repo.path(),
+        &["update-ref", "refs/heads/i18n/de", &source, &first.commit],
+    );
+    std::thread::sleep(Duration::from_millis(1_100));
+    let replay = create_candidate(
+        repo.path(),
+        &source,
+        "i18n/de",
+        &changes,
+        "i18n(de): update",
+    )
+    .unwrap();
+    assert_eq!(replay.commit, first.commit);
 }
 
 #[test]

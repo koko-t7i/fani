@@ -53,6 +53,21 @@ pub fn process_token() -> String {
     format!("{}-{nanos}-{nonce}", std::process::id())
 }
 
+pub fn process_identity(pid: u32) -> Option<(u32, u64)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let started_at = fields.get(19)?.parse().ok()?;
+    Some((pid, started_at))
+}
+
+pub fn current_process_identity() -> Result<(u32, u64)> {
+    process_identity(std::process::id()).ok_or_else(|| anyhow!("cannot read process identity"))
+}
+
 fn has_token(pid: Pid, token: &str) -> bool {
     let Ok(environ) = fs::read(format!("/proc/{}/environ", pid.as_raw())) else {
         return false;

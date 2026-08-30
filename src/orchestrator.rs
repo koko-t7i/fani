@@ -1,8 +1,8 @@
 use crate::agent::{AgentExecutor, CommandAgent};
 use crate::config::{Config, RepoConfig};
 use crate::db::{
-    AttemptInput, CanonicalFileInput, Database, FindingInput, OutboxKind, PullRequestStateInput,
-    TrustTranslationInput,
+    AttemptCandidateInput, AttemptInput, CanonicalFileInput, Database, FindingInput, OutboxKind,
+    PullRequestStateInput, TrustTranslationInput,
 };
 use crate::github::{EnsurePullRequest, GhClient, locale_branch};
 use crate::markdown::{
@@ -16,6 +16,7 @@ use crate::model::{
     AgentResult, AgentStage, AgentTask, DecisionCode, Finding, FindingSeverity, LanguageOutcome,
     PlanSummary, Status,
 };
+use crate::process::current_process_identity;
 use crate::source;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -291,6 +292,21 @@ impl<'a> Orchestrator<'a> {
                 };
                 if planned.translation.is_some() {
                     reused += 1;
+                    if self.repo.quality.revision || self.repo.quality.proofread {
+                        let input = serde_json::to_string(&json!({
+                            "source_revision": source_revision,
+                            "path": document.path,
+                            "unit": planned.stable_id,
+                        }))?;
+                        planned.work_item_id = Some(self.database.enqueue_work_item(
+                            run_id,
+                            database_id,
+                            language,
+                            "pipeline",
+                            0,
+                            &input,
+                        )?);
+                    }
                 } else if scheduled < self.repo.max_tasks {
                     let input = serde_json::to_string(&json!({
                         "source_revision": source_revision,
@@ -301,7 +317,7 @@ impl<'a> Orchestrator<'a> {
                         run_id,
                         database_id,
                         language,
-                        "translate",
+                        "pipeline",
                         0,
                         &input,
                     )?);
@@ -357,26 +373,61 @@ impl<'a> Orchestrator<'a> {
         let config = self.config.agent_for("translate")?;
         let executor = CommandAgent::new(config);
         let mut tasks = Vec::new();
-        for document in documents.iter() {
-            for unit in &document.units {
-                if unit.translation.is_none() && unit.work_item_id.is_some() {
-                    tasks.push(AgentTask {
-                        id: unit.stable_id.clone(),
-                        stage: AgentStage::Translate,
-                        source_language: "auto".into(),
-                        target_language: language.into(),
-                        source: unit.markdown.protected_source.clone(),
-                        previous_source: unit.previous_source.clone(),
-                        previous_translation: unit.previous_translation.clone(),
-                        findings: Vec::new(),
-                        protected_tokens: unit
-                            .markdown
-                            .protected
-                            .iter()
-                            .map(|span| span.token.clone())
-                            .collect(),
-                    });
+        for document in documents.iter_mut() {
+            for unit in &mut document.units {
+                let Some(work_item_id) = unit.work_item_id else {
+                    continue;
+                };
+                if unit.translation.is_some() {
+                    continue;
                 }
+                let dedupe_key = format!("{}:translate", unit.stable_id);
+                if let Some(recovered) = self
+                    .database
+                    .successful_attempt(work_item_id, &dedupe_key)?
+                {
+                    validate_translation(&unit.markdown, &recovered.output).map_err(
+                        |findings| {
+                            anyhow!(
+                                "durable Agent output for {} failed validation: {findings:?}",
+                                unit.stable_id
+                            )
+                        },
+                    )?;
+                    self.database.select_canonical_candidate(
+                        unit.database_id,
+                        language,
+                        &format!("attempt:{}", recovered.id),
+                        &recovered.output,
+                        Some(recovered.id),
+                        Some(1.0),
+                    )?;
+                    unit.translation = Some(recovered.output);
+                    continue;
+                }
+                if self
+                    .database
+                    .attempt_status(work_item_id, &dedupe_key)?
+                    .is_some()
+                {
+                    continue;
+                }
+                tasks.push(AgentTask {
+                    id: unit.stable_id.clone(),
+                    stage: AgentStage::Translate,
+                    source_language: "auto".into(),
+                    target_language: language.into(),
+                    source: unit.markdown.protected_source.clone(),
+                    previous_source: unit.previous_source.clone(),
+                    previous_translation: unit.previous_translation.clone(),
+                    findings: Vec::new(),
+                    protected_tokens: unit
+                        .markdown
+                        .protected
+                        .iter()
+                        .map(|span| span.token.clone())
+                        .collect(),
+                });
             }
         }
         self.log(&format!(
@@ -397,13 +448,6 @@ impl<'a> Orchestrator<'a> {
                 let Some(result) = by_id.get(unit.stable_id.as_str()) else {
                     continue;
                 };
-                let status = if result.ok {
-                    "succeeded"
-                } else if result.code.as_deref() == Some(DecisionCode::AgentTimeout.as_str()) {
-                    "timed_out"
-                } else {
-                    "failed"
-                };
                 let request_json = serde_json::to_string(
                     &json!({"task_id": unit.stable_id, "stage": "translate"}),
                 )?;
@@ -411,29 +455,41 @@ impl<'a> Orchestrator<'a> {
                     .ok
                     .then(|| serde_json::to_string(&json!({"output": result.output})))
                     .transpose()?;
-                let receipt = self.database.record_attempt(AttemptInput {
-                    work_item_id,
-                    dedupe_key: &format!("{}:translate", unit.stable_id),
-                    agent: &config.name,
-                    status,
-                    request_json: &request_json,
-                    response_json: response_json.as_deref(),
-                    error: (!result.ok).then_some(result.diagnostic.as_str()),
-                })?;
+                let dedupe_key = format!("{}:translate", unit.stable_id);
                 if result.ok {
                     match validate_translation(&unit.markdown, &result.output) {
                         Ok(_) => {
+                            let candidate_key = format!("attempt:{dedupe_key}");
+                            self.database
+                                .record_attempt_candidate(AttemptCandidateInput {
+                                    attempt: AttemptInput {
+                                        work_item_id,
+                                        dedupe_key: &dedupe_key,
+                                        agent: &config.name,
+                                        status: "succeeded",
+                                        request_json: &request_json,
+                                        response_json: response_json.as_deref(),
+                                        error: None,
+                                    },
+                                    unit_id: unit.database_id,
+                                    locale: language,
+                                    candidate_key: &candidate_key,
+                                    target_text: &result.output,
+                                    score: Some(1.0),
+                                })?;
+                            crate::failpoint::reach("agent_candidate_committed");
                             unit.translation = Some(result.output.clone());
-                            self.database.select_canonical_candidate(
-                                unit.database_id,
-                                language,
-                                &format!("attempt:{}", receipt.id),
-                                &result.output,
-                                Some(receipt.id),
-                                Some(1.0),
-                            )?;
                         }
                         Err(findings) => {
+                            let receipt = self.database.record_attempt(AttemptInput {
+                                work_item_id,
+                                dedupe_key: &dedupe_key,
+                                agent: &config.name,
+                                status: "failed",
+                                request_json: &request_json,
+                                response_json: response_json.as_deref(),
+                                error: Some("deterministic Markdown validation failed"),
+                            })?;
                             for validation in findings {
                                 self.database.record_finding(FindingInput {
                                     work_item_id,
@@ -447,6 +503,22 @@ impl<'a> Orchestrator<'a> {
                             }
                         }
                     }
+                } else {
+                    let status =
+                        if result.code.as_deref() == Some(DecisionCode::AgentTimeout.as_str()) {
+                            "timed_out"
+                        } else {
+                            "failed"
+                        };
+                    self.database.record_attempt(AttemptInput {
+                        work_item_id,
+                        dedupe_key: &dedupe_key,
+                        agent: &config.name,
+                        status,
+                        request_json: &request_json,
+                        response_json: None,
+                        error: Some(result.diagnostic.as_str()),
+                    })?;
                 }
             }
         }
@@ -465,34 +537,73 @@ impl<'a> Orchestrator<'a> {
         let mut rounds = 0;
         for round in 0..self.repo.repair_budget {
             let mut tasks = Vec::new();
-            for document in documents.iter() {
-                for unit in &document.units {
-                    if unit.translation.is_none() && unit.work_item_id.is_some() {
-                        tasks.push(AgentTask {
-                            id: unit.stable_id.clone(),
-                            stage: AgentStage::Repair,
-                            source_language: "auto".into(),
-                            target_language: language.into(),
-                            source: unit.markdown.protected_source.clone(),
-                            previous_source: unit.previous_source.clone(),
-                            previous_translation: unit.previous_translation.clone(),
-                            findings: vec![finding(
-                                &document.source_path,
-                                Some(unit.stable_id.clone()),
-                                DecisionCode::VerificationFailed.as_str(),
-                                "previous output failed deterministic Markdown validation",
-                            )],
-                            protected_tokens: unit
-                                .markdown
-                                .protected
-                                .iter()
-                                .map(|span| span.token.clone())
-                                .collect(),
-                        });
+            let mut skipped_terminal_attempt = false;
+            for document in documents.iter_mut() {
+                for unit in &mut document.units {
+                    let Some(work_item_id) =
+                        unit.work_item_id.filter(|_| unit.translation.is_none())
+                    else {
+                        continue;
+                    };
+                    let dedupe_key = format!("{}:repair:{round}", unit.stable_id);
+                    if let Some(recovered) = self
+                        .database
+                        .successful_attempt(work_item_id, &dedupe_key)?
+                    {
+                        validate_translation(&unit.markdown, &recovered.output).map_err(
+                            |findings| {
+                                anyhow!(
+                                    "durable repair output for {} failed validation: {findings:?}",
+                                    unit.stable_id
+                                )
+                            },
+                        )?;
+                        self.database.select_canonical_candidate(
+                            unit.database_id,
+                            language,
+                            &format!("attempt:{}", recovered.id),
+                            &recovered.output,
+                            Some(recovered.id),
+                            Some(1.0),
+                        )?;
+                        unit.translation = Some(recovered.output);
+                        continue;
                     }
+                    if self
+                        .database
+                        .attempt_status(work_item_id, &dedupe_key)?
+                        .is_some()
+                    {
+                        skipped_terminal_attempt = true;
+                        continue;
+                    }
+                    tasks.push(AgentTask {
+                        id: unit.stable_id.clone(),
+                        stage: AgentStage::Repair,
+                        source_language: "auto".into(),
+                        target_language: language.into(),
+                        source: unit.markdown.protected_source.clone(),
+                        previous_source: unit.previous_source.clone(),
+                        previous_translation: unit.previous_translation.clone(),
+                        findings: vec![finding(
+                            &document.source_path,
+                            Some(unit.stable_id.clone()),
+                            DecisionCode::VerificationFailed.as_str(),
+                            "previous output failed deterministic Markdown validation",
+                        )],
+                        protected_tokens: unit
+                            .markdown
+                            .protected
+                            .iter()
+                            .map(|span| span.token.clone())
+                            .collect(),
+                    });
                 }
             }
             if tasks.is_empty() {
+                if skipped_terminal_attempt {
+                    continue;
+                }
                 break;
             }
             rounds += 1;
@@ -503,21 +614,61 @@ impl<'a> Orchestrator<'a> {
                 .collect();
             for document in documents.iter_mut() {
                 for unit in &mut document.units {
-                    if let Some(result) = by_id
-                        .get(unit.stable_id.as_str())
-                        .filter(|result| result.ok)
-                    {
-                        if validate_translation(&unit.markdown, &result.output).is_ok() {
-                            unit.translation = Some(result.output.clone());
-                            self.database.select_canonical_candidate(
-                                unit.database_id,
-                                language,
-                                &format!("repair:{}:{round}", unit.stable_id),
-                                &result.output,
-                                None,
-                                Some(1.0),
-                            )?;
-                        }
+                    let Some(work_item_id) = unit.work_item_id else {
+                        continue;
+                    };
+                    let Some(result) = by_id.get(unit.stable_id.as_str()) else {
+                        continue;
+                    };
+                    let request_json = serde_json::to_string(
+                        &json!({"task_id": unit.stable_id, "stage": "repair", "round": round}),
+                    )?;
+                    let response_json = result
+                        .ok
+                        .then(|| serde_json::to_string(&json!({"output": result.output})))
+                        .transpose()?;
+                    let dedupe_key = format!("{}:repair:{round}", unit.stable_id);
+                    if result.ok && validate_translation(&unit.markdown, &result.output).is_ok() {
+                        self.database
+                            .record_attempt_candidate(AttemptCandidateInput {
+                                attempt: AttemptInput {
+                                    work_item_id,
+                                    dedupe_key: &dedupe_key,
+                                    agent: &config.name,
+                                    status: "succeeded",
+                                    request_json: &request_json,
+                                    response_json: response_json.as_deref(),
+                                    error: None,
+                                },
+                                unit_id: unit.database_id,
+                                locale: language,
+                                candidate_key: &format!("attempt:{dedupe_key}"),
+                                target_text: &result.output,
+                                score: Some(1.0),
+                            })?;
+                        crate::failpoint::reach("repair_candidate_committed");
+                        unit.translation = Some(result.output.clone());
+                    } else {
+                        let status = if result.code.as_deref()
+                            == Some(DecisionCode::AgentTimeout.as_str())
+                        {
+                            "timed_out"
+                        } else {
+                            "failed"
+                        };
+                        self.database.record_attempt(AttemptInput {
+                            work_item_id,
+                            dedupe_key: &dedupe_key,
+                            agent: &config.name,
+                            status,
+                            request_json: &request_json,
+                            response_json: response_json.as_deref(),
+                            error: Some(if result.ok {
+                                "deterministic Markdown validation failed"
+                            } else {
+                                result.diagnostic.as_str()
+                            }),
+                        })?;
                     }
                 }
             }
@@ -548,26 +699,77 @@ impl<'a> Orchestrator<'a> {
             let config = self.config.agent_for(stage_name)?;
             let executor = CommandAgent::new(config);
             let mut tasks = Vec::new();
-            for document in documents.iter() {
-                for unit in &document.units {
-                    if unit.work_item_id.is_some() && unit.translation.is_some() {
-                        tasks.push(AgentTask {
-                            id: unit.stable_id.clone(),
-                            stage: stage.clone(),
-                            source_language: "auto".into(),
-                            target_language: language.into(),
-                            source: unit.markdown.protected_source.clone(),
-                            previous_source: Some(unit.markdown.protected_source.clone()),
-                            previous_translation: unit.translation.clone(),
-                            findings: Vec::new(),
-                            protected_tokens: unit
-                                .markdown
-                                .protected
-                                .iter()
-                                .map(|span| span.token.clone())
-                                .collect(),
-                        });
+            for document in documents.iter_mut() {
+                for unit in &mut document.units {
+                    let Some(work_item_id) =
+                        unit.work_item_id.filter(|_| unit.translation.is_some())
+                    else {
+                        continue;
+                    };
+                    let dedupe_key = format!("{}:{stage_name}", unit.stable_id);
+                    if let Some(recovered) = self
+                        .database
+                        .successful_attempt(work_item_id, &dedupe_key)?
+                    {
+                        if recovered.output.trim().eq_ignore_ascii_case("OK") {
+                            continue;
+                        }
+                        if blocking {
+                            validate_translation(&unit.markdown, &recovered.output).map_err(
+                                |validation| {
+                                    anyhow!(
+                                        "durable revision output for {} failed validation: {validation:?}",
+                                        unit.stable_id
+                                    )
+                                },
+                            )?;
+                            self.database.select_canonical_candidate(
+                                unit.database_id,
+                                language,
+                                &format!("attempt:{}", recovered.id),
+                                &recovered.output,
+                                Some(recovered.id),
+                                Some(1.0),
+                            )?;
+                            unit.translation = Some(recovered.output);
+                        } else {
+                            findings.push(Finding {
+                                severity: FindingSeverity::Warning,
+                                code: "PROOFREAD-ADVISORY".into(),
+                                path: document.source_path.clone(),
+                                unit_id: Some(unit.stable_id.clone()),
+                                message: recovered.output,
+                            });
+                        }
+                        continue;
                     }
+                    if let Some(status) = self.database.attempt_status(work_item_id, &dedupe_key)? {
+                        if blocking {
+                            findings.push(finding(
+                                &document.source_path,
+                                Some(unit.stable_id.clone()),
+                                DecisionCode::AgentExit.as_str(),
+                                format!("durable blocking revision attempt ended as {status}"),
+                            ));
+                        }
+                        continue;
+                    }
+                    tasks.push(AgentTask {
+                        id: unit.stable_id.clone(),
+                        stage: stage.clone(),
+                        source_language: "auto".into(),
+                        target_language: language.into(),
+                        source: unit.markdown.protected_source.clone(),
+                        previous_source: Some(unit.markdown.protected_source.clone()),
+                        previous_translation: unit.translation.clone(),
+                        findings: Vec::new(),
+                        protected_tokens: unit
+                            .markdown
+                            .protected
+                            .iter()
+                            .map(|span| span.token.clone())
+                            .collect(),
+                    });
                 }
             }
             if tasks.is_empty() {
@@ -580,10 +782,37 @@ impl<'a> Orchestrator<'a> {
                 .collect();
             for document in documents.iter_mut() {
                 for unit in &mut document.units {
+                    let Some(work_item_id) = unit.work_item_id else {
+                        continue;
+                    };
                     let Some(result) = by_id.get(unit.stable_id.as_str()) else {
                         continue;
                     };
+                    let request_json = serde_json::to_string(
+                        &json!({"task_id": unit.stable_id, "stage": stage_name}),
+                    )?;
+                    let response_json = result
+                        .ok
+                        .then(|| serde_json::to_string(&json!({"output": result.output})))
+                        .transpose()?;
+                    let dedupe_key = format!("{}:{stage_name}", unit.stable_id);
                     if !result.ok {
+                        let status = if result.code.as_deref()
+                            == Some(DecisionCode::AgentTimeout.as_str())
+                        {
+                            "timed_out"
+                        } else {
+                            "failed"
+                        };
+                        self.database.record_attempt(AttemptInput {
+                            work_item_id,
+                            dedupe_key: &dedupe_key,
+                            agent: &config.name,
+                            status,
+                            request_json: &request_json,
+                            response_json: None,
+                            error: Some(result.diagnostic.as_str()),
+                        })?;
                         if blocking {
                             findings.push(finding(
                                 &document.source_path,
@@ -598,22 +827,50 @@ impl<'a> Orchestrator<'a> {
                         continue;
                     }
                     if result.output.trim().eq_ignore_ascii_case("OK") {
+                        self.database.record_attempt(AttemptInput {
+                            work_item_id,
+                            dedupe_key: &dedupe_key,
+                            agent: &config.name,
+                            status: "succeeded",
+                            request_json: &request_json,
+                            response_json: response_json.as_deref(),
+                            error: None,
+                        })?;
                         continue;
                     }
                     if blocking {
                         match validate_translation(&unit.markdown, &result.output) {
                             Ok(_) => {
+                                self.database
+                                    .record_attempt_candidate(AttemptCandidateInput {
+                                        attempt: AttemptInput {
+                                            work_item_id,
+                                            dedupe_key: &dedupe_key,
+                                            agent: &config.name,
+                                            status: "succeeded",
+                                            request_json: &request_json,
+                                            response_json: response_json.as_deref(),
+                                            error: None,
+                                        },
+                                        unit_id: unit.database_id,
+                                        locale: language,
+                                        candidate_key: &format!("attempt:{dedupe_key}"),
+                                        target_text: &result.output,
+                                        score: Some(1.0),
+                                    })?;
+                                crate::failpoint::reach("revision_candidate_committed");
                                 unit.translation = Some(result.output.clone());
-                                self.database.select_canonical_candidate(
-                                    unit.database_id,
-                                    language,
-                                    &format!("revision:{}", unit.stable_id),
-                                    &result.output,
-                                    None,
-                                    Some(1.0),
-                                )?;
                             }
                             Err(validation) => {
+                                self.database.record_attempt(AttemptInput {
+                                    work_item_id,
+                                    dedupe_key: &dedupe_key,
+                                    agent: &config.name,
+                                    status: "failed",
+                                    request_json: &request_json,
+                                    response_json: response_json.as_deref(),
+                                    error: Some("deterministic Markdown validation failed"),
+                                })?;
                                 findings.push(finding(
                                     &document.source_path,
                                     Some(unit.stable_id.clone()),
@@ -623,6 +880,15 @@ impl<'a> Orchestrator<'a> {
                             }
                         }
                     } else {
+                        self.database.record_attempt(AttemptInput {
+                            work_item_id,
+                            dedupe_key: &dedupe_key,
+                            agent: &config.name,
+                            status: "succeeded",
+                            request_json: &request_json,
+                            response_json: response_json.as_deref(),
+                            error: None,
+                        })?;
                         findings.push(Finding {
                             severity: FindingSeverity::Warning,
                             code: "PROOFREAD-ADVISORY".into(),
@@ -716,6 +982,8 @@ impl<'a> Orchestrator<'a> {
                 "materialize:{repository_id}:{language}:{}:{desired_hash}",
                 document.target_path
             );
+            self.database
+                .supersede_materializations(language, &document.target_path, &dedupe)?;
             self.database.enqueue_materialization(
                 work_item_id,
                 &dedupe,
@@ -725,7 +993,8 @@ impl<'a> Orchestrator<'a> {
                     "path": document.target_path,
                 }))?,
             )?;
-            let owner = format!("materialize:{}:{}", std::process::id(), run_id);
+            let (pid, started_at) = current_process_identity()?;
+            let owner = format!("materialize:{pid}:{started_at}:{run_id}");
             let claimed = self.database.claim_outbox_key(
                 OutboxKind::Materialization,
                 &dedupe,
@@ -742,6 +1011,7 @@ impl<'a> Orchestrator<'a> {
                 let result = materialize(&self.repo.path, &operation);
                 match result {
                     Ok(MaterializationResult::Written { hash }) => {
+                        crate::failpoint::reach("materialized_file_written");
                         self.database.set_canonical_file_state(
                             canonical_id,
                             "materialized",
@@ -864,7 +1134,8 @@ impl<'a> Orchestrator<'a> {
             outcome.published.skipped = "publication is disabled".into();
             return Ok(());
         }
-        let owner = format!("publish:{}:{}", std::process::id(), run_id);
+        let (pid, started_at) = current_process_identity()?;
+        let owner = format!("publish:{pid}:{started_at}:{run_id}");
         let entry = if written.is_empty() {
             self.database.claim_publication_locale(
                 language,
@@ -879,7 +1150,14 @@ impl<'a> Orchestrator<'a> {
                     .database
                     .canonical_file(repository_id, language, path)?
                     .ok_or_else(|| anyhow!("missing canonical publication content for {path}"))?;
-                files.push(json!({"path": path, "content_hash": canonical.content_hash}));
+                let content = String::from_utf8(canonical.content).with_context(|| {
+                    format!("canonical publication content is not UTF-8: {path}")
+                })?;
+                files.push(json!({
+                    "path": path,
+                    "content": content,
+                    "content_hash": canonical.content_hash,
+                }));
             }
             let payload = serde_json::to_string(&json!({
                 "files": files,
@@ -897,20 +1175,21 @@ impl<'a> Orchestrator<'a> {
                 &dedupe,
                 &payload,
             )?;
-            self.database.claim_outbox_key(
-                OutboxKind::Publication,
-                &dedupe,
+            self.database.claim_publication_locale(
+                language,
                 &owner,
                 Utc::now().timestamp_millis(),
                 180_000,
             )?
         };
         let Some(entry) = entry else {
-            outcome.published.skipped =
-                "no file changed and no publication recovery is pending".into();
+            if outcome.published.commit.is_empty() {
+                outcome.published.skipped =
+                    "no file changed and no publication recovery is pending".into();
+            }
             return Ok(());
         };
-        let payload: serde_json::Value = serde_json::from_str(&entry.payload_json)?;
+        let mut payload: serde_json::Value = serde_json::from_str(&entry.payload_json)?;
         let payload_language = payload["language"]
             .as_str()
             .ok_or_else(|| anyhow!("publication outbox is missing language"))?;
@@ -925,22 +1204,105 @@ impl<'a> Orchestrator<'a> {
             outcome.published.skipped = "another locale has pending publication recovery".into();
             return Ok(());
         }
+        let payload_source_revision = payload["source_revision"]
+            .as_str()
+            .ok_or_else(|| anyhow!("publication outbox is missing source revision"))?
+            .to_owned();
         let records = payload["files"]
             .as_array()
             .cloned()
             .ok_or_else(|| anyhow!("publication outbox is missing files"))?;
-        outcome.published = match crate::gitout::publish(self.repo, language, &records) {
-            Ok(published) => published,
-            Err(error) => {
-                self.database.retry_outbox(
-                    OutboxKind::Publication,
-                    entry.id,
-                    &owner,
-                    &error.to_string(),
-                    Utc::now().timestamp_millis() + 5_000,
-                )?;
-                return Err(error);
+        outcome.published = if let Some(commit) = payload["commit"].as_str() {
+            let expected_remote_tip = payload["expected_remote_tip"].as_str();
+            let mut published = crate::gitout::publish_pending_with_expected(
+                self.repo,
+                language,
+                commit,
+                expected_remote_tip,
+            )?;
+            published.paths = records
+                .iter()
+                .filter_map(|record| record["path"].as_str().map(str::to_owned))
+                .collect();
+            published
+        } else {
+            let mut durable_files = Vec::with_capacity(records.len());
+            for record in &records {
+                let path = record["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("publication file is missing path"))?;
+                let content = record["content"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("publication file is missing durable content"))?;
+                let expected_hash = record["content_hash"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("publication file is missing content hash"))?;
+                if content_hash(content.as_bytes()) != expected_hash {
+                    bail!("durable publication content hash changed for {path}");
+                }
+                durable_files.push((path.to_owned(), content.as_bytes().to_vec()));
             }
+            let branch = locale_branch(&self.repo.publish.branch, language)?;
+            let message = format!(
+                "i18n({language}): update {} translated file(s)",
+                durable_files.len()
+            );
+            let candidate = crate::gitout::create_candidate_from_contents(
+                &self.repo.path,
+                &payload_source_revision,
+                &branch,
+                &durable_files,
+                &message,
+            )?;
+            let mut prepared = crate::model::Published {
+                branch,
+                commit: candidate.commit.clone(),
+                paths: candidate
+                    .changes
+                    .iter()
+                    .map(|change| change.path.clone())
+                    .collect(),
+                ..crate::model::Published::default()
+            };
+            if candidate.previous_tip.as_deref() == Some(candidate.commit.as_str()) {
+                prepared.skipped = "the translations are already committed".into();
+            }
+            let expected_remote_tip = if self.repo.publish.push {
+                crate::gitout::remote_branch_tip(
+                    &self.repo.path,
+                    &self.repo.publish.remote,
+                    &prepared.branch,
+                )?
+            } else {
+                None
+            };
+            payload["commit"] = serde_json::Value::String(prepared.commit.clone());
+            payload["expected_remote_tip"] = expected_remote_tip
+                .as_ref()
+                .map_or(serde_json::Value::Null, |tip| {
+                    serde_json::Value::String(tip.clone())
+                });
+            let durable_payload = serde_json::to_string(&payload)?;
+            if !self.database.update_outbox_payload(
+                OutboxKind::Publication,
+                entry.id,
+                &owner,
+                &durable_payload,
+            )? {
+                bail!("publication outbox ownership changed before commit persistence");
+            }
+            crate::failpoint::reach("publication_candidate_persisted");
+            if self.repo.publish.push {
+                let pushed = crate::gitout::publish_pending_with_expected(
+                    self.repo,
+                    language,
+                    &prepared.commit,
+                    expected_remote_tip.as_deref(),
+                )?;
+                prepared.pushed = pushed.pushed;
+                prepared.error = pushed.error;
+            }
+            prepared
         };
         if !outcome.published.error.is_empty() {
             self.database.retry_outbox(
@@ -952,6 +1314,7 @@ impl<'a> Orchestrator<'a> {
             )?;
             bail!("{}", outcome.published.error);
         }
+        crate::failpoint::reach("publication_side_effect_completed");
         let reconcile = (|| -> Result<()> {
             if self.repo.publish.github.enabled && outcome.published.pushed {
                 let branch = locale_branch(&self.repo.publish.branch, language)?;
@@ -1014,7 +1377,7 @@ impl<'a> Orchestrator<'a> {
         {
             bail!("publication outbox lease was lost before completion");
         }
-        Ok(())
+        self.publish(repository_id, run_id, language, &[], outcome)
     }
 
     pub fn run_language(&self, language: &str) -> LanguageOutcome {

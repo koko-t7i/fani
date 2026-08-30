@@ -1,5 +1,6 @@
-use fani::db::{AttemptInput, Database, OutboxKind, TrustTranslationInput};
+use fani::db::{AttemptCandidateInput, AttemptInput, Database, OutboxKind, TrustTranslationInput};
 use rusqlite::params;
+use std::fs;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -126,6 +127,69 @@ fn attempt_recording_is_idempotent_by_work_item_and_dedupe_key() {
 }
 
 #[test]
+fn successful_attempt_and_candidate_commit_atomically_and_are_recoverable() {
+    let fixture = fixture();
+    let response = r#"{"output":"介绍"}"#;
+    let receipt = fixture
+        .db
+        .record_attempt_candidate(AttemptCandidateInput {
+            attempt: AttemptInput {
+                work_item_id: fixture.work_item_id,
+                dedupe_key: "translate:heading:intro",
+                agent: "translator",
+                status: "succeeded",
+                request_json: r#"{"prompt":"translate"}"#,
+                response_json: Some(response),
+                error: None,
+            },
+            unit_id: fixture.unit_id,
+            locale: "zh-CN",
+            candidate_key: "attempt:translate:heading:intro",
+            target_text: "介绍",
+            score: Some(1.0),
+        })
+        .unwrap();
+
+    let recovered = fixture
+        .db
+        .successful_attempt(fixture.work_item_id, "translate:heading:intro")
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.id, receipt.id);
+    assert_eq!(recovered.output, "介绍");
+    assert_eq!(
+        fixture
+            .db
+            .selected_candidate(fixture.unit_id, "zh-CN")
+            .unwrap()
+            .as_deref(),
+        Some("介绍")
+    );
+
+    let replay = fixture
+        .db
+        .record_attempt_candidate(AttemptCandidateInput {
+            attempt: AttemptInput {
+                work_item_id: fixture.work_item_id,
+                dedupe_key: "translate:heading:intro",
+                agent: "translator",
+                status: "succeeded",
+                request_json: r#"{"prompt":"translate"}"#,
+                response_json: Some(response),
+                error: None,
+            },
+            unit_id: fixture.unit_id,
+            locale: "zh-CN",
+            candidate_key: "attempt:translate:heading:intro",
+            target_text: "介绍",
+            score: Some(1.0),
+        })
+        .unwrap();
+    assert!(!replay.inserted);
+    assert_eq!(replay.id, receipt.id);
+}
+
+#[test]
 fn expired_outbox_claims_are_recovered_and_replayed_once() {
     let fixture = fixture();
     let now = chrono::Utc::now().timestamp_millis();
@@ -224,6 +288,84 @@ fn expired_outbox_claims_are_recovered_and_replayed_once() {
             .attempt_count,
         2
     );
+}
+
+#[test]
+fn newer_materialization_supersedes_stale_processing_content() {
+    let fixture = fixture();
+    let now = chrono::Utc::now().timestamp_millis();
+    let stale_key = "materialize:guide.md:zh-CN:old";
+    let active_key = "materialize:guide.md:zh-CN:new";
+    fixture
+        .db
+        .enqueue_materialization(
+            fixture.work_item_id,
+            stale_key,
+            r#"{"locale":"zh-CN","path":"zh-CN/guide.md"}"#,
+        )
+        .unwrap();
+    fixture
+        .db
+        .claim_outbox_key(
+            OutboxKind::Materialization,
+            stale_key,
+            "materialize:999999999:1:dead",
+            now,
+            60_000,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .supersede_materializations("zh-CN", "zh-CN/guide.md", active_key)
+            .unwrap(),
+        1
+    );
+    fixture
+        .db
+        .enqueue_materialization(
+            fixture.work_item_id,
+            active_key,
+            r#"{"locale":"zh-CN","path":"zh-CN/guide.md"}"#,
+        )
+        .unwrap();
+    let conn = fixture.db.connect().unwrap();
+    let states: (String, String) = conn
+        .query_row(
+            "SELECT (SELECT state FROM materialization_outbox WHERE dedupe_key=?1),(SELECT state FROM materialization_outbox WHERE dedupe_key=?2)",
+            [stale_key, active_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(states, ("done".into(), "pending".into()));
+    drop(conn);
+
+    let pid = std::process::id();
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let started_at = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap();
+    fixture
+        .db
+        .claim_outbox_key(
+            OutboxKind::Materialization,
+            active_key,
+            &format!("materialize:{pid}:{started_at}:live"),
+            chrono::Utc::now().timestamp_millis(),
+            60_000,
+        )
+        .unwrap()
+        .unwrap();
+    let error = fixture
+        .db
+        .supersede_materializations("zh-CN", "zh-CN/guide.md", "newest")
+        .unwrap_err();
+    assert!(error.to_string().contains("live worker"), "{error:#}");
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use crate::db::{Database, Lease};
+use crate::process::current_process_identity;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use std::path::Path;
@@ -20,7 +21,8 @@ impl RepoLock {
             .unwrap_or_else(|_| repo.to_owned())
             .display()
             .to_string();
-        let owner = format!("{}:{}", std::process::id(), Utc::now().timestamp_millis());
+        let (pid, started_at) = current_process_identity()?;
+        let owner = format!("{pid}:{started_at}:{}", Utc::now().timestamp_millis());
         let lease = db
             .acquire_lease(
                 "repository",
