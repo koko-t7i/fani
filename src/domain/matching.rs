@@ -1,4 +1,4 @@
-use crate::markdown::{MarkdownUnit, UnitKind};
+use crate::domain::markdown::{MarkdownUnit, UnitKind};
 use strsim::normalized_levenshtein;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,7 +137,7 @@ pub fn match_units(previous: &[PreviousUnit], current: &[MarkdownUnit]) -> Vec<U
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::extract_units;
+    use crate::domain::markdown::extract_units;
 
     fn previous(id: &str, ordinal: usize, source: &str) -> PreviousUnit {
         PreviousUnit {

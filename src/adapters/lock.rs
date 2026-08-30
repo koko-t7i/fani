@@ -1,5 +1,5 @@
-use crate::db::{Database, Lease};
-use crate::process::current_process_identity;
+use crate::adapters::db::{Database, Lease};
+use crate::adapters::process::current_process_identity;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use std::path::Path;

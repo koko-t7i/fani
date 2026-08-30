@@ -1,4 +1,4 @@
-use crate::model::{AgentStage, AgentTask};
+use crate::domain::model::{AgentStage, AgentTask};
 
 pub const TRANSLATION_RULES: &str = r#"Translate only the Markdown unit between SOURCE markers.
 Return only the translated Markdown unit, with no fence, explanation, or metadata.

@@ -1,4 +1,4 @@
-use fani::db::Database;
+use fani::test_support::db::Database;
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -143,6 +143,11 @@ repair = "fixture"
         status_text.contains("pending=2") && status_text.contains("source="),
         "{status_text}"
     );
+    assert_eq!(
+        status_text.matches("repo [zh-CN]").count(),
+        1,
+        "{status_text}"
+    );
     assert!(!repo.join("translations/zh-CN/docs/guide.md").exists());
 
     let first = fani(&[
@@ -261,6 +266,65 @@ repair = "fixture"
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("pending=1"));
     assert!(!repo.join(".fani").exists());
+}
+
+#[test]
+fn status_keeps_earlier_diagnostics_when_a_later_repository_errors() {
+    let tmp = tempdir().unwrap();
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    for repo in [&first, &second] {
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(repo.join("docs/guide.md"), "# Hello\n").unwrap();
+        run(repo, &["init", "-q", "-b", "main"]);
+        run(repo, &["config", "user.email", "test@example.invalid"]);
+        run(repo, &["config", "user.name", "Test"]);
+        run(repo, &["add", "."]);
+        run(repo, &["commit", "-qm", "source"]);
+    }
+
+    let config = tmp.path().join("fani.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[repo]]
+path = "{}"
+languages = ["zh-CN"]
+include = ["docs/**/*.md"]
+target_pattern = "translations/{{lang}}/{{relpath}}"
+
+[[repo]]
+path = "{}"
+languages = ["zh-CN"]
+include = ["docs/**/*.md"]
+target_pattern = "translations/{{lang}}/{{relpath}}"
+[repo.publish]
+source_ref = "refs/heads/missing"
+
+[agents.fake]
+cmd = ["true"]
+[routing]
+translate = "fake"
+"#,
+            first.display(),
+            second.display()
+        ),
+    )
+    .unwrap();
+
+    let output = fani(&["status", "--config", config.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("first [zh-CN] source=") && stdout.contains("pending=1"),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout.matches("first [zh-CN]").count(), 1, "{stdout}");
+    assert!(
+        stderr.contains("fani: ") && stderr.contains("missing"),
+        "{stderr}"
+    );
 }
 
 #[test]

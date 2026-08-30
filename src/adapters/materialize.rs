@@ -1,22 +1,11 @@
+use crate::application::ports::{Materialization, MaterializationResult, Materializer};
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Materialization {
-    pub path: PathBuf,
-    pub expected_hash: Option<String>,
-    pub desired: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MaterializationResult {
-    Written { hash: String },
-    AlreadyCurrent { hash: String },
-    HumanEdit { actual_hash: String },
-}
+pub struct FilesystemMaterializer;
 
 pub fn content_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -108,6 +97,25 @@ pub fn apply(root: &Path, operation: &Materialization) -> Result<Materialization
     }
     write_atomic(&path, &operation.desired)?;
     Ok(MaterializationResult::Written { hash: desired_hash })
+}
+
+impl Materializer for FilesystemMaterializer {
+    fn read(&self, root: &Path, relative: &Path) -> Result<Option<Vec<u8>>> {
+        let path = safe_path(root, relative)?;
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn apply(&self, root: &Path, operation: &Materialization) -> Result<MaterializationResult> {
+        apply(root, operation)
+    }
+
+    fn restore(&self, root: &Path, operation: &Materialization) -> Result<MaterializationResult> {
+        restore(root, operation)
+    }
 }
 
 #[cfg(test)]

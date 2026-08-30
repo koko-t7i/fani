@@ -1,10 +1,10 @@
-use crate::config::RepoConfig;
-use crate::model::SourceDocument;
+use crate::application::settings::RepoConfig;
+use crate::domain::model::SourceDocument;
 use anyhow::{Context, Result, anyhow};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -156,36 +156,10 @@ pub fn discover(repo: &RepoConfig, source_revision: &str) -> Result<Vec<SourceDo
     Ok(documents)
 }
 
-pub fn document_id(repository: &str, path: &str) -> String {
-    hash(&[repository.as_bytes(), path.as_bytes()])
-}
-
-pub fn target_path(repo: &RepoConfig, language: &str, source_path: &str) -> Result<PathBuf> {
-    let value = repo
-        .target_pattern
-        .replace("{lang}", language)
-        .replace("{relpath}", source_path);
-    let path = PathBuf::from(value);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(anyhow!(
-            "target path escapes repository: {}",
-            path.display()
-        ));
-    }
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GithubConfig, PublishConfig, QualityConfig};
+    use crate::application::settings::{GithubConfig, PublishConfig, QualityConfig};
     use std::fs;
     use tempfile::tempdir;
 

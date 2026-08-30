@@ -1,4 +1,4 @@
-use fani::gitout::{
+use fani::test_support::gitout::{
     ChangeKind, PathChange, create_candidate, create_candidate_from_contents, push_candidate,
 };
 use serde_json::Value;
@@ -10,7 +10,7 @@ use std::process::Command;
 use std::time::Duration;
 use tempfile::tempdir;
 
-use fani::github::{EnsurePullRequest, GhClient, ReconcileAction, locale_branch};
+use fani::test_support::github::{EnsurePullRequest, GhClient, ReconcileAction, locale_branch};
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")

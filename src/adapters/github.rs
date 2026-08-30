@@ -1,3 +1,8 @@
+use crate::application::ports::{
+    CodeHost, EnsurePullRequest as PortEnsurePullRequest, PullRequest as PortPullRequest,
+    ReconciledPullRequest as PortReconciledPullRequest,
+};
+use crate::application::settings::RepoConfig;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -395,6 +400,55 @@ impl GhClient {
             action,
             pull_request: pull,
             durable,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GithubCodeHost;
+
+fn port_pull_request(pull: &PullRequest, payload_json: String) -> PortPullRequest {
+    PortPullRequest {
+        number: pull.number,
+        url: pull.url.clone(),
+        state: pull.state.clone(),
+        draft: pull.draft,
+        head_revision: pull.head_revision.clone(),
+        payload_json,
+    }
+}
+
+impl CodeHost for GithubCodeHost {
+    fn pull_request(
+        &self,
+        repo: &RepoConfig,
+        repository: &str,
+        selector: &str,
+    ) -> Result<PortPullRequest> {
+        let pull = GhClient::new(&repo.path).pull_request(repository, selector)?;
+        let payload_json = serde_json::to_string(&pull)?;
+        Ok(port_pull_request(&pull, payload_json))
+    }
+
+    fn ensure_pull_request(
+        &self,
+        repo: &RepoConfig,
+        request: PortEnsurePullRequest<'_>,
+    ) -> Result<PortReconciledPullRequest> {
+        let reconciled = GhClient::new(&repo.path).ensure_pull_request(EnsurePullRequest {
+            repository: request.repository,
+            head: request.head,
+            base: request.base,
+            title: request.title,
+            body: request.body,
+            draft: request.draft,
+            durable: None,
+        })?;
+        let payload_json = serde_json::to_string(&reconciled)?;
+        let pull_payload_json = serde_json::to_string(&reconciled.pull_request)?;
+        Ok(PortReconciledPullRequest {
+            pull_request: port_pull_request(&reconciled.pull_request, pull_payload_json),
+            payload_json,
         })
     }
 }

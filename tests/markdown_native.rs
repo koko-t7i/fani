@@ -1,43 +1,8 @@
-#[path = "../src/markdown.rs"]
-mod markdown;
-
-#[allow(dead_code)]
-mod model {
-    #[derive(Clone, Debug)]
-    pub enum AgentStage {
-        Translate,
-        Repair,
-        Revision,
-        Proofread,
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct Finding {
-        pub code: String,
-        pub message: String,
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct AgentTask {
-        pub id: String,
-        pub stage: AgentStage,
-        pub source_language: String,
-        pub target_language: String,
-        pub source: String,
-        pub previous_source: Option<String>,
-        pub previous_translation: Option<String>,
-        pub findings: Vec<Finding>,
-        pub protected_tokens: Vec<String>,
-    }
-}
-
-#[path = "../src/prompts.rs"]
-mod prompts;
-
-use markdown::{
+use fani::domain::markdown::{
     MarkdownError, ProtectedKind, UnitTranslation, apply_translations, extract_units,
     validate_translation,
 };
+use fani::domain::{model, prompts};
 
 const DOCUMENT: &str = r#"# Hello `{name}`
 

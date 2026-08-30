@@ -1,30 +1,26 @@
-use crate::agent::{AgentExecutor, CommandAgent};
-use crate::config::{Config, RepoConfig};
-use crate::db::{
-    AttemptCandidateInput, AttemptInput, CanonicalFileInput, Database, FindingInput, OutboxKind,
-    PullRequestStateInput, TrustTranslationInput,
+use crate::application::command::OutputReporter;
+use crate::application::ports::{
+    AgentExecutor, AttemptCandidateInput, AttemptInput, CanonicalFileInput, CodeHost,
+    EnsurePullRequest, FindingInput, GitPublisher, Materialization, MaterializationResult,
+    Materializer, OutboxKind, PublicationFile, PullRequestStateInput, StateStore,
+    TrustTranslationInput,
 };
-use crate::github::{EnsurePullRequest, GhClient, locale_branch};
-use crate::markdown::{
+use crate::application::settings::RepoConfig;
+use crate::domain::markdown::{
     MarkdownUnit, UnitTranslation, apply_translations, extract_units, validate_translation,
 };
-use crate::matching::{MatchKind, PreviousUnit, match_units};
-use crate::materialize::{
-    Materialization, MaterializationResult, apply as materialize, content_hash, restore, safe_path,
-};
-use crate::model::{
+use crate::domain::matching::{MatchKind, PreviousUnit, match_units};
+use crate::domain::model::{
     AgentResult, AgentStage, AgentTask, DecisionCode, Finding, FindingSeverity, LanguageOutcome,
     PlanSummary, Status,
 };
-use crate::process::current_process_identity;
-use crate::source;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 fn hash(parts: &[&[u8]]) -> String {
@@ -34,6 +30,29 @@ fn hash(parts: &[&[u8]]) -> String {
         digest.update(part);
     }
     format!("{:x}", digest.finalize())
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn target_path(repo: &RepoConfig, language: &str, source_path: &str) -> Result<PathBuf> {
+    let value = repo
+        .target_pattern
+        .replace("{lang}", language)
+        .replace("{relpath}", source_path);
+    let path = PathBuf::from(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("target path escapes repository: {}", path.display());
+    }
+    Ok(path)
 }
 
 fn kind_name(unit: &MarkdownUnit) -> String {
@@ -50,20 +69,23 @@ fn finding(path: &str, unit_id: Option<String>, code: &str, message: impl Into<S
     }
 }
 
-fn previous_units(rows: &[crate::db::UnitHistory]) -> Vec<PreviousUnit> {
+#[derive(Deserialize)]
+struct UnitContext {
+    kind: String,
+}
+
+fn previous_units(rows: &[crate::application::ports::UnitHistory]) -> Vec<PreviousUnit> {
     rows.iter()
         .filter_map(|row| {
-            let kind = serde_json::from_str::<serde_json::Value>(&row.context_json)
+            let kind = serde_json::from_str::<UnitContext>(&row.context_json)
                 .ok()?
-                .get("kind")?
-                .as_str()?
-                .to_owned();
+                .kind;
             let kind = match kind.as_str() {
-                "Paragraph" => crate::markdown::UnitKind::Paragraph,
-                "Heading" => crate::markdown::UnitKind::Heading,
-                "TableCell" => crate::markdown::UnitKind::TableCell,
-                "DefinitionTerm" => crate::markdown::UnitKind::DefinitionTerm,
-                "Definition" => crate::markdown::UnitKind::Definition,
+                "Paragraph" => crate::domain::markdown::UnitKind::Paragraph,
+                "Heading" => crate::domain::markdown::UnitKind::Heading,
+                "TableCell" => crate::domain::markdown::UnitKind::TableCell,
+                "DefinitionTerm" => crate::domain::markdown::UnitKind::DefinitionTerm,
+                "Definition" => crate::domain::markdown::UnitKind::Definition,
                 _ => return None,
             };
             Some(PreviousUnit {
@@ -98,34 +120,71 @@ struct PlannedDocument {
     expected_materialized_hash: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PublicationRecord {
+    content: String,
+    content_hash: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PublicationPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_remote_tip: Option<Option<String>>,
+    files: Vec<PublicationRecord>,
+    language: String,
+    source_revision: String,
+}
+
 pub struct Orchestrator<'a> {
-    config: &'a Config,
     repo: &'a RepoConfig,
-    database: &'a Database,
+    database: &'a dyn StateStore,
+    materializer: &'a dyn Materializer,
+    agents: &'a dyn AgentExecutor,
+    git: &'a dyn GitPublisher,
+    code_host: &'a dyn CodeHost,
     config_path: &'a Path,
+    owner_identity: &'a str,
+    failpoint: fn(&str),
+    output: &'a dyn OutputReporter,
     quiet: bool,
 }
 
 impl<'a> Orchestrator<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: &'a Config,
         repo: &'a RepoConfig,
-        database: &'a Database,
+        database: &'a dyn StateStore,
+        materializer: &'a dyn Materializer,
+        agents: &'a dyn AgentExecutor,
+        git: &'a dyn GitPublisher,
+        code_host: &'a dyn CodeHost,
         config_path: &'a Path,
+        owner_identity: &'a str,
+        failpoint: fn(&str),
+        output: &'a dyn OutputReporter,
         quiet: bool,
     ) -> Self {
         Self {
-            config,
             repo,
             database,
+            materializer,
+            agents,
+            git,
+            code_host,
             config_path,
+            owner_identity,
+            failpoint,
+            output,
             quiet,
         }
     }
 
     fn log(&self, message: &str) {
         if !self.quiet {
-            eprintln!("{message}");
+            self.output.stderr(message);
         }
     }
 
@@ -144,9 +203,9 @@ impl<'a> Orchestrator<'a> {
     }
 
     pub fn plan_language(&self, language: &str) -> Result<PlanSummary> {
-        let source_revision = source::resolve_source_revision(self.repo)?;
+        let source_revision = self.git.resolve_source_revision(self.repo)?;
         let repository_id = self.repository_id()?;
-        let documents = source::discover(self.repo, &source_revision)?;
+        let documents = self.git.discover(self.repo, &source_revision)?;
         let mut pending = 0;
         let mut reused = 0;
         let mut conflicts = 0;
@@ -213,7 +272,7 @@ impl<'a> Orchestrator<'a> {
         let mut conflicts = Vec::new();
         let mut reused = 0;
         let mut scheduled = 0;
-        let documents = source::discover(self.repo, source_revision)?;
+        let documents = self.git.discover(self.repo, source_revision)?;
         for document in documents {
             let source_text = String::from_utf8(document.bytes)
                 .with_context(|| format!("{} is not UTF-8", document.path))?;
@@ -325,14 +384,16 @@ impl<'a> Orchestrator<'a> {
                 }
                 units.push(planned);
             }
-            let target = source::target_path(self.repo, language, &document.path)?;
+            let target = target_path(self.repo, language, &document.path)?;
             let target_path = target.to_string_lossy().into_owned();
             let canonical = self
                 .database
                 .canonical_file(repository_id, language, &target_path)?;
             if let Some(canonical) = &canonical {
-                let disk = safe_path(&self.repo.path, &target)?;
-                let actual = fs::read(&disk).ok().map(|bytes| content_hash(&bytes));
+                let actual = self
+                    .materializer
+                    .read(&self.repo.path, &target)?
+                    .map(|bytes| content_hash(&bytes));
                 if actual.as_deref() == Some(canonical.content_hash.as_str()) {
                     if canonical.materialized_hash.as_deref()
                         != Some(canonical.content_hash.as_str())
@@ -370,8 +431,6 @@ impl<'a> Orchestrator<'a> {
         language: &str,
         documents: &mut [PlannedDocument],
     ) -> Result<Vec<AgentResult>> {
-        let config = self.config.agent_for("translate")?;
-        let executor = CommandAgent::new(config);
         let mut tasks = Vec::new();
         for document in documents.iter_mut() {
             for unit in &mut document.units {
@@ -430,12 +489,17 @@ impl<'a> Orchestrator<'a> {
                 });
             }
         }
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let execution = self.agents.execute(&tasks)?;
+        let agent_name = execution.agent;
+        let results = execution.results;
         self.log(&format!(
-            "    dispatching {} native Markdown unit(s) to {}",
+            "    dispatched {} native Markdown unit(s) to {}",
             tasks.len(),
-            config.name
+            agent_name
         ));
-        let results = executor.execute(&tasks)?;
         let by_id: HashMap<_, _> = results
             .iter()
             .map(|result| (result.task_id.as_str(), result))
@@ -465,7 +529,7 @@ impl<'a> Orchestrator<'a> {
                                     attempt: AttemptInput {
                                         work_item_id,
                                         dedupe_key: &dedupe_key,
-                                        agent: &config.name,
+                                        agent: &agent_name,
                                         status: "succeeded",
                                         request_json: &request_json,
                                         response_json: response_json.as_deref(),
@@ -477,14 +541,14 @@ impl<'a> Orchestrator<'a> {
                                     target_text: &result.output,
                                     score: Some(1.0),
                                 })?;
-                            crate::failpoint::reach("agent_candidate_committed");
+                            (self.failpoint)("agent_candidate_committed");
                             unit.translation = Some(result.output.clone());
                         }
                         Err(findings) => {
                             let receipt = self.database.record_attempt(AttemptInput {
                                 work_item_id,
                                 dedupe_key: &dedupe_key,
-                                agent: &config.name,
+                                agent: &agent_name,
                                 status: "failed",
                                 request_json: &request_json,
                                 response_json: response_json.as_deref(),
@@ -513,7 +577,7 @@ impl<'a> Orchestrator<'a> {
                     self.database.record_attempt(AttemptInput {
                         work_item_id,
                         dedupe_key: &dedupe_key,
-                        agent: &config.name,
+                        agent: &agent_name,
                         status,
                         request_json: &request_json,
                         response_json: None,
@@ -532,8 +596,6 @@ impl<'a> Orchestrator<'a> {
         documents: &mut [PlannedDocument],
         all_results: &mut Vec<AgentResult>,
     ) -> Result<usize> {
-        let config = self.config.agent_for("repair")?;
-        let executor = CommandAgent::new(config);
         let mut rounds = 0;
         for round in 0..self.repo.repair_budget {
             let mut tasks = Vec::new();
@@ -607,7 +669,9 @@ impl<'a> Orchestrator<'a> {
                 break;
             }
             rounds += 1;
-            let results = executor.execute(&tasks)?;
+            let execution = self.agents.execute(&tasks)?;
+            let agent_name = execution.agent;
+            let results = execution.results;
             let by_id: HashMap<_, _> = results
                 .iter()
                 .map(|result| (result.task_id.as_str(), result))
@@ -634,7 +698,7 @@ impl<'a> Orchestrator<'a> {
                                 attempt: AttemptInput {
                                     work_item_id,
                                     dedupe_key: &dedupe_key,
-                                    agent: &config.name,
+                                    agent: &agent_name,
                                     status: "succeeded",
                                     request_json: &request_json,
                                     response_json: response_json.as_deref(),
@@ -646,7 +710,7 @@ impl<'a> Orchestrator<'a> {
                                 target_text: &result.output,
                                 score: Some(1.0),
                             })?;
-                        crate::failpoint::reach("repair_candidate_committed");
+                        (self.failpoint)("repair_candidate_committed");
                         unit.translation = Some(result.output.clone());
                     } else {
                         let status = if result.code.as_deref()
@@ -659,7 +723,7 @@ impl<'a> Orchestrator<'a> {
                         self.database.record_attempt(AttemptInput {
                             work_item_id,
                             dedupe_key: &dedupe_key,
-                            agent: &config.name,
+                            agent: &agent_name,
                             status,
                             request_json: &request_json,
                             response_json: response_json.as_deref(),
@@ -696,8 +760,6 @@ impl<'a> Orchestrator<'a> {
             if !enabled {
                 continue;
             }
-            let config = self.config.agent_for(stage_name)?;
-            let executor = CommandAgent::new(config);
             let mut tasks = Vec::new();
             for document in documents.iter_mut() {
                 for unit in &mut document.units {
@@ -775,7 +837,9 @@ impl<'a> Orchestrator<'a> {
             if tasks.is_empty() {
                 continue;
             }
-            let results = executor.execute(&tasks)?;
+            let execution = self.agents.execute(&tasks)?;
+            let agent_name = execution.agent;
+            let results = execution.results;
             let by_id: HashMap<_, _> = results
                 .iter()
                 .map(|result| (result.task_id.as_str(), result))
@@ -807,7 +871,7 @@ impl<'a> Orchestrator<'a> {
                         self.database.record_attempt(AttemptInput {
                             work_item_id,
                             dedupe_key: &dedupe_key,
-                            agent: &config.name,
+                            agent: &agent_name,
                             status,
                             request_json: &request_json,
                             response_json: None,
@@ -830,7 +894,7 @@ impl<'a> Orchestrator<'a> {
                         self.database.record_attempt(AttemptInput {
                             work_item_id,
                             dedupe_key: &dedupe_key,
-                            agent: &config.name,
+                            agent: &agent_name,
                             status: "succeeded",
                             request_json: &request_json,
                             response_json: response_json.as_deref(),
@@ -846,7 +910,7 @@ impl<'a> Orchestrator<'a> {
                                         attempt: AttemptInput {
                                             work_item_id,
                                             dedupe_key: &dedupe_key,
-                                            agent: &config.name,
+                                            agent: &agent_name,
                                             status: "succeeded",
                                             request_json: &request_json,
                                             response_json: response_json.as_deref(),
@@ -858,14 +922,14 @@ impl<'a> Orchestrator<'a> {
                                         target_text: &result.output,
                                         score: Some(1.0),
                                     })?;
-                                crate::failpoint::reach("revision_candidate_committed");
+                                (self.failpoint)("revision_candidate_committed");
                                 unit.translation = Some(result.output.clone());
                             }
                             Err(validation) => {
                                 self.database.record_attempt(AttemptInput {
                                     work_item_id,
                                     dedupe_key: &dedupe_key,
-                                    agent: &config.name,
+                                    agent: &agent_name,
                                     status: "failed",
                                     request_json: &request_json,
                                     response_json: response_json.as_deref(),
@@ -883,7 +947,7 @@ impl<'a> Orchestrator<'a> {
                         self.database.record_attempt(AttemptInput {
                             work_item_id,
                             dedupe_key: &dedupe_key,
-                            agent: &config.name,
+                            agent: &agent_name,
                             status: "succeeded",
                             request_json: &request_json,
                             response_json: response_json.as_deref(),
@@ -993,8 +1057,7 @@ impl<'a> Orchestrator<'a> {
                     "path": document.target_path,
                 }))?,
             )?;
-            let (pid, started_at) = current_process_identity()?;
-            let owner = format!("materialize:{pid}:{started_at}:{run_id}");
+            let owner = format!("materialize:{}:{run_id}", self.owner_identity);
             let claimed = self.database.claim_outbox_key(
                 OutboxKind::Materialization,
                 &dedupe,
@@ -1008,10 +1071,10 @@ impl<'a> Orchestrator<'a> {
                     expected_hash: document.expected_materialized_hash.clone(),
                     desired,
                 };
-                let result = materialize(&self.repo.path, &operation);
+                let result = self.materializer.apply(&self.repo.path, &operation);
                 match result {
                     Ok(MaterializationResult::Written { hash }) => {
-                        crate::failpoint::reach("materialized_file_written");
+                        (self.failpoint)("materialized_file_written");
                         self.database.set_canonical_file_state(
                             canonical_id,
                             "materialized",
@@ -1065,7 +1128,7 @@ impl<'a> Orchestrator<'a> {
         if !self.repo.publish.github.enabled {
             return Ok(());
         }
-        let branch = locale_branch(&self.repo.publish.branch, language)?;
+        let branch = self.git.branch(self.repo, language)?;
         let Some(stored) =
             self.database
                 .pull_request_for_branch(repository_id, "github", &branch)?
@@ -1075,8 +1138,11 @@ impl<'a> Orchestrator<'a> {
         let Some(number) = stored.number else {
             return Ok(());
         };
-        let pull = GhClient::new(&self.repo.path)
-            .pull_request(&self.repo.publish.github.repository, &number.to_string())?;
+        let pull = self.code_host.pull_request(
+            self.repo,
+            &self.repo.publish.github.repository,
+            &number.to_string(),
+        )?;
         let state = if pull.state.eq_ignore_ascii_case("merged") {
             "merged"
         } else if pull.state.eq_ignore_ascii_case("open") && pull.draft {
@@ -1113,7 +1179,7 @@ impl<'a> Orchestrator<'a> {
                 "observe:{state}:{}",
                 pull.head_revision.as_deref().unwrap_or("unknown")
             ),
-            payload_json: &serde_json::to_string(&pull)?,
+            payload_json: &pull.payload_json,
         })?;
         if state == "merged" {
             self.database
@@ -1134,8 +1200,7 @@ impl<'a> Orchestrator<'a> {
             outcome.published.skipped = "publication is disabled".into();
             return Ok(());
         }
-        let (pid, started_at) = current_process_identity()?;
-        let owner = format!("publish:{pid}:{started_at}:{run_id}");
+        let owner = format!("publish:{}:{run_id}", self.owner_identity);
         let entry = if written.is_empty() {
             self.database.claim_publication_locale(
                 language,
@@ -1153,17 +1218,19 @@ impl<'a> Orchestrator<'a> {
                 let content = String::from_utf8(canonical.content).with_context(|| {
                     format!("canonical publication content is not UTF-8: {path}")
                 })?;
-                files.push(json!({
-                    "path": path,
-                    "content": content,
-                    "content_hash": canonical.content_hash,
-                }));
+                files.push(PublicationRecord {
+                    content,
+                    content_hash: canonical.content_hash,
+                    path: path.clone(),
+                });
             }
-            let payload = serde_json::to_string(&json!({
-                "files": files,
-                "language": language,
-                "source_revision": outcome.source_revision,
-            }))?;
+            let payload = serde_json::to_string(&PublicationPayload {
+                commit: None,
+                expected_remote_tip: None,
+                files,
+                language: language.to_owned(),
+                source_revision: outcome.source_revision.clone(),
+            })?;
             let dedupe = format!(
                 "publish:{repository_id}:{language}:{}",
                 hash(&[payload.as_bytes()])
@@ -1189,11 +1256,8 @@ impl<'a> Orchestrator<'a> {
             }
             return Ok(());
         };
-        let mut payload: serde_json::Value = serde_json::from_str(&entry.payload_json)?;
-        let payload_language = payload["language"]
-            .as_str()
-            .ok_or_else(|| anyhow!("publication outbox is missing language"))?;
-        if payload_language != language {
+        let mut payload: PublicationPayload = serde_json::from_str(&entry.payload_json)?;
+        if payload.language != language {
             self.database.retry_outbox(
                 OutboxKind::Publication,
                 entry.id,
@@ -1204,84 +1268,44 @@ impl<'a> Orchestrator<'a> {
             outcome.published.skipped = "another locale has pending publication recovery".into();
             return Ok(());
         }
-        let payload_source_revision = payload["source_revision"]
-            .as_str()
-            .ok_or_else(|| anyhow!("publication outbox is missing source revision"))?
-            .to_owned();
-        let records = payload["files"]
-            .as_array()
-            .cloned()
-            .ok_or_else(|| anyhow!("publication outbox is missing files"))?;
-        outcome.published = if let Some(commit) = payload["commit"].as_str() {
-            let expected_remote_tip = payload["expected_remote_tip"].as_str();
-            let mut published = crate::gitout::publish_pending_with_expected(
+        let payload_source_revision = payload.source_revision.clone();
+        let records = payload.files.clone();
+        outcome.published = if let Some(commit) = payload.commit.as_deref() {
+            let mut published = self.git.publish_pending(
                 self.repo,
                 language,
                 commit,
-                expected_remote_tip,
+                payload
+                    .expected_remote_tip
+                    .as_ref()
+                    .and_then(|tip| tip.as_deref()),
             )?;
-            published.paths = records
-                .iter()
-                .filter_map(|record| record["path"].as_str().map(str::to_owned))
-                .collect();
+            published.paths = records.iter().map(|record| record.path.clone()).collect();
             published
         } else {
             let mut durable_files = Vec::with_capacity(records.len());
             for record in &records {
-                let path = record["path"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("publication file is missing path"))?;
-                let content = record["content"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("publication file is missing durable content"))?;
-                let expected_hash = record["content_hash"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("publication file is missing content hash"))?;
-                if content_hash(content.as_bytes()) != expected_hash {
-                    bail!("durable publication content hash changed for {path}");
+                if content_hash(record.content.as_bytes()) != record.content_hash {
+                    bail!(
+                        "durable publication content hash changed for {}",
+                        record.path
+                    );
                 }
-                durable_files.push((path.to_owned(), content.as_bytes().to_vec()));
-            }
-            let branch = locale_branch(&self.repo.publish.branch, language)?;
-            let message = format!(
-                "i18n({language}): update {} translated file(s)",
-                durable_files.len()
-            );
-            let candidate = crate::gitout::create_candidate_from_contents(
-                &self.repo.path,
-                &payload_source_revision,
-                &branch,
-                &durable_files,
-                &message,
-            )?;
-            let mut prepared = crate::model::Published {
-                branch,
-                commit: candidate.commit.clone(),
-                paths: candidate
-                    .changes
-                    .iter()
-                    .map(|change| change.path.clone())
-                    .collect(),
-                ..crate::model::Published::default()
-            };
-            if candidate.previous_tip.as_deref() == Some(candidate.commit.as_str()) {
-                prepared.skipped = "the translations are already committed".into();
-            }
-            let expected_remote_tip = if self.repo.publish.push {
-                crate::gitout::remote_branch_tip(
-                    &self.repo.path,
-                    &self.repo.publish.remote,
-                    &prepared.branch,
-                )?
-            } else {
-                None
-            };
-            payload["commit"] = serde_json::Value::String(prepared.commit.clone());
-            payload["expected_remote_tip"] = expected_remote_tip
-                .as_ref()
-                .map_or(serde_json::Value::Null, |tip| {
-                    serde_json::Value::String(tip.clone())
+                durable_files.push(PublicationFile {
+                    path: record.path.clone(),
+                    content: record.content.as_bytes().to_vec(),
                 });
+            }
+            let prepared_publication = self.git.prepare(
+                self.repo,
+                language,
+                &payload_source_revision,
+                &durable_files,
+            )?;
+            let mut prepared = prepared_publication.published;
+            let expected_remote_tip = prepared_publication.expected_remote_tip;
+            payload.commit = Some(prepared.commit.clone());
+            payload.expected_remote_tip = Some(expected_remote_tip.clone());
             let durable_payload = serde_json::to_string(&payload)?;
             if !self.database.update_outbox_payload(
                 OutboxKind::Publication,
@@ -1291,9 +1315,9 @@ impl<'a> Orchestrator<'a> {
             )? {
                 bail!("publication outbox ownership changed before commit persistence");
             }
-            crate::failpoint::reach("publication_candidate_persisted");
+            (self.failpoint)("publication_candidate_persisted");
             if self.repo.publish.push {
-                let pushed = crate::gitout::publish_pending_with_expected(
+                let pushed = self.git.publish_pending(
                     self.repo,
                     language,
                     &prepared.commit,
@@ -1314,25 +1338,26 @@ impl<'a> Orchestrator<'a> {
             )?;
             bail!("{}", outcome.published.error);
         }
-        crate::failpoint::reach("publication_side_effect_completed");
+        (self.failpoint)("publication_side_effect_completed");
         let reconcile = (|| -> Result<()> {
             if self.repo.publish.github.enabled && outcome.published.pushed {
-                let branch = locale_branch(&self.repo.publish.branch, language)?;
+                let branch = self.git.branch(self.repo, language)?;
                 let title = format!("i18n({language}): update translated documentation");
                 let body = format!(
                     "Automated verified documentation translation from `{}`.",
                     outcome.source_revision
                 );
-                let reconciled =
-                    GhClient::new(&self.repo.path).ensure_pull_request(EnsurePullRequest {
+                let reconciled = self.code_host.ensure_pull_request(
+                    self.repo,
+                    EnsurePullRequest {
                         repository: &self.repo.publish.github.repository,
                         head: &branch,
                         base: &self.repo.publish.github.base,
                         title: &title,
                         body: &body,
                         draft: self.repo.publish.github.draft,
-                        durable: None,
-                    })?;
+                    },
+                )?;
                 outcome.published.pr_number = Some(reconciled.pull_request.number);
                 outcome.published.pr_url = Some(reconciled.pull_request.url.clone());
                 let pr_state = if reconciled.pull_request.state.eq_ignore_ascii_case("merged") {
@@ -1356,7 +1381,7 @@ impl<'a> Orchestrator<'a> {
                     state: pr_state,
                     head_revision: Some(&outcome.published.commit),
                     event_key: &format!("ensure:{}", outcome.published.commit),
-                    payload_json: &serde_json::to_string(&reconciled)?,
+                    payload_json: &reconciled.payload_json,
                 })?;
             }
             Ok(())
@@ -1384,7 +1409,7 @@ impl<'a> Orchestrator<'a> {
         let started = Instant::now();
         let mut outcome = LanguageOutcome::new(&self.repo.path, language);
         let result = (|| -> Result<()> {
-            let source_revision = source::resolve_source_revision(self.repo)?;
+            let source_revision = self.git.resolve_source_revision(self.repo)?;
             outcome.source_revision = source_revision.clone();
             let repository_id = self.repository_id()?;
             self.reconcile_pull_request(repository_id, language)?;
@@ -1503,7 +1528,13 @@ impl<'a> Orchestrator<'a> {
     }
 }
 
-pub fn adopt_human_edit(repo: &RepoConfig, database: &Database, language: &str) -> Result<usize> {
+pub fn adopt_human_edit(
+    repo: &RepoConfig,
+    database: &dyn StateStore,
+    materializer: &dyn Materializer,
+    git: &dyn GitPublisher,
+    language: &str,
+) -> Result<usize> {
     let repository_key = repo
         .path
         .canonicalize()
@@ -1514,18 +1545,18 @@ pub fn adopt_human_edit(repo: &RepoConfig, database: &Database, language: &str) 
         Some(&repo.publish.github.base),
         None,
     )?;
-    let source_revision = source::resolve_source_revision(repo)?;
-    let documents = source::discover(repo, &source_revision)?;
+    let source_revision = git.resolve_source_revision(repo)?;
+    let documents = git.discover(repo, &source_revision)?;
     let mut adopted = 0;
     for document in documents {
-        let target = source::target_path(repo, language, &document.path)?
+        let target = target_path(repo, language, &document.path)?
             .to_string_lossy()
             .into_owned();
         let Some(canonical) = database.canonical_file(repository_id, language, &target)? else {
             continue;
         };
-        let target_disk_path = safe_path(&repo.path, Path::new(&target))?;
-        let bytes = fs::read(&target_disk_path)
+        let bytes = materializer
+            .read(&repo.path, Path::new(&target))?
             .with_context(|| format!("cannot read human target {target}"))?;
         let target_text = std::str::from_utf8(&bytes).context("human target is not UTF-8")?;
         let source_text =
@@ -1605,7 +1636,13 @@ pub fn adopt_human_edit(repo: &RepoConfig, database: &Database, language: &str) 
     Ok(adopted)
 }
 
-pub fn discard_human_edit(repo: &RepoConfig, database: &Database, language: &str) -> Result<usize> {
+pub fn discard_human_edit(
+    repo: &RepoConfig,
+    database: &dyn StateStore,
+    materializer: &dyn Materializer,
+    git: &dyn GitPublisher,
+    language: &str,
+) -> Result<usize> {
     let repository_key = repo
         .path
         .canonicalize()
@@ -1616,11 +1653,11 @@ pub fn discard_human_edit(repo: &RepoConfig, database: &Database, language: &str
         Some(&repo.publish.github.base),
         None,
     )?;
-    let source_revision = source::resolve_source_revision(repo)?;
-    let documents = source::discover(repo, &source_revision)?;
+    let source_revision = git.resolve_source_revision(repo)?;
+    let documents = git.discover(repo, &source_revision)?;
     let mut discarded = 0;
     for document in documents {
-        let target = source::target_path(repo, language, &document.path)?
+        let target = target_path(repo, language, &document.path)?
             .to_string_lossy()
             .into_owned();
         let Some(canonical) = database.canonical_file(repository_id, language, &target)? else {
@@ -1631,7 +1668,7 @@ pub fn discard_human_edit(repo: &RepoConfig, database: &Database, language: &str
             expected_hash: None,
             desired: canonical.content.clone(),
         };
-        let result = restore(&repo.path, &operation)?;
+        let result = materializer.restore(&repo.path, &operation)?;
         let hash = match result {
             MaterializationResult::Written { hash }
             | MaterializationResult::AlreadyCurrent { hash } => hash,

@@ -1,4 +1,9 @@
-use crate::process::process_identity;
+use crate::adapters::process::process_identity;
+use crate::application::ports::{
+    AttemptCandidateInput, AttemptInput, AttemptReceipt, CanonicalFile, CanonicalFileInput,
+    FindingInput, OutboxEntry, OutboxKind, PullRequestStateInput, RecoveredAttempt, StateStore,
+    StoredPullRequest, TrustTranslationInput, UnitHistory,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -252,101 +257,6 @@ pub struct Database {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AttemptReceipt {
-    pub id: i64,
-    pub inserted: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct AttemptInput<'a> {
-    pub work_item_id: i64,
-    pub dedupe_key: &'a str,
-    pub agent: &'a str,
-    pub status: &'a str,
-    pub request_json: &'a str,
-    pub response_json: Option<&'a str>,
-    pub error: Option<&'a str>,
-}
-
-#[derive(Clone, Debug)]
-pub struct AttemptCandidateInput<'a> {
-    pub attempt: AttemptInput<'a>,
-    pub unit_id: i64,
-    pub locale: &'a str,
-    pub candidate_key: &'a str,
-    pub target_text: &'a str,
-    pub score: Option<f64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveredAttempt {
-    pub id: i64,
-    pub output: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct TrustTranslationInput<'a> {
-    pub repository_id: i64,
-    pub unit_id: Option<i64>,
-    pub locale: &'a str,
-    pub source_hash: &'a str,
-    pub context_key: &'a str,
-    pub target_text: &'a str,
-    pub provenance: &'a str,
-}
-
-#[derive(Clone, Debug)]
-pub struct FindingInput<'a> {
-    pub work_item_id: i64,
-    pub attempt_id: Option<i64>,
-    pub finding_key: &'a str,
-    pub severity: &'a str,
-    pub code: &'a str,
-    pub message: &'a str,
-    pub details_json: &'a str,
-}
-
-#[derive(Clone, Debug)]
-pub struct PullRequestStateInput<'a> {
-    pub repository_id: i64,
-    pub provider: &'a str,
-    pub external_id: &'a str,
-    pub number: Option<i64>,
-    pub branch: &'a str,
-    pub url: Option<&'a str>,
-    pub state: &'a str,
-    pub head_revision: Option<&'a str>,
-    pub event_key: &'a str,
-    pub payload_json: &'a str,
-}
-
-#[derive(Clone, Debug)]
-pub struct CanonicalFileInput<'a> {
-    pub repository_id: i64,
-    pub locale: &'a str,
-    pub path: &'a str,
-    pub source_revision: &'a str,
-    pub content: &'a [u8],
-    pub content_hash: &'a str,
-    pub materialized_hash: Option<&'a str>,
-    pub state: &'a str,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OutboxKind {
-    Materialization,
-    Publication,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OutboxEntry {
-    pub id: i64,
-    pub dedupe_key: String,
-    pub payload_json: String,
-    pub attempt_count: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lease {
     pub resource_type: String,
     pub resource_key: String,
@@ -354,38 +264,6 @@ pub struct Lease {
     pub fencing_token: i64,
     pub acquired_at: i64,
     pub expires_at: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CanonicalFile {
-    pub id: i64,
-    pub source_revision: String,
-    pub content: Vec<u8>,
-    pub content_hash: String,
-    pub materialized_hash: Option<String>,
-    pub state: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredPullRequest {
-    pub external_id: String,
-    pub number: Option<i64>,
-    pub branch: String,
-    pub url: Option<String>,
-    pub state: String,
-    pub head_revision: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnitHistory {
-    pub id: i64,
-    pub unit_key: String,
-    pub ordinal: usize,
-    pub source_text: String,
-    pub source_hash: String,
-    pub context_json: String,
-    pub translation: Option<String>,
-    pub trusted: bool,
 }
 
 impl Database {
@@ -1555,6 +1433,276 @@ fn new_id(prefix: &str) -> String {
         std::process::id(),
         ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+impl StateStore for Database {
+    fn upsert_repository(
+        &self,
+        repository_key: &str,
+        root_path: &Path,
+        default_branch: Option<&str>,
+        remote_url: Option<&str>,
+    ) -> Result<i64> {
+        Database::upsert_repository(self, repository_key, root_path, default_branch, remote_url)
+    }
+
+    fn upsert_document(
+        &self,
+        repository_id: i64,
+        path: &str,
+        source_revision: Option<&str>,
+        content_hash: &str,
+        metadata_json: &str,
+    ) -> Result<i64> {
+        Database::upsert_document(
+            self,
+            repository_id,
+            path,
+            source_revision,
+            content_hash,
+            metadata_json,
+        )
+    }
+
+    fn upsert_unit(
+        &self,
+        document_id: i64,
+        unit_key: &str,
+        ordinal: i64,
+        source_text: &str,
+        source_hash: &str,
+        context_json: &str,
+    ) -> Result<i64> {
+        Database::upsert_unit(
+            self,
+            document_id,
+            unit_key,
+            ordinal,
+            source_text,
+            source_hash,
+            context_json,
+        )
+    }
+
+    fn unit_history(&self, document_id: i64, locale: &str) -> Result<Vec<UnitHistory>> {
+        Database::unit_history(self, document_id, locale)
+    }
+
+    fn trusted_translation(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        source_hash: &str,
+        context_key: &str,
+    ) -> Result<Option<String>> {
+        Database::trusted_translation(self, repository_id, locale, source_hash, context_key)
+    }
+
+    fn trust_translation(&self, input: TrustTranslationInput<'_>) -> Result<i64> {
+        Database::trust_translation(self, input)
+    }
+
+    fn begin_run(
+        &self,
+        repository_id: i64,
+        invocation_key: &str,
+        config_path: &Path,
+        metadata_json: &str,
+    ) -> Result<String> {
+        Database::begin_run(
+            self,
+            repository_id,
+            invocation_key,
+            config_path,
+            metadata_json,
+        )
+    }
+
+    fn finish_run(&self, run_id: &str, status: &str) -> Result<bool> {
+        Database::finish_run(self, run_id, status)
+    }
+
+    fn enqueue_work_item(
+        &self,
+        run_id: &str,
+        unit_id: i64,
+        locale: &str,
+        kind: &str,
+        priority: i64,
+        input_json: &str,
+    ) -> Result<i64> {
+        Database::enqueue_work_item(self, run_id, unit_id, locale, kind, priority, input_json)
+    }
+
+    fn successful_attempt(
+        &self,
+        work_item_id: i64,
+        dedupe_key: &str,
+    ) -> Result<Option<RecoveredAttempt>> {
+        Database::successful_attempt(self, work_item_id, dedupe_key)
+    }
+
+    fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>> {
+        Database::attempt_status(self, work_item_id, dedupe_key)
+    }
+
+    fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt> {
+        Database::record_attempt(self, input)
+    }
+
+    fn record_attempt_candidate(&self, input: AttemptCandidateInput<'_>) -> Result<AttemptReceipt> {
+        Database::record_attempt_candidate(self, input)
+    }
+
+    fn select_canonical_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        candidate_key: &str,
+        target_text: &str,
+        source_attempt_id: Option<i64>,
+        score: Option<f64>,
+    ) -> Result<i64> {
+        Database::select_canonical_candidate(
+            self,
+            unit_id,
+            locale,
+            candidate_key,
+            target_text,
+            source_attempt_id,
+            score,
+        )
+    }
+
+    fn record_finding(&self, input: FindingInput<'_>) -> Result<i64> {
+        Database::record_finding(self, input)
+    }
+
+    fn canonical_file(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        path: &str,
+    ) -> Result<Option<CanonicalFile>> {
+        Database::canonical_file(self, repository_id, locale, path)
+    }
+
+    fn upsert_canonical_file(&self, input: CanonicalFileInput<'_>) -> Result<i64> {
+        Database::upsert_canonical_file(self, input)
+    }
+
+    fn set_canonical_file_state(
+        &self,
+        id: i64,
+        state: &str,
+        materialized_hash: Option<&str>,
+    ) -> Result<()> {
+        Database::set_canonical_file_state(self, id, state, materialized_hash)
+    }
+
+    fn supersede_materializations(
+        &self,
+        locale: &str,
+        path: &str,
+        active_dedupe_key: &str,
+    ) -> Result<usize> {
+        Database::supersede_materializations(self, locale, path, active_dedupe_key)
+    }
+
+    fn enqueue_materialization(
+        &self,
+        work_item_id: i64,
+        dedupe_key: &str,
+        payload_json: &str,
+    ) -> Result<i64> {
+        Database::enqueue_materialization(self, work_item_id, dedupe_key, payload_json)
+    }
+
+    fn claim_outbox_key(
+        &self,
+        kind: OutboxKind,
+        dedupe_key: &str,
+        owner: &str,
+        now: i64,
+        lease_ms: i64,
+    ) -> Result<Option<OutboxEntry>> {
+        Database::claim_outbox_key(self, kind, dedupe_key, owner, now, lease_ms)
+    }
+
+    fn retry_outbox(
+        &self,
+        kind: OutboxKind,
+        id: i64,
+        owner: &str,
+        error: &str,
+        available_at: i64,
+    ) -> Result<bool> {
+        Database::retry_outbox(self, kind, id, owner, error, available_at)
+    }
+
+    fn complete_outbox(&self, kind: OutboxKind, id: i64, owner: &str) -> Result<bool> {
+        Database::complete_outbox(self, kind, id, owner)
+    }
+
+    fn enqueue_publication(
+        &self,
+        repository_id: i64,
+        run_id: Option<&str>,
+        locale: &str,
+        dedupe_key: &str,
+        payload_json: &str,
+    ) -> Result<i64> {
+        Database::enqueue_publication(
+            self,
+            repository_id,
+            run_id,
+            locale,
+            dedupe_key,
+            payload_json,
+        )
+    }
+
+    fn claim_publication_locale(
+        &self,
+        locale: &str,
+        owner: &str,
+        now: i64,
+        lease_ms: i64,
+    ) -> Result<Option<OutboxEntry>> {
+        Database::claim_publication_locale(self, locale, owner, now, lease_ms)
+    }
+
+    fn update_outbox_payload(
+        &self,
+        kind: OutboxKind,
+        id: i64,
+        owner: &str,
+        payload_json: &str,
+    ) -> Result<bool> {
+        Database::update_outbox_payload(self, kind, id, owner, payload_json)
+    }
+
+    fn pull_request_for_branch(
+        &self,
+        repository_id: i64,
+        provider: &str,
+        branch: &str,
+    ) -> Result<Option<StoredPullRequest>> {
+        Database::pull_request_for_branch(self, repository_id, provider, branch)
+    }
+
+    fn record_pr_state(&self, input: PullRequestStateInput<'_>) -> Result<i64> {
+        Database::record_pr_state(self, input)
+    }
+
+    fn promote_merged_locale(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        provenance: &str,
+    ) -> Result<usize> {
+        Database::promote_merged_locale(self, repository_id, locale, provenance)
+    }
 }
 
 #[cfg(test)]

@@ -1,13 +1,13 @@
-use crate::config::RepoConfig;
-use crate::model::Published;
-use crate::process::{
+use crate::adapters::process::{
     enable_subreaper, finish_process_group, process_token, spawn_tracked, terminate_process_group,
     wrapped_command,
 };
+use crate::application::ports::{GitPublisher, PreparedPublication, PublicationFile};
+use crate::application::settings::RepoConfig;
+use crate::domain::model::Published;
 use anyhow::{Context, Result, anyhow, bail};
 use nix::unistd::{Pid, setpgid};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -312,60 +312,6 @@ fn checked_path(path: &str) -> Result<String> {
     Ok(candidate.to_string_lossy().into_owned())
 }
 
-fn reported_paths(written: &[Value]) -> Result<Vec<String>> {
-    let mut paths = BTreeMap::<String, ()>::new();
-    for item in written {
-        let Some(path) = item
-            .get("target")
-            .or_else(|| item.get("path"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        paths.insert(checked_path(path)?, ());
-    }
-    Ok(paths.into_keys().collect())
-}
-
-pub fn classify_changes(
-    repo: &RepoConfig,
-    base_treeish: &str,
-    written: &[Value],
-) -> Result<Vec<PathChange>> {
-    let git = Git::new(&repo.path);
-    let mut changes = Vec::new();
-    for path in reported_paths(written)? {
-        let entry = git.tree_entry(base_treeish, &path)?;
-        if entry.as_ref().is_some_and(|entry| entry.kind != "blob") {
-            bail!("publication path {path:?} is not a blob in the candidate tree");
-        }
-        let disk = repo.path.join(&path);
-        let kind = if disk.exists() {
-            let metadata = fs::symlink_metadata(&disk)
-                .with_context(|| format!("cannot inspect publication path {}", disk.display()))?;
-            if !metadata.file_type().is_file() {
-                bail!(
-                    "publication path must be a regular file: {}",
-                    disk.display()
-                );
-            }
-            if entry.is_some() {
-                ChangeKind::Modify
-            } else {
-                ChangeKind::Add
-            }
-        } else if entry.is_some() {
-            ChangeKind::Delete
-        } else {
-            bail!(
-                "reported publication path does not exist in the worktree or candidate tree: {path}"
-            );
-        };
-        changes.push(PathChange { path, kind });
-    }
-    Ok(changes)
-}
-
 pub fn create_candidate(
     repo_path: &Path,
     source_ref: &str,
@@ -568,59 +514,6 @@ pub fn push_candidate(
     Ok(())
 }
 
-pub fn allowed_paths(written: &[Value]) -> Result<Vec<String>> {
-    reported_paths(written)
-}
-
-pub fn publish(repo: &RepoConfig, lang: &str, written: &[Value]) -> Result<Published> {
-    let branch = repo.publish.branch.replace("{lang}", lang);
-    let mut result = Published {
-        branch: branch.clone(),
-        ..Published::default()
-    };
-    if !repo.publish.enabled {
-        result.skipped = "publication is disabled for this repo".into();
-        return Ok(result);
-    }
-    if written.is_empty() {
-        result.skipped = "nothing was written".into();
-        return Ok(result);
-    }
-
-    let git = Git::new(&repo.path);
-    let source = git.snapshot(&repo.publish.source_ref)?;
-    let candidate_ref = format!("refs/heads/{branch}");
-    let _previous_tip = git.rev(&candidate_ref)?;
-    let changes = classify_changes(repo, &source.tree, written)?;
-    result.paths = changes.iter().map(|change| change.path.clone()).collect();
-    if changes.is_empty() {
-        result.skipped = "no allowlisted publication paths were reported".into();
-        return Ok(result);
-    }
-
-    let message = format!("i18n({lang}): update {} translated file(s)", changes.len());
-    let candidate = create_candidate(&repo.path, &source.commit, &branch, &changes, &message)?;
-    result.commit = candidate.commit.clone();
-    if candidate.previous_tip.as_deref() == Some(candidate.commit.as_str()) {
-        result.skipped = "the translations are already committed".into();
-    }
-    if repo.publish.push {
-        let expected_remote = git.remote_tip(&repo.publish.remote, &branch)?;
-        match push_candidate(
-            &repo.path,
-            &repo.publish.remote,
-            &candidate,
-            expected_remote.as_deref(),
-        ) {
-            Ok(()) => result.pushed = true,
-            Err(error) => {
-                result.error = format!("could not push commit {}: {error}", result.commit);
-            }
-        }
-    }
-    Ok(result)
-}
-
 pub fn remote_branch_tip(repo_path: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
     Git::new(repo_path).remote_tip(remote, branch)
 }
@@ -681,41 +574,80 @@ pub fn publish_pending_with_expected(
     Ok(result)
 }
 
-pub fn publish_pending(repo: &RepoConfig, lang: &str, commit: &str) -> Result<Published> {
-    let branch = repo.publish.branch.replace("{lang}", lang);
-    let mut result = Published {
-        branch: branch.clone(),
-        commit: commit.to_string(),
-        skipped: "retrying a previously failed push".into(),
-        ..Published::default()
-    };
-    if !repo.publish.enabled || !repo.publish.push {
-        return Ok(result);
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeGitPublisher;
+
+impl GitPublisher for NativeGitPublisher {
+    fn resolve_source_revision(&self, repo: &RepoConfig) -> Result<String> {
+        crate::adapters::source::resolve_source_revision(repo)
     }
-    let git = Git::new(&repo.path);
-    let candidate_ref = format!("refs/heads/{branch}");
-    if git.rev(&candidate_ref)?.as_deref() != Some(commit) {
-        bail!("pending commit {commit} is no longer the tip of {candidate_ref}");
+
+    fn discover(
+        &self,
+        repo: &RepoConfig,
+        source_revision: &str,
+    ) -> Result<Vec<crate::domain::model::SourceDocument>> {
+        crate::adapters::source::discover(repo, source_revision)
     }
-    let source = git.snapshot(&repo.publish.source_ref)?;
-    let tree = git.run(["rev-parse", &format!("{commit}^{{tree}}")], None, true)?;
-    let candidate = CandidateCommit {
-        branch: branch.clone(),
-        commit: commit.to_string(),
-        tree,
-        previous_tip: Some(commit.to_string()),
-        source,
-        changes: Vec::new(),
-    };
-    let expected_remote = git.remote_tip(&repo.publish.remote, &branch)?;
-    match push_candidate(
-        &repo.path,
-        &repo.publish.remote,
-        &candidate,
-        expected_remote.as_deref(),
-    ) {
-        Ok(()) => result.pushed = true,
-        Err(error) => result.error = format!("could not push commit {commit}: {error}"),
+
+    fn branch(&self, repo: &RepoConfig, language: &str) -> Result<String> {
+        crate::adapters::github::locale_branch(&repo.publish.branch, language)
     }
-    Ok(result)
+
+    fn prepare(
+        &self,
+        repo: &RepoConfig,
+        language: &str,
+        source_revision: &str,
+        files: &[PublicationFile],
+    ) -> Result<PreparedPublication> {
+        let branch = self.branch(repo, language)?;
+        let message = format!(
+            "i18n({language}): update {} translated file(s)",
+            files.len()
+        );
+        let durable_files: Vec<_> = files
+            .iter()
+            .map(|file| (file.path.clone(), file.content.clone()))
+            .collect();
+        let candidate = create_candidate_from_contents(
+            &repo.path,
+            source_revision,
+            &branch,
+            &durable_files,
+            &message,
+        )?;
+        let mut published = Published {
+            branch,
+            commit: candidate.commit.clone(),
+            paths: candidate
+                .changes
+                .iter()
+                .map(|change| change.path.clone())
+                .collect(),
+            ..Published::default()
+        };
+        if candidate.previous_tip.as_deref() == Some(candidate.commit.as_str()) {
+            published.skipped = "the translations are already committed".into();
+        }
+        let expected_remote_tip = if repo.publish.push {
+            remote_branch_tip(&repo.path, &repo.publish.remote, &published.branch)?
+        } else {
+            None
+        };
+        Ok(PreparedPublication {
+            published,
+            expected_remote_tip,
+        })
+    }
+
+    fn publish_pending(
+        &self,
+        repo: &RepoConfig,
+        language: &str,
+        commit: &str,
+        expected_remote_tip: Option<&str>,
+    ) -> Result<Published> {
+        publish_pending_with_expected(repo, language, commit, expected_remote_tip)
+    }
 }

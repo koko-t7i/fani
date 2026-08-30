@@ -1,4 +1,4 @@
-use crate::model::{LanguageOutcome, Status};
+use crate::domain::model::{LanguageOutcome, Status};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use serde_json::{Value, json};

@@ -1,9 +1,10 @@
-use crate::config::AgentConfig;
-use crate::model::{AgentResult, AgentTask, DecisionCode};
-use crate::process::{
+use crate::adapters::config::{AgentConfig, Config};
+use crate::adapters::process::{
     enable_subreaper, finish_process_group, process_token, spawn_tracked, terminate_process_group,
     wrapped_command,
 };
+use crate::application::ports::{AgentExecution, AgentExecutor};
+use crate::domain::model::{AgentResult, AgentTask, DecisionCode};
 use anyhow::{Context, Result, anyhow};
 use nix::unistd::{Pid, setpgid};
 use std::io::{Read, Write};
@@ -300,10 +301,6 @@ fn execute_once(
     Ok((output, diagnostic, started.elapsed().as_secs_f64()))
 }
 
-pub trait AgentExecutor: Send + Sync {
-    fn execute(&self, tasks: &[AgentTask]) -> Result<Vec<AgentResult>>;
-}
-
 #[derive(Clone)]
 pub struct CommandAgent {
     config: AgentConfig,
@@ -317,7 +314,7 @@ impl CommandAgent {
     }
 
     fn execute_one(&self, task: &AgentTask) -> AgentResult {
-        let prompt = crate::prompts::render(task);
+        let prompt = crate::domain::prompts::render(task);
         let started = Instant::now();
         let mut last_code = DecisionCode::AgentExit.as_str().to_owned();
         let mut last_message = String::new();
@@ -352,7 +349,7 @@ impl CommandAgent {
     }
 }
 
-impl AgentExecutor for CommandAgent {
+impl CommandAgent {
     fn execute(&self, tasks: &[AgentTask]) -> Result<Vec<AgentResult>> {
         if tasks.is_empty() {
             return Ok(Vec::new());
@@ -384,6 +381,37 @@ impl AgentExecutor for CommandAgent {
         let mut output = output.lock().expect("Agent output lock").clone();
         output.sort_by_key(|(index, _)| *index);
         Ok(output.into_iter().map(|(_, result)| result).collect())
+    }
+}
+
+pub struct RoutedAgentExecutor<'a> {
+    config: &'a Config,
+}
+
+impl<'a> RoutedAgentExecutor<'a> {
+    pub fn new(config: &'a Config) -> Self {
+        Self { config }
+    }
+
+    fn config_for_tasks(&self, tasks: &[AgentTask]) -> Result<&AgentConfig> {
+        let stage = tasks
+            .first()
+            .map(|task| &task.stage)
+            .ok_or_else(|| anyhow!("cannot route an empty Agent task batch"))?;
+        if tasks.iter().any(|task| task.stage != *stage) {
+            return Err(anyhow!("Agent task batch contains multiple stages"));
+        }
+        self.config.agent_for(stage.as_str()).map_err(Into::into)
+    }
+}
+
+impl AgentExecutor for RoutedAgentExecutor<'_> {
+    fn execute(&self, tasks: &[AgentTask]) -> Result<AgentExecution> {
+        let config = self.config_for_tasks(tasks)?;
+        Ok(AgentExecution {
+            agent: config.name.clone(),
+            results: CommandAgent::new(config).execute(tasks)?,
+        })
     }
 }
 

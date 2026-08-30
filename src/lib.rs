@@ -1,21 +1,36 @@
-pub mod agent;
-pub mod cli;
-pub mod config;
-pub mod db;
-mod failpoint;
-pub mod github;
-pub mod gitout;
-pub mod lock;
-pub mod markdown;
-pub mod matching;
-pub mod materialize;
-pub mod model;
-pub mod orchestrator;
-mod process;
-pub mod prompts;
-pub mod report;
-pub mod source;
+mod adapters;
+pub mod application;
+mod cli;
+mod composition;
+pub mod domain;
 
-pub use process::run_process_wrapper_if_requested;
+pub use adapters::process::run_process_wrapper_if_requested;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn run_cli() -> i32 {
+    cli::run()
+}
+
+#[doc(hidden)]
+pub mod test_support {
+    pub mod db {
+        pub use crate::adapters::db::Database;
+        pub use crate::application::ports::{
+            AttemptCandidateInput, AttemptInput, OutboxKind, TrustTranslationInput,
+        };
+    }
+
+    pub mod github {
+        pub use crate::adapters::github::{
+            EnsurePullRequest, GhClient, ReconcileAction, locale_branch,
+        };
+    }
+
+    pub mod gitout {
+        pub use crate::adapters::gitout::{
+            CandidateCommit, ChangeKind, PathChange, create_candidate,
+            create_candidate_from_contents, push_candidate,
+        };
+    }
+}

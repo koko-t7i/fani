@@ -1,4 +1,6 @@
-use fani::db::{AttemptCandidateInput, AttemptInput, Database, OutboxKind, TrustTranslationInput};
+use fani::test_support::db::{
+    AttemptCandidateInput, AttemptInput, Database, OutboxKind, TrustTranslationInput,
+};
 use rusqlite::params;
 use std::fs;
 use tempfile::TempDir;
