@@ -6,6 +6,7 @@ use std::time::Instant;
 pub fn execute(request: CommandRequest, output: &dyn OutputReporter) -> Result<CommandOutput> {
     crate::diagnostics::init();
     let command = match &request {
+        CommandRequest::Init(_) => "init",
         CommandRequest::Sync(_) => "sync",
         CommandRequest::Status(_) => "status",
         CommandRequest::Check(_) => "check",

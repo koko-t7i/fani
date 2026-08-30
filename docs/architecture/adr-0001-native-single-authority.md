@@ -22,7 +22,7 @@ main -> cli -> application -> domain
                  adapters
 ```
 
-The application layer owns the coarse I/O ports `StateStore`, `AgentExecutor`, `Materializer`, `GitPublisher`, and `CodeHost`. Concrete SQLite, process, filesystem, Git, and GitHub adapters are wired only at the outer composition root. The domain contains pure Markdown extraction, matching, protected-syntax handling, assembly, and verification.
+The application layer owns the coarse I/O ports `StateStore`, `AgentExecutor`, `Materializer`, `GitPublisher`, and `CodeHost`. Concrete SQLite, HTTPS provider, process, filesystem, Git, and GitHub adapters are wired only at the outer composition root. The domain contains pure Markdown extraction, matching, protected-syntax handling, assembly, and verification.
 
 The runtime authority boundaries are:
 

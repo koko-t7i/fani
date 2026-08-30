@@ -11,6 +11,16 @@ pub struct Selection {
 }
 
 #[derive(Clone, Debug)]
+pub struct InitRequest {
+    pub config: PathBuf,
+    pub repository: PathBuf,
+    pub language: String,
+    pub provider: String,
+    pub model: String,
+    pub force: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct SyncRequest {
     pub selection: Selection,
     pub report_dir: Option<PathBuf>,
@@ -25,6 +35,7 @@ pub enum ReconcileMode {
 
 #[derive(Clone, Debug)]
 pub enum CommandRequest {
+    Init(InitRequest),
     Sync(SyncRequest),
     Status(Selection),
     Check(Selection),
@@ -50,6 +61,7 @@ pub trait OutputReporter: Send + Sync {
 }
 
 pub trait CommandOperations {
+    fn init(&self, request: InitRequest) -> Result<CommandOutput>;
     fn sync(&self, request: SyncRequest) -> Result<CommandOutput>;
     fn status(&self, request: Selection) -> Result<CommandOutput>;
     fn doctor(&self, config: PathBuf) -> Result<CommandOutput>;
@@ -70,6 +82,7 @@ where
 
     pub fn execute(&self, request: CommandRequest) -> Result<CommandOutput> {
         match request {
+            CommandRequest::Init(request) => self.operations.init(request),
             CommandRequest::Sync(request) => self.operations.sync(request),
             CommandRequest::Status(request) | CommandRequest::Check(request) => {
                 self.operations.status(request)
@@ -92,6 +105,11 @@ mod tests {
     }
 
     impl CommandOperations for FakeOperations {
+        fn init(&self, _request: InitRequest) -> Result<CommandOutput> {
+            self.calls.borrow_mut().push("init");
+            Ok(CommandOutput::default())
+        }
+
         fn sync(&self, _request: SyncRequest) -> Result<CommandOutput> {
             self.calls.borrow_mut().push("sync");
             Ok(CommandOutput::default())
@@ -129,6 +147,16 @@ mod tests {
         let application = Application::new(operations);
 
         application
+            .execute(CommandRequest::Init(InitRequest {
+                config: "fani.toml".into(),
+                repository: ".".into(),
+                language: "zh-CN".into(),
+                provider: "anthropic".into(),
+                model: "test-model".into(),
+                force: false,
+            }))
+            .unwrap();
+        application
             .execute(CommandRequest::Status(selection()))
             .unwrap();
         application
@@ -145,7 +173,7 @@ mod tests {
 
         assert_eq!(
             application.operations.calls.into_inner(),
-            ["status", "doctor", "reconcile"]
+            ["init", "status", "doctor", "reconcile"]
         );
     }
 }

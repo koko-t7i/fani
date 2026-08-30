@@ -29,6 +29,58 @@ fn fani(args: &[&str]) -> Output {
         .unwrap()
 }
 
+#[test]
+fn init_creates_a_script_free_safe_starter_config() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let config = tmp.path().join("fani.toml");
+    let output = fani(&[
+        "init",
+        "--config",
+        config.to_str().unwrap(),
+        "--repo",
+        repo.to_str().unwrap(),
+        "--lang",
+        "zh-CN",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-test",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("provider = \"anthropic\""));
+    assert!(text.contains("model = \"claude-test\""));
+    assert!(text.contains(&format!(
+        "path = {}",
+        serde_json::to_string(&fs::canonicalize(&repo).unwrap().to_string_lossy()).unwrap()
+    )));
+    assert!(text.contains("enabled = false"));
+    assert!(!text.contains("cmd ="));
+    assert!(!text.contains("adapter ="));
+
+    let second = fani(&[
+        "init",
+        "--config",
+        config.to_str().unwrap(),
+        "--repo",
+        repo.to_str().unwrap(),
+        "--lang",
+        "zh-CN",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-test",
+    ]);
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("already exists"));
+}
+
 fn strict_provider_case(script: &str, output_file: bool) -> (i32, Value) {
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");

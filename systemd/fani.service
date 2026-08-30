@@ -11,7 +11,7 @@
 [Unit]
 Description=Translate documentation that is out of date
 Documentation=https://github.com/koko/fani
-# Nothing to do without a network: every agent call is a remote API call.
+# Built-in providers require the network; custom Agents may also require it.
 After=network-online.target
 
 [Service]
@@ -19,8 +19,8 @@ Type=oneshot
 WorkingDirectory=%h/fani
 ExecStart=%h/.cargo/bin/fani sync --config %h/fani/fani.toml --report-dir %h/fani/reports
 
-# Agent CLIs read their credentials from here. Keep the file mode 600; systemd
-# reads it as root before dropping to the user.
+# Built-in providers and custom Agents read credentials from here. Keep the file
+# mode 600; systemd reads it as root before dropping to the user.
 EnvironmentFile=-%h/.config/fani/env
 
 # A run is bounded by max_tasks, but an agent that hangs past its own timeout

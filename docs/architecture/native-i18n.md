@@ -6,7 +6,7 @@ Decision record: [`ADR-0001`](adr-0001-native-single-authority.md)
 
 ## Product boundary
 
-fani 0.3 is a Linux-first continuous documentation translation CLI for GitHub repositories. It supports Markdown/CommonMark/GFM, a command-line Agent provider, SQLite state, Git branch publication, and GitHub pull requests. MDX, resource files, other forges, automatic merge, a Web UI, and compatibility with the experimental Python/i18n-skill implementation are outside this version.
+fani 0.3 is a Linux-first continuous documentation translation CLI for GitHub repositories. It supports Markdown/CommonMark/GFM, built-in HTTPS model providers, a strict custom command Agent protocol, SQLite state, Git branch publication, and GitHub pull requests. MDX, resource files, other forges, automatic merge, a Web UI, and compatibility with the experimental Python/i18n-skill implementation are outside this version.
 
 ## Authority
 

@@ -4,7 +4,7 @@ _fani()
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="sync status check doctor adopt discard help"
+    commands="init sync status check doctor adopt discard help"
 
     case "${prev}" in
         --config|--repo|--lang|--report-dir)
@@ -21,6 +21,9 @@ _fani()
     fi
 
     case "${COMP_WORDS[1]}" in
+        init)
+            COMPREPLY=( $(compgen -W "--config --repo --lang --provider --model --force --help" -- "${cur}") )
+            ;;
         sync)
             COMPREPLY=( $(compgen -W "--config --repo --lang --report-dir --quiet --help" -- "${cur}") )
             ;;

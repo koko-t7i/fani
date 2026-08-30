@@ -27,9 +27,38 @@ use wait_timeout::ChildExt;
 const OUTPUT_FILE_TOKEN: &str = "{output_file}";
 const MAX_STDIN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 type ReadResult = (&'static str, std::io::Result<(Vec<u8>, bool)>);
+
+#[derive(Debug)]
+struct NativeFailure {
+    code: String,
+    message: String,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+impl NativeFailure {
+    fn permanent(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable: false,
+            retry_after: None,
+        }
+    }
+
+    fn transient(code: &str, message: impl Into<String>, retry_after: Option<Duration>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable: true,
+            retry_after,
+        }
+    }
+}
 
 fn spawn_reader<R: Read + Send + 'static>(
     name: &'static str,
@@ -330,6 +359,182 @@ fn execute_once(
     ))
 }
 
+fn agent_request(task: &AgentTask) -> (AgentRequestEnvelope, String, String, String) {
+    let prompt_version = prompts::PROMPT_VERSION.to_owned();
+    let prompt_hash = prompts::task_prompt_hash(task);
+    let policy_fingerprint = prompts::policy_fingerprint();
+    let request = AgentRequestEnvelope {
+        schema: AGENT_REQUEST_SCHEMA.to_owned(),
+        task: task.clone(),
+        prompt: AgentPrompt {
+            version: prompt_version.clone(),
+            resource: prompts::resource_name(task).to_owned(),
+            hash: prompt_hash.clone(),
+            content: prompts::render(task),
+        },
+        policy: AgentPolicy {
+            fingerprint: policy_fingerprint.clone(),
+        },
+    };
+    (request, prompt_version, prompt_hash, policy_fingerprint)
+}
+
+fn native_http_once(
+    config: &AgentConfig,
+    agent: &ureq::Agent,
+    task_id: &str,
+    prompt: &str,
+) -> Result<(String, String, f64), NativeFailure> {
+    let started = Instant::now();
+    if prompt.len() > MAX_STDIN_BYTES {
+        return Err(NativeFailure::permanent(
+            DecisionCode::AgentInvalid.as_str(),
+            "Agent prompt exceeds input limit",
+        ));
+    }
+    let endpoint = config.endpoint().ok_or_else(|| {
+        NativeFailure::permanent(
+            DecisionCode::AgentInvalid.as_str(),
+            "native provider endpoint is not configured",
+        )
+    })?;
+    let key_name = config.api_key_env().ok_or_else(|| {
+        NativeFailure::permanent(
+            DecisionCode::AgentInvalid.as_str(),
+            "native provider api_key_env is not configured",
+        )
+    })?;
+    let api_key = std::env::var(key_name).map_err(|_| {
+        NativeFailure::permanent(
+            DecisionCode::AgentExit.as_str(),
+            format!("required provider credential {key_name} is not set"),
+        )
+    })?;
+    let mut request = agent.post(endpoint).set("content-type", "application/json");
+    let body = if config.provider == "anthropic" {
+        request = request
+            .set("x-api-key", &api_key)
+            .set("anthropic-version", "2023-06-01");
+        serde_json::json!({
+            "model": config.model,
+            "max_tokens": config.max_output_tokens,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    } else {
+        request = request.set("authorization", &format!("Bearer {api_key}"));
+        let mut body = serde_json::json!({
+            "model": config.model,
+            "messages": [{"role": "user", "content": prompt}]
+        });
+        let token_field = if config.provider == "openai" {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body[token_field] = serde_json::json!(config.max_output_tokens);
+        body
+    };
+    let body = serde_json::to_vec(&body).map_err(|_| {
+        NativeFailure::permanent(
+            DecisionCode::AgentInvalid.as_str(),
+            "cannot serialize provider request",
+        )
+    })?;
+    if body.len() > MAX_STDIN_BYTES {
+        return Err(NativeFailure::permanent(
+            DecisionCode::AgentInvalid.as_str(),
+            "serialized provider request exceeds input limit",
+        ));
+    }
+    let response = request.send_bytes(&body).map_err(|error| match error {
+        ureq::Error::Status(status, response) => {
+            let retryable = status == 408 || status == 429 || (500..=599).contains(&status);
+            let retry_after = response
+                .header("retry-after")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let message = format!("provider returned HTTP {status}; response body redacted");
+            if retryable {
+                NativeFailure::transient(DecisionCode::AgentExit.as_str(), message, retry_after)
+            } else {
+                NativeFailure::permanent(DecisionCode::AgentExit.as_str(), message)
+            }
+        }
+        ureq::Error::Transport(_) => NativeFailure::transient(
+            DecisionCode::AgentExit.as_str(),
+            "provider request failed; transport details redacted",
+            None,
+        ),
+    })?;
+    let mut response_bytes = Vec::new();
+    response
+        .into_reader()
+        .take((MAX_PROVIDER_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut response_bytes)
+        .map_err(|_| {
+            NativeFailure::transient(
+                DecisionCode::AgentExit.as_str(),
+                "cannot read provider response; details redacted",
+                None,
+            )
+        })?;
+    if response_bytes.len() > MAX_PROVIDER_RESPONSE_BYTES {
+        return Err(NativeFailure::permanent(
+            DecisionCode::AgentInvalid.as_str(),
+            format!("provider response exceeded {MAX_PROVIDER_RESPONSE_BYTES} bytes"),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|_| {
+        NativeFailure::permanent(
+            DecisionCode::AgentInvalid.as_str(),
+            "provider returned invalid JSON; response body redacted",
+        )
+    })?;
+    let output = if config.provider == "anthropic" {
+        value
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| {
+                        (part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                            .then(|| part.get("text").and_then(serde_json::Value::as_str))
+                            .flatten()
+                    })
+                    .collect::<String>()
+            })
+    } else {
+        value
+            .pointer("/choices/0/message/content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }
+    .filter(|output| !output.is_empty())
+    .ok_or_else(|| {
+        NativeFailure::permanent(
+            DecisionCode::AgentInvalid.as_str(),
+            "provider response does not contain non-empty text output",
+        )
+    })?;
+    if output.len() > MAX_ANSWER_BYTES {
+        return Err(NativeFailure::permanent(
+            DecisionCode::AgentInvalid.as_str(),
+            format!("Agent result exceeded {MAX_ANSWER_BYTES} bytes"),
+        ));
+    }
+    let envelope = AgentResponseEnvelope {
+        schema: AGENT_RESPONSE_SCHEMA.to_owned(),
+        task_id: task_id.to_owned(),
+        output: output.clone(),
+    };
+    Ok((
+        output,
+        serde_json::to_string(&envelope).expect("Agent response is serializable"),
+        started.elapsed().as_secs_f64(),
+    ))
+}
+
 #[derive(Clone)]
 pub struct CommandAgent {
     config: AgentConfig,
@@ -343,22 +548,7 @@ impl CommandAgent {
     }
 
     fn execute_one(&self, task: &AgentTask) -> AgentResult {
-        let prompt_version = prompts::PROMPT_VERSION.to_owned();
-        let prompt_hash = prompts::task_prompt_hash(task);
-        let policy_fingerprint = prompts::policy_fingerprint();
-        let request = AgentRequestEnvelope {
-            schema: AGENT_REQUEST_SCHEMA.to_owned(),
-            task: task.clone(),
-            prompt: AgentPrompt {
-                version: prompt_version.clone(),
-                resource: prompts::resource_name(task).to_owned(),
-                hash: prompt_hash.clone(),
-                content: prompts::render(task),
-            },
-            policy: AgentPolicy {
-                fingerprint: policy_fingerprint.clone(),
-            },
-        };
+        let (request, prompt_version, prompt_hash, policy_fingerprint) = agent_request(task);
         let request_json = serde_json::to_string(&request).expect("Agent request is serializable");
         let started = Instant::now();
         let mut last_code = DecisionCode::AgentExit.as_str().to_owned();
@@ -439,6 +629,116 @@ impl CommandAgent {
     }
 }
 
+#[derive(Clone)]
+pub struct NativeHttpAgent {
+    config: AgentConfig,
+    agent: ureq::Agent,
+}
+
+impl NativeHttpAgent {
+    pub fn new(config: &AgentConfig) -> Self {
+        Self {
+            config: config.clone(),
+            agent: ureq::AgentBuilder::new()
+                .try_proxy_from_env(false)
+                .redirects(0)
+                .timeout(Duration::from_secs_f64(config.timeout_s))
+                .build(),
+        }
+    }
+
+    fn execute_one(&self, task: &AgentTask) -> AgentResult {
+        let (request, prompt_version, prompt_hash, policy_fingerprint) = agent_request(task);
+        let request_json = serde_json::to_string(&request).expect("Agent request is serializable");
+        let started = Instant::now();
+        let mut last_code = DecisionCode::AgentExit.as_str().to_owned();
+        let mut last_message = String::new();
+        let mut attempts = 0;
+        for attempt in 1..=self.config.retries + 1 {
+            attempts = attempt;
+            match native_http_once(&self.config, &self.agent, &task.id, &request.prompt.content) {
+                Ok((output, response_json, duration_s)) => {
+                    return AgentResult {
+                        task_id: task.id.clone(),
+                        ok: true,
+                        output,
+                        code: None,
+                        attempts: attempt,
+                        duration_s,
+                        diagnostic: String::new(),
+                        request_json,
+                        response_json: Some(response_json),
+                        prompt_version,
+                        prompt_hash,
+                        policy_fingerprint,
+                    };
+                }
+                Err(failure) => {
+                    last_code = failure.code;
+                    last_message = failure.message;
+                    if !failure.retryable || attempt > self.config.retries {
+                        break;
+                    }
+                    let exponential_ms = 200_u64.saturating_mul(1_u64 << (attempt - 1).min(4));
+                    thread::sleep(
+                        failure
+                            .retry_after
+                            .unwrap_or_else(|| Duration::from_millis(exponential_ms))
+                            .min(Duration::from_secs(30)),
+                    );
+                }
+            }
+        }
+        AgentResult {
+            task_id: task.id.clone(),
+            ok: false,
+            output: String::new(),
+            code: Some(last_code),
+            attempts,
+            duration_s: started.elapsed().as_secs_f64(),
+            diagnostic: last_message,
+            request_json,
+            response_json: None,
+            prompt_version,
+            prompt_hash,
+            policy_fingerprint,
+        }
+    }
+
+    fn execute(&self, tasks: &[AgentTask]) -> Result<Vec<AgentResult>> {
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tasks = Arc::new(tasks.to_vec());
+        let next = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let workers = self.config.concurrency.min(tasks.len()).max(1);
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                let tasks = Arc::clone(&tasks);
+                let next = Arc::clone(&next);
+                let output = Arc::clone(&output);
+                let executor = self.clone();
+                scope.spawn(move || {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= tasks.len() {
+                            break;
+                        }
+                        output
+                            .lock()
+                            .expect("Agent output lock")
+                            .push((index, executor.execute_one(&tasks[index])));
+                    }
+                });
+            }
+        });
+        let mut output = output.lock().expect("Agent output lock").clone();
+        output.sort_by_key(|(index, _)| *index);
+        Ok(output.into_iter().map(|(_, result)| result).collect())
+    }
+}
+
 pub struct RoutedAgentExecutor<'a> {
     config: &'a Config,
 }
@@ -482,8 +782,23 @@ impl AgentExecutor for RoutedAgentExecutor<'_> {
             identity.update((value.len() as u64).to_be_bytes());
             identity.update(value.as_bytes());
         }
+        if config.adapter == "native-http-v1" {
+            if let Some(endpoint) = config.endpoint() {
+                identity.update((endpoint.len() as u64).to_be_bytes());
+                identity.update(endpoint.as_bytes());
+            }
+            identity.update(config.max_output_tokens.to_be_bytes());
+        }
+        for argument in &config.cmd {
+            identity.update((argument.len() as u64).to_be_bytes());
+            identity.update(argument.as_bytes());
+        }
         let provider_fingerprint = format!("{:x}", identity.finalize());
-        let results = CommandAgent::new(config).execute(tasks)?;
+        let results = match config.adapter.as_str() {
+            "native-http-v1" => NativeHttpAgent::new(config).execute(tasks)?,
+            "command-json-v1" => CommandAgent::new(config).execute(tasks)?,
+            adapter => return Err(anyhow!("unsupported Agent adapter {adapter:?}")),
+        };
         for result in &results {
             tracing::info!(
                 event = "provider.task.completed",
@@ -531,4 +846,173 @@ pub fn executable_on_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn config(provider: &str, endpoint: String, key_env: &str) -> AgentConfig {
+        AgentConfig {
+            name: "native".into(),
+            provider: provider.into(),
+            model: "test-model".into(),
+            adapter: "native-http-v1".into(),
+            cmd: Vec::new(),
+            endpoint: Some(endpoint),
+            api_key_env: Some(key_env.into()),
+            max_output_tokens: 512,
+            concurrency: 1,
+            timeout_s: 5.0,
+            retries: 0,
+            enabled: true,
+            env_allow: Vec::new(),
+        }
+    }
+
+    fn http_agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .redirects(0)
+            .timeout(Duration::from_secs(5))
+            .build()
+    }
+
+    fn server(status: &str, body: &'static str) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_owned();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let headers_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + content_length {
+                        break;
+                    }
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn native_anthropic_provider_needs_no_external_adapter() {
+        let (endpoint, request) =
+            server("200 OK", r#"{"content":[{"type":"text","text":"你好"}]}"#);
+        let key_env = "FANI_TEST_ANTHROPIC_KEY";
+        unsafe { std::env::set_var(key_env, "secret-anthropic-key") };
+        let (output, envelope, _) = native_http_once(
+            &config("anthropic", endpoint, key_env),
+            &http_agent(),
+            "task-1",
+            "Translate",
+        )
+        .unwrap();
+        unsafe { std::env::remove_var(key_env) };
+        assert_eq!(output, "你好");
+        assert_eq!(
+            serde_json::from_str::<AgentResponseEnvelope>(&envelope)
+                .unwrap()
+                .task_id,
+            "task-1"
+        );
+        let request = request.join().unwrap();
+        assert!(request.contains("x-api-key: secret-anthropic-key"));
+        assert!(request.contains("anthropic-version: 2023-06-01"));
+        assert!(request.contains("Translate"));
+    }
+
+    fn task() -> AgentTask {
+        AgentTask {
+            id: "task".into(),
+            stage: crate::domain::model::AgentStage::Translate,
+            source_language: "en".into(),
+            target_language: "fr".into(),
+            source: "Hello".into(),
+            previous_source: None,
+            previous_translation: None,
+            findings: Vec::new(),
+            protected_tokens: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn native_openai_compatible_provider_extracts_text_and_redacts_errors() {
+        let key_env = "FANI_TEST_OPENAI_KEY";
+        unsafe { std::env::set_var(key_env, "secret-openai-key") };
+        let (endpoint, request) = server(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"Bonjour"}}]}"#,
+        );
+        let (output, _, _) = native_http_once(
+            &config("openai-compatible", endpoint, key_env),
+            &http_agent(),
+            "task-2",
+            "Translate",
+        )
+        .unwrap();
+        assert_eq!(output, "Bonjour");
+        assert!(
+            request
+                .join()
+                .unwrap()
+                .contains("authorization: Bearer secret-openai-key")
+        );
+
+        let (endpoint, _) = server("401 Unauthorized", r#"{"error":"secret response"}"#);
+        let error = native_http_once(
+            &config("openai-compatible", endpoint, key_env),
+            &http_agent(),
+            "task-3",
+            "Translate",
+        )
+        .unwrap_err()
+        .message;
+        unsafe { std::env::remove_var(key_env) };
+        assert!(error.contains("HTTP 401"));
+        assert!(!error.contains("secret response"));
+        assert!(!error.contains("secret-openai-key"));
+    }
+
+    #[test]
+    fn authentication_failure_is_not_retried() {
+        let key_env = "FANI_TEST_NO_RETRY_KEY";
+        unsafe { std::env::set_var(key_env, "secret") };
+        let (endpoint, request) = server("401 Unauthorized", r#"{"error":"denied"}"#);
+        let mut config = config("openai-compatible", endpoint, key_env);
+        config.retries = 2;
+        let result = NativeHttpAgent::new(&config).execute_one(&task());
+        unsafe { std::env::remove_var(key_env) };
+        assert!(!result.ok);
+        assert_eq!(result.attempts, 1);
+        assert!(result.diagnostic.contains("HTTP 401"));
+        request.join().unwrap();
+    }
 }

@@ -10,7 +10,7 @@ fani is a Linux-first Rust 2024 command-line application with Rust 1.85 as its m
 - `serde`, `serde_json`, and `toml` for strict typed configuration, Agent envelopes, durable payloads, and reports.
 - `pulldown-cmark`, `regex`, `globset`, and `strsim` for native Markdown extraction, protected syntax, source discovery, and deterministic unit matching.
 - bundled `rusqlite` as the single fani-owned authority for runs, work, attempts, findings, canonical content, trusted translation memory, leases, outboxes, and pull-request state.
-- synchronous bounded subprocess adapters for Agent, Git, and GitHub operations. Each adapter has explicit deadlines, bounded input/output, controlled environment variables, and Linux process-tree cleanup where Agent execution requires it.
+- synchronous bounded HTTPS adapters for built-in model providers, plus a strict subprocess adapter for custom Agents and subprocess adapters for Git and GitHub operations. Every external boundary has explicit deadlines and bounded input/output; custom Agent processes also use controlled environment variables and Linux process-tree cleanup.
 - Git plumbing with a temporary index for fixed-source candidate commits without changing the checked-out branch, `HEAD`, real index, staging, or unrelated worktree files.
 - `gh` for bounded GitHub pull-request creation and reconciliation.
 

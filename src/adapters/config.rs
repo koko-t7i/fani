@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
+use url::Url;
 
 pub const STAGES: [&str; 4] = ["translate", "repair", "revision", "proofread"];
 
@@ -25,8 +26,16 @@ pub struct AgentConfig {
     pub name: String,
     pub provider: String,
     pub model: String,
+    #[serde(default = "default_adapter")]
     pub adapter: String,
+    #[serde(default)]
     pub cmd: Vec<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     #[serde(default = "default_timeout")]
@@ -49,6 +58,12 @@ pub struct Config {
     pub routing: HashMap<String, String>,
 }
 
+fn default_adapter() -> String {
+    "native-http-v1".into()
+}
+fn default_max_output_tokens() -> u32 {
+    8192
+}
 fn default_concurrency() -> usize {
     4
 }
@@ -70,6 +85,30 @@ fn expand_home(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+impl AgentConfig {
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref().or(match self.provider.as_str() {
+            "anthropic" => Some("https://api.anthropic.com/v1/messages"),
+            "openai" => Some("https://api.openai.com/v1/chat/completions"),
+            "xai" => Some("https://api.x.ai/v1/chat/completions"),
+            "deepseek" => Some("https://api.deepseek.com/chat/completions"),
+            _ => None,
+        })
+    }
+
+    pub fn api_key_env(&self) -> Option<&str> {
+        self.api_key_env
+            .as_deref()
+            .or(match self.provider.as_str() {
+                "anthropic" => Some("ANTHROPIC_API_KEY"),
+                "openai" => Some("OPENAI_API_KEY"),
+                "xai" => Some("XAI_API_KEY"),
+                "deepseek" => Some("DEEPSEEK_API_KEY"),
+                _ => None,
+            })
+    }
 }
 
 fn validate_repo_relative(value: &str, field: &str, repo: &Path) -> Result<(), ConfigError> {
@@ -215,15 +254,85 @@ impl Config {
                     )));
                 }
             }
-            if agent.adapter != "command-json-v1" {
-                return Err(ConfigError::Invalid(format!(
-                    "[agents.{name}]: unsupported adapter {:?}",
-                    agent.adapter
-                )));
+            match agent.adapter.as_str() {
+                "command-json-v1" => {
+                    if agent.cmd.is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[agents.{name}]: cmd must not be empty for command-json-v1"
+                        )));
+                    }
+                }
+                "native-http-v1" => {
+                    if !agent.cmd.is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[agents.{name}]: cmd is only valid with command-json-v1"
+                        )));
+                    }
+                    if !matches!(
+                        agent.provider.as_str(),
+                        "anthropic" | "openai" | "xai" | "deepseek" | "openai-compatible"
+                    ) {
+                        return Err(ConfigError::Invalid(format!(
+                            "[agents.{name}]: native-http-v1 does not support provider {:?}",
+                            agent.provider
+                        )));
+                    }
+                    if agent.provider == "openai-compatible" {
+                        if agent.endpoint.is_none() {
+                            return Err(ConfigError::Invalid(format!(
+                                "[agents.{name}]: openai-compatible requires endpoint"
+                            )));
+                        }
+                        if agent.api_key_env.is_none() {
+                            return Err(ConfigError::Invalid(format!(
+                                "[agents.{name}]: openai-compatible requires api_key_env"
+                            )));
+                        }
+                    } else if agent.endpoint.is_some() || agent.api_key_env.is_some() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[agents.{name}]: official providers use fixed endpoint and credential names; use openai-compatible for overrides"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(ConfigError::Invalid(format!(
+                        "[agents.{name}]: unsupported adapter {:?}",
+                        agent.adapter
+                    )));
+                }
             }
-            if agent.cmd.is_empty() {
+            if let Some(endpoint) = &agent.endpoint {
+                let url = Url::parse(endpoint).map_err(|_| {
+                    ConfigError::Invalid(format!("[agents.{name}]: endpoint is not a valid URL"))
+                })?;
+                if !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.fragment().is_some()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "[agents.{name}]: endpoint must not contain userinfo or a fragment"
+                    )));
+                }
+                let loopback = url
+                    .host_str()
+                    .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                    .is_some_and(|address| address.is_loopback());
+                if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+                    return Err(ConfigError::Invalid(format!(
+                        "[agents.{name}]: endpoint must use HTTPS (HTTP is allowed only for loopback testing)"
+                    )));
+                }
+            }
+            if let Some(name) = &agent.api_key_env {
+                if name.is_empty() || name.contains('=') || name.as_bytes().contains(&0) {
+                    return Err(ConfigError::Invalid(format!(
+                        "[agents.{name}]: invalid api_key_env name {name:?}"
+                    )));
+                }
+            }
+            if agent.max_output_tokens == 0 {
                 return Err(ConfigError::Invalid(format!(
-                    "[agents.{name}]: cmd must not be empty"
+                    "[agents.{name}]: max_output_tokens must be greater than zero"
                 )));
             }
             if agent.concurrency == 0 {
@@ -375,6 +484,100 @@ translate = "fake"
                 .to_string()
                 .contains("unknown field `legacy_output`")
         );
+    }
+
+    #[test]
+    fn built_in_provider_needs_only_provider_and_model() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        let text = minimal(tmp.path())
+            .replace("provider = \"fixture\"", "provider = \"anthropic\"")
+            .replace("model = \"fixture\"", "model = \"claude-test\"")
+            .replace("adapter = \"command-json-v1\"\ncmd = [\"true\"]\n", "");
+        fs::write(tmp.path().join("fani.toml"), text).unwrap();
+        let config = Config::load(&tmp.path().join("fani.toml")).unwrap();
+        let agent = config.agent_for("translate").unwrap();
+        assert_eq!(agent.adapter, "native-http-v1");
+        assert_eq!(
+            agent.endpoint(),
+            Some("https://api.anthropic.com/v1/messages")
+        );
+        assert_eq!(agent.api_key_env(), Some("ANTHROPIC_API_KEY"));
+        assert!(agent.cmd.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_built_in_provider_without_custom_command() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        let text = minimal(tmp.path())
+            .replace("provider = \"fixture\"", "provider = \"unknown\"")
+            .replace("adapter = \"command-json-v1\"\ncmd = [\"true\"]\n", "");
+        fs::write(tmp.path().join("fani.toml"), text).unwrap();
+        let error = Config::load(&tmp.path().join("fani.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not support provider"), "{error}");
+    }
+
+    #[test]
+    fn openai_compatible_requires_key_name_and_secure_endpoint() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        let base = minimal(tmp.path())
+            .replace("provider = \"fixture\"", "provider = \"openai-compatible\"")
+            .replace("adapter = \"command-json-v1\"\ncmd = [\"true\"]\n", "");
+        let path = tmp.path().join("fani.toml");
+
+        fs::write(
+            &path,
+            base.replace(
+                "model = \"fixture\"",
+                "model = \"fixture\"\nendpoint = \"https://models.example.com/v1/chat/completions\"",
+            ),
+        )
+        .unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("requires api_key_env"), "{error}");
+
+        fs::write(
+            &path,
+            base.replace(
+                "model = \"fixture\"",
+                "model = \"fixture\"\nendpoint = \"http://models.example.com/v1/chat/completions\"\napi_key_env = \"MODEL_API_KEY\"",
+            ),
+        )
+        .unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("must use HTTPS"), "{error}");
+
+        fs::write(
+            &path,
+            base.replace(
+                "model = \"fixture\"",
+                "model = \"fixture\"\nendpoint = \"http://localhost:123@remote.example/v1/chat/completions\"\napi_key_env = \"MODEL_API_KEY\"",
+            ),
+        )
+        .unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("userinfo"), "{error}");
+    }
+
+    #[test]
+    fn official_provider_rejects_endpoint_and_key_overrides() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        let text = minimal(tmp.path())
+            .replace("provider = \"fixture\"", "provider = \"anthropic\"")
+            .replace("adapter = \"command-json-v1\"\ncmd = [\"true\"]", "")
+            .replace(
+                "model = \"fixture\"",
+                "model = \"fixture\"\nendpoint = \"https://attacker.example/v1/messages\"",
+            );
+        let path = tmp.path().join("fani.toml");
+        fs::write(&path, text).unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("fixed endpoint"), "{error}");
     }
 
     #[test]

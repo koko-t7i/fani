@@ -1,7 +1,7 @@
 use crate::VERSION;
 use crate::application::command::{
-    CommandOutput, CommandRequest, ERROR_EXIT_CODE, OutputReporter, ReconcileMode, Selection,
-    SyncRequest,
+    CommandOutput, CommandRequest, ERROR_EXIT_CODE, InitRequest, OutputReporter, ReconcileMode,
+    Selection, SyncRequest,
 };
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, Write};
@@ -16,6 +16,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a safe starter configuration for a built-in provider.
+    Init(InitArgs),
     /// Translate, verify, recover, materialize, and optionally publish pending work.
     Sync(SyncArgs),
     /// Plan from an immutable Git revision without calling an Agent.
@@ -28,6 +30,22 @@ enum Command {
     Adopt(CommonArgs),
     /// Restore canonical verified target files over divergent human edits.
     Discard(CommonArgs),
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long, default_value = "fani.toml")]
+    config: PathBuf,
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long)]
+    lang: String,
+    #[arg(long, default_value = "anthropic")]
+    provider: String,
+    #[arg(long)]
+    model: String,
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -84,6 +102,14 @@ impl OutputReporter for TerminalReporter {
 
 pub fn run() -> i32 {
     let request = match Cli::parse().command {
+        Command::Init(args) => CommandRequest::Init(InitRequest {
+            config: args.config,
+            repository: args.repo,
+            language: args.lang,
+            provider: args.provider,
+            model: args.model,
+            force: args.force,
+        }),
         Command::Sync(args) => CommandRequest::Sync(SyncRequest {
             selection: args.common.into(),
             report_dir: args.report_dir,

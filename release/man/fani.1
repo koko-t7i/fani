@@ -6,8 +6,11 @@ fani \- continuous Markdown translation for Git and GitHub
 .I COMMAND
 .RI [ OPTIONS ]
 .SH DESCRIPTION
-fani reads Markdown from an immutable Git revision, reuses trusted translation memory from SQLite, delegates unresolved units to an isolated command-line Agent, verifies assembled output, and can publish stable language branches and GitHub pull requests.
+fani reads Markdown from an immutable Git revision, reuses trusted translation memory from SQLite, delegates unresolved units to a built-in model provider or isolated custom Agent command, verifies assembled output, and can publish stable language branches and GitHub pull requests.
 .SH COMMANDS
+.TP
+.B init
+Create a safe starter configuration for a built-in provider.
 .TP
 .B sync
 Translate, verify, recover, materialize, and optionally publish pending work.
@@ -35,7 +38,16 @@ Use PATH as the configuration file. The default is fani.toml.
 Select one configured repository.
 .TP
 .BI --lang " LANGUAGE"
-Select one configured language.
+Select one configured language, or set the initial target language for init.
+.TP
+.BI --provider " PROVIDER"
+Select the built-in provider for init: anthropic, openai, xai, or deepseek.
+.TP
+.BI --model " MODEL"
+Set the provider model for init.
+.TP
+.B --force
+Allow init to replace an existing configuration.
 .TP
 .BI --report-dir " PATH"
 Write sync reports under PATH.

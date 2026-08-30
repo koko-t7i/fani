@@ -1,6 +1,6 @@
 # fani
 
-fani is a Linux-first continuous documentation translation CLI. It reads Markdown from an immutable Git revision, reuses trusted translation memory from SQLite, sends only unresolved units to an isolated command-line Agent, verifies and assembles candidates natively, and can publish one stable branch and GitHub pull request per language.
+fani is a Linux-first continuous documentation translation CLI. It reads Markdown from an immutable Git revision, reuses trusted translation memory from SQLite, sends only unresolved units to a built-in model provider or an isolated custom Agent command, verifies and assembles candidates natively, and can publish one stable branch and GitHub pull request per language.
 
 The shipped binary is Rust. It has no Python, `uv`, external i18n skill, legacy JSON state, or compatibility migration dependency.
 
@@ -20,8 +20,10 @@ The shipped binary is Rust. It has no Python, `uv`, external i18n skill, legacy 
 - Rust 1.85 or newer to build;
 - Linux;
 - Git;
-- at least one headless command-line Agent provider;
+- an API key for a built-in provider: Anthropic, OpenAI, xAI, or DeepSeek;
 - `gh` only when GitHub pull-request publication is enabled.
+
+A custom command implementing fani's strict JSON protocol remains available for private or self-hosted providers.
 
 ## Install
 
@@ -29,9 +31,31 @@ Source install:
 
 ```bash
 cargo install --path . --locked
-cp examples/fani.toml fani.toml
-fani doctor
 ```
+
+## Quick start
+
+No provider script or provider CLI is required. Set one API key, generate a safe local-only configuration, then synchronize:
+
+```bash
+export ANTHROPIC_API_KEY='...'
+fani init --lang zh-CN --provider anthropic --model claude-sonnet-4-5
+fani doctor
+fani sync
+```
+
+`fani init` uses the current directory, scans Markdown, writes translations under `i18n/<language>/`, disables revision and publication for the first run, and refuses to overwrite an existing `fani.toml` unless `--force` is given.
+
+Other built-in providers use the same flow:
+
+| Provider | `--provider` | Credential environment variable | Default API |
+| --- | --- | --- | --- |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Messages API |
+| OpenAI | `openai` | `OPENAI_API_KEY` | Chat Completions API |
+| xAI | `xai` | `XAI_API_KEY` | Chat Completions API |
+| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | Chat Completions API |
+
+For an OpenAI-compatible endpoint, set `provider = "openai-compatible"`, `endpoint`, and `api_key_env` in `fani.toml`. Official provider endpoints and credential-variable names are fixed so a repository configuration cannot redirect a standard API key. Built-in requests do not follow redirects or inherit proxy environment variables.
 
 Tagged releases publish one `x86_64-unknown-linux-gnu` `.tar.xz` archive. The archive contains the `fani` binary, Bash/Zsh/Fish completions, the `fani(1)` man page, systemd user units, the annotated example configuration, and this README. Each archive has a SHA-256 sidecar; the release also contains a CycloneDX XML SBOM and GitHub artifact attestations for the final asset set.
 
@@ -58,6 +82,7 @@ The `reproducible_candidate` end-to-end test creates a fixed local source reposi
 ## Commands
 
 ```bash
+fani init --lang zh-CN --provider anthropic --model MODEL  # create starter config
 fani doctor                         # validate configuration and runtime prerequisites
 fani status                         # immutable-source plan; no Agent calls
 fani check                          # CI-friendly alias for status/check semantics
@@ -110,7 +135,9 @@ A repository config defines:
 
 Documentation checks are configured under `[repo.documentation]` as one or more argv arrays, for example `commands = [["mdbook", "build"], ["markdownlint", "docs/zh-CN"]]`. Shell strings are not accepted. Every command receives a fresh repository-independent staging tree checked out from the fixed source revision with the exact assembled candidate files overlaid. A nonzero exit or timeout is persisted and reported as a blocking finding, so publication does not start.
 
-An Agent config defines argv, concurrency, timeout, retries, enablement, and the exact environment variables copied into its isolated process. Secrets belong in the process environment, never in TOML.
+A built-in Agent config only needs `provider` and `model`; `adapter` defaults to `native-http-v1`, the standard credential variable is selected automatically, and secrets remain in the process environment rather than TOML. Optional fields include `endpoint`, `api_key_env`, `max_output_tokens`, concurrency, timeout, retries, and enablement.
+
+Advanced integrations can select `adapter = "command-json-v1"`, provide `cmd`, and explicitly list `env_allow`. fani writes a strict `fani.agent.request.v1` JSON envelope to stdin and accepts only a matching `fani.agent.response.v1` JSON envelope from stdout or `{output_file}`. This custom command path preserves the same bounded I/O, timeout, process-tree cleanup, and diagnostic redaction guarantees.
 
 ## Persistent state and recovery
 

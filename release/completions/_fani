@@ -3,10 +3,19 @@
 _arguments -C \
   '(-h --help)'{-h,--help}'[Print help]' \
   '(-V --version)'{-V,--version}'[Print version]' \
-  '1:command:(sync status check doctor adopt discard help)' \
+  '1:command:(init sync status check doctor adopt discard help)' \
   '*::argument:->args'
 
 case "$words[2]" in
+  init)
+    _arguments \
+      '--config=[Configuration file]:file:_files' \
+      '--repo=[Repository path]:directory:_directories' \
+      '--lang=[Target language]:language:' \
+      '--provider=[Built-in provider]:provider:(anthropic openai xai deepseek)' \
+      '--model=[Provider model]:model:' \
+      '--force[Replace an existing configuration]'
+    ;;
   sync)
     _arguments \
       '--config=[Configuration file]:file:_files' \
