@@ -10,6 +10,7 @@ use thiserror::Error;
 pub enum UnitKind {
     Paragraph,
     Heading,
+    ListItem,
     TableCell,
     DefinitionTerm,
     Definition,
@@ -114,6 +115,7 @@ pub fn extract_units(markdown: &str) -> Vec<MarkdownUnit> {
         }
     }
 
+    candidates.extend(tight_list_candidates(&events, &candidates));
     candidates.sort_by_key(|candidate| (candidate.range.start, candidate.range.end));
     candidates.dedup_by(|left, right| left.range == right.range);
 
@@ -122,6 +124,100 @@ pub fn extract_units(markdown: &str) -> Vec<MarkdownUnit> {
         .into_iter()
         .filter_map(|candidate| build_unit(markdown, &events, candidate, &mut occurrences))
         .collect()
+}
+
+fn tight_list_candidates(
+    events: &[(Event<'_>, Range<usize>)],
+    existing: &[Candidate],
+) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for (index, (event, _)) in events.iter().enumerate() {
+        if !matches!(event, Event::Start(Tag::Item)) {
+            continue;
+        }
+        let mut range: Option<Range<usize>> = None;
+        for (event, event_range) in events.iter().skip(index + 1) {
+            match event {
+                Event::End(TagEnd::Item) => break,
+                Event::Start(tag) if is_block_tag(tag) => break,
+                Event::TaskListMarker(_) => continue,
+                _ if is_inline_event(event) => {
+                    range = Some(match range {
+                        Some(current) => {
+                            current.start.min(event_range.start)..current.end.max(event_range.end)
+                        }
+                        None => event_range.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        let Some(range) = range.filter(|range| range.start < range.end) else {
+            continue;
+        };
+        if existing.iter().any(|candidate| {
+            candidate.range.start <= range.start && candidate.range.end >= range.end
+        }) {
+            continue;
+        }
+        candidates.push(Candidate {
+            kind: UnitKind::ListItem,
+            range,
+        });
+    }
+    candidates
+}
+
+fn is_block_tag(tag: &Tag<'_>) -> bool {
+    matches!(
+        tag,
+        Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::HtmlBlock
+            | Tag::List(_)
+            | Tag::FootnoteDefinition(_)
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::MetadataBlock(_)
+    )
+}
+
+fn is_inline_event(event: &Event<'_>) -> bool {
+    matches!(
+        event,
+        Event::Start(
+            Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough
+                | Tag::Superscript
+                | Tag::Subscript
+                | Tag::Link { .. }
+                | Tag::Image { .. }
+        ) | Event::End(
+            TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough
+                | TagEnd::Superscript
+                | TagEnd::Subscript
+                | TagEnd::Link
+                | TagEnd::Image
+        ) | Event::Text(_)
+            | Event::Code(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::FootnoteReference(_)
+            | Event::SoftBreak
+            | Event::HardBreak
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+    )
 }
 
 pub fn validate_translation(

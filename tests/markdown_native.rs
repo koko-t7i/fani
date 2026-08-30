@@ -177,6 +177,172 @@ fn apply_is_order_independent_and_rejects_unknown_or_duplicate_ids() {
 }
 
 #[test]
+fn representative_commonmark_gfm_corpus_is_byte_stable_and_protected() {
+    let corpus = [
+        include_str!("fixtures/markdown-corpus/rich-gfm.md"),
+        include_str!("fixtures/markdown-corpus/edge-commonmark.md"),
+    ];
+
+    for source in corpus {
+        let units = extract_units(source);
+        assert!(!units.is_empty());
+        assert_eq!(apply_translations(source, &units, &[]).unwrap(), source);
+
+        let identity = units
+            .iter()
+            .map(|unit| UnitTranslation {
+                id: unit.id.clone(),
+                text: unit.protected_source.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            apply_translations(source, &units, &identity).unwrap(),
+            source
+        );
+        assert!(
+            units
+                .iter()
+                .all(|unit| &source[unit.range.clone()] == unit.source)
+        );
+        assert!(
+            units
+                .iter()
+                .all(|unit| !unit.source.contains("title: Keep"))
+        );
+        assert!(
+            units
+                .iter()
+                .all(|unit| !unit.source.contains("slug: native"))
+        );
+        assert!(
+            units
+                .iter()
+                .all(|unit| !unit.source.contains("let untranslated"))
+        );
+        assert!(
+            units
+                .iter()
+                .all(|unit| !unit.source.contains("indented_code"))
+        );
+    }
+
+    let rich = extract_units(corpus[0]);
+    assert!(
+        rich.iter()
+            .any(|unit| unit.kind == fani::domain::markdown::UnitKind::Heading)
+    );
+    assert!(
+        rich.iter()
+            .any(|unit| unit.kind == fani::domain::markdown::UnitKind::TableCell)
+    );
+    assert!(
+        rich.iter()
+            .any(|unit| unit.kind == fani::domain::markdown::UnitKind::Definition)
+    );
+    assert!(
+        rich.iter()
+            .any(|unit| unit.source.contains("Preserve task markers"))
+    );
+    assert!(
+        rich.iter()
+            .any(|unit| unit.source.contains("A quoted paragraph"))
+    );
+    assert!(rich.iter().flat_map(|unit| &unit.protected).any(|span| {
+        span.kind == ProtectedKind::LinkTarget && span.value == "https://example.com/diagram.png"
+    }));
+    assert!(
+        rich.iter().flat_map(|unit| &unit.protected).any(|span| {
+            span.kind == ProtectedKind::Placeholder && span.value == "${ACCOUNT_ID}"
+        })
+    );
+
+    let edge = extract_units(corpus[1]);
+    assert!(edge.iter().flat_map(|unit| &unit.protected).any(|span| {
+        span.kind == ProtectedKind::LinkTarget && span.value == "https://example.com/other"
+    }));
+    assert!(corpus[1].contains("\r\n"));
+}
+
+#[test]
+fn tight_task_and_nested_lists_translate_without_touching_markers_or_indentation() {
+    let source = "- [x] First **bold**\n- Parent\n  - Child `code`\n";
+    let units = extract_units(source);
+    let list_units = units
+        .iter()
+        .filter(|unit| unit.kind == fani::domain::markdown::UnitKind::ListItem)
+        .collect::<Vec<_>>();
+    assert_eq!(list_units.len(), 3, "{units:#?}");
+    let translations = list_units
+        .iter()
+        .map(|unit| UnitTranslation {
+            id: unit.id.clone(),
+            text: unit
+                .protected_source
+                .replace("First", "第一")
+                .replace("bold", "粗体")
+                .replace("Parent", "父项")
+                .replace("Child", "子项"),
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        apply_translations(source, &units, &translations).unwrap(),
+        "- [x] 第一 **粗体**\n- 父项\n  - 子项 `code`\n"
+    );
+}
+
+#[test]
+fn corpus_rejects_malicious_tokens_links_and_structure_changes() {
+    let source = include_str!("fixtures/markdown-corpus/edge-commonmark.md");
+    let units = extract_units(source);
+    let heading = units
+        .iter()
+        .find(|unit| unit.kind == fani::domain::markdown::UnitKind::Heading)
+        .unwrap();
+    let changed_level = heading.protected_source.replacen("# ", "## ", 1);
+    assert!(
+        validate_translation(heading, &changed_level)
+            .unwrap_err()
+            .iter()
+            .any(|finding| finding.code == "MD-STRUCTURE")
+    );
+
+    let linked = units
+        .iter()
+        .find(|unit| {
+            unit.protected.iter().any(|span| {
+                span.kind == ProtectedKind::LinkTarget && span.value == "https://example.com/other"
+            })
+        })
+        .unwrap();
+    let target = linked
+        .protected
+        .iter()
+        .find(|span| span.value == "https://example.com/other")
+        .unwrap();
+    let replaced_target = linked
+        .protected_source
+        .replace(&target.token, "https://evil.example/steal");
+    assert!(
+        validate_translation(linked, &replaced_target)
+            .unwrap_err()
+            .iter()
+            .any(|finding| finding.code == "MD-PROTECTED")
+    );
+
+    let injected = format!(
+        "{} @@FANI_PLACEHOLDER_9999_deadbeefdeadbeef@@",
+        linked.protected_source
+    );
+    assert!(
+        validate_translation(linked, &injected)
+            .unwrap_err()
+            .iter()
+            .any(|finding| finding.code == "MD-UNKNOWN-TOKEN")
+    );
+}
+
+#[test]
 fn prompts_make_the_native_engine_contract_explicit() {
     let rendered = prompts::render(&model::AgentTask {
         id: "md-123".into(),
