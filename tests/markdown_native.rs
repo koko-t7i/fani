@@ -117,7 +117,7 @@ fn deterministic_validation_rejects_missing_tokens_and_structure_changes() {
 }
 
 #[test]
-fn validation_reports_protected_token_reordering_explicitly() {
+fn validation_allows_protected_inline_code_reordering() {
     let source = "Run `fani doctor` in the same environment as `fani sync`.\n";
     let units = extract_units(source);
     let unit = &units[0];
@@ -126,11 +126,29 @@ fn validation_reports_protected_token_reordering_explicitly() {
         unit.protected[1].token, unit.protected[0].token
     );
 
+    assert_eq!(
+        validate_translation(unit, &translated).unwrap(),
+        "在与 `fani sync` 相同的环境中运行 `fani doctor`。"
+    );
+}
+
+#[test]
+fn validation_rejects_delimiters_that_change_protected_inline_code() {
+    let source = "Use `a` and `b`.\n";
+    let units = extract_units(source);
+    let unit = &units[0];
+    let translated = format!(
+        "使用 `` {} `` 和 {}。",
+        unit.protected[0].token, unit.protected[1].token
+    );
+
     let findings = validate_translation(unit, &translated).unwrap_err();
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].code, "MD-PROTECTED-ORDER");
-    assert!(findings[0].message.contains(&unit.protected[0].token));
-    assert!(findings[0].message.contains(&unit.protected[1].token));
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.code == "MD-PROTECTED-CODE"),
+        "{findings:?}"
+    );
 }
 
 #[test]

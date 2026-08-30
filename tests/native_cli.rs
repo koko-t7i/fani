@@ -725,7 +725,7 @@ repair = "fixture"
 }
 
 #[test]
-fn repair_receives_explicit_protected_token_order_finding() {
+fn translated_inline_code_may_follow_target_language_order() {
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
     fs::create_dir_all(repo.join("docs")).unwrap();
@@ -745,7 +745,7 @@ fn repair_receives_explicit_protected_token_order_finding() {
     fs::write(
         &provider,
         format!(
-            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\nif [ \"$count\" -eq 1 ]; then\n  jq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(\"在与 \" + .task.protected_tokens[1] + \" 相同的环境中运行 \" + .task.protected_tokens[0] + \"。\")}}'\nelse\n  jq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(if any(.task.findings[]; .code == \"MD-PROTECTED-ORDER\") then .task.source else \"still invalid\" end)}}'\nfi\n",
+            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\njq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(\"在与 \" + .task.protected_tokens[1] + \" 相同的环境中运行 \" + .task.protected_tokens[0] + \"。\")}}'\n",
             counter = counter.display()
         ),
     )
@@ -808,12 +808,12 @@ repair = "fixture"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(report["totals"]["agent_calls"], 2);
-    assert_eq!(report["totals"]["repair_rounds"], 1);
-    assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+    assert_eq!(report["totals"]["agent_calls"], 1);
+    assert_eq!(report["totals"]["repair_rounds"], 0);
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
     assert_eq!(
         fs::read_to_string(repo.join("translations/zh-CN/docs/guide.md")).unwrap(),
-        "Run `fani doctor` in the same environment as `fani sync`.\n"
+        "在与 `fani sync` 相同的环境中运行 `fani doctor`。\n"
     );
 }
 

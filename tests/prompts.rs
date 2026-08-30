@@ -24,17 +24,17 @@ fn embedded_prompt_resources_match_reviewed_golden_hashes() {
         (
             "translate",
             prompts::TRANSLATE,
-            "ad0e20f144d7071f7a67b47f0fb2019fe8637c803aebe046e7857d6afd85b530",
+            "e5542d0c289e9d5f968a48d09c561697078455da0141a7f214986bf489f468db",
         ),
         (
             "revise",
             prompts::REVISE,
-            "5e75f4a26eb13a75c25bf2076644f9595b9e1adb5cb808dd8c69e7a1eddd1f10",
+            "2d88ac3badd067088a6dadaac8bf31e29ec9b70846b662099a4740a43a934414",
         ),
         (
             "repair",
             prompts::REPAIR,
-            "7478eb7ec648bd981dcc101826d32a2dcbd2a12a0d43cc22985abf61f1fa0691",
+            "9915da0ff97327796a0a7b68cbee1704edf511a52a161a392f0e9da0677c6082",
         ),
         (
             "revision",

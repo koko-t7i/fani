@@ -284,31 +284,18 @@ pub fn validate_translation(
         return Err(findings);
     }
 
-    let expected_order = unit
-        .protected
-        .iter()
-        .map(|protected| protected.token.as_str())
-        .collect::<Vec<_>>();
-    let mut positioned = expected_order
-        .iter()
-        .map(|token| (translated.find(token).unwrap(), *token))
-        .collect::<Vec<_>>();
-    positioned.sort_by_key(|(position, _)| *position);
-    let observed_order = positioned
-        .into_iter()
-        .map(|(_, token)| token)
-        .collect::<Vec<_>>();
-    if expected_order != observed_order {
+    let restored = restore_protected(unit, translated);
+    let expected_code = inline_code_values(&unit.source);
+    let actual_code = inline_code_values(&restored);
+    if expected_code != actual_code {
         findings.push(ValidationFinding {
-            code: "MD-PROTECTED-ORDER",
+            code: "MD-PROTECTED-CODE",
             message: format!(
-                "protected tokens are reordered (expected {expected_order:?}, found {observed_order:?})"
+                "protected inline code changed (expected {expected_code:?}, found {actual_code:?})"
             ),
         });
-        return Err(findings);
     }
 
-    let restored = restore_protected(unit, translated);
     let expected = structure_signature(&unit.source);
     let actual = structure_signature(&restored);
     if expected != actual {
@@ -572,13 +559,24 @@ fn short_hash(value: &str) -> String {
         })
 }
 
+fn inline_code_values(markdown: &str) -> Vec<String> {
+    let mut values = Parser::new_ext(markdown, Options::all())
+        .filter_map(|event| match event {
+            Event::Code(value) => Some(value.into_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
 fn structure_signature(markdown: &str) -> Vec<String> {
     let mut signature = Vec::new();
     for event in Parser::new_ext(markdown, Options::all()) {
         let part = match event {
             Event::Start(tag) => format!("start:{}", tag_name(&tag)),
             Event::End(tag) => format!("end:{}", tag_end_name(tag)),
-            Event::Code(value) => format!("code:{value}"),
+            Event::Code(_) => "code".into(),
             Event::Html(value) => format!("html:{value}"),
             Event::InlineHtml(value) => format!("inline-html:{value}"),
             Event::FootnoteReference(value) => format!("footnote:{value}"),
