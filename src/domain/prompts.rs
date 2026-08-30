@@ -1,13 +1,73 @@
 use crate::domain::model::{AgentStage, AgentTask};
+use sha2::{Digest, Sha256};
 
-pub const TRANSLATION_RULES: &str = r#"Translate only the Markdown unit between SOURCE markers.
-Return only the translated Markdown unit, with no fence, explanation, or metadata.
-Preserve Markdown structure. Every @@FANI_*@@ token is immutable: copy each token exactly once and do not invent tokens.
-Do not translate code, HTML, link destinations, or placeholders represented by those tokens."#;
+pub const PROMPT_VERSION: &str = "fani-native-markdown-prompts-v2";
+pub const VERIFIER_VERSION: &str = "fani-markdown-verifier-v1";
 
-pub const REPAIR_RULES: &str = r#"Repair the candidate with the smallest possible edit.
-Return only the repaired Markdown unit, with no fence, explanation, or metadata.
-Preserve Markdown structure. Every @@FANI_*@@ token is immutable: copy each token exactly once and do not invent tokens."#;
+pub const TRANSLATE: &str = include_str!("../../prompts/translate.md");
+pub const REVISE: &str = include_str!("../../prompts/revise.md");
+pub const REPAIR: &str = include_str!("../../prompts/repair.md");
+pub const REVISION: &str = include_str!("../../prompts/revision.md");
+pub const PROOFREAD: &str = include_str!("../../prompts/proofread.md");
+
+pub const TRANSLATION_RULES: &str = TRANSLATE;
+pub const REPAIR_RULES: &str = REPAIR;
+
+pub fn resource_name(task: &AgentTask) -> &'static str {
+    match task.stage {
+        AgentStage::Translate
+            if task.previous_source.is_some() && task.previous_translation.is_some() =>
+        {
+            "revise"
+        }
+        AgentStage::Translate => "translate",
+        AgentStage::Repair => "repair",
+        AgentStage::Revision => "revision",
+        AgentStage::Proofread => "proofread",
+    }
+}
+
+pub fn resource(task: &AgentTask) -> &'static str {
+    match resource_name(task) {
+        "translate" => TRANSLATE,
+        "revise" => REVISE,
+        "repair" => REPAIR,
+        "revision" => REVISION,
+        "proofread" => PROOFREAD,
+        _ => unreachable!("all prompt resources are matched"),
+    }
+}
+
+pub fn prompt_hash(stage: &AgentStage) -> String {
+    let rules = match stage {
+        AgentStage::Translate => TRANSLATE,
+        AgentStage::Repair => REPAIR,
+        AgentStage::Revision => REVISION,
+        AgentStage::Proofread => PROOFREAD,
+    };
+    format!("{:x}", Sha256::digest(rules.as_bytes()))
+}
+
+pub fn task_prompt_hash(task: &AgentTask) -> String {
+    format!("{:x}", Sha256::digest(resource(task).as_bytes()))
+}
+
+pub fn policy_fingerprint() -> String {
+    let mut digest = Sha256::new();
+    for resource in [
+        PROMPT_VERSION,
+        VERIFIER_VERSION,
+        TRANSLATE,
+        REVISE,
+        REPAIR,
+        REVISION,
+        PROOFREAD,
+    ] {
+        digest.update((resource.len() as u64).to_be_bytes());
+        digest.update(resource.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
 
 pub fn render(task: &AgentTask) -> String {
     let mut context = String::new();
@@ -32,16 +92,10 @@ pub fn render(task: &AgentTask) -> String {
         }
     }
 
-    let action = match &task.stage {
-        AgentStage::Translate => "Translate the source into the target language.",
-        AgentStage::Repair => {
-            "Repair the candidate according to the findings with the smallest possible edit."
-        }
-        AgentStage::Revision => "Revise the translation only where the source changed.",
-        AgentStage::Proofread => "Proofread the translation without changing protected content.",
-    };
     format!(
-        "fani-native-markdown-prompt-v1\n\n{TRANSLATION_RULES}\n\n{action}\nSource language: {}\nTarget language: {}\nTask ID: {}\nProtected tokens: {}{context}\n\n--- SOURCE ---\n{}\n--- END SOURCE ---",
+        "{PROMPT_VERSION}\nResource: {}\n\n{}\nSource language: {}\nTarget language: {}\nTask ID: {}\nProtected tokens: {}{context}\n\n--- SOURCE ---\n{}\n--- END SOURCE ---",
+        resource_name(task),
+        resource(task),
         task.source_language,
         task.target_language,
         task.id,
@@ -52,7 +106,7 @@ pub fn render(task: &AgentTask) -> String {
 
 pub fn translation_prompt(target_language: &str, unit_id: &str, protected_source: &str) -> String {
     format!(
-        "{TRANSLATION_RULES}\n\nTarget language: {target_language}\nUnit ID: {unit_id}\n\n--- SOURCE ---\n{protected_source}\n--- END SOURCE ---"
+        "{PROMPT_VERSION}\nResource: translate\n\n{TRANSLATE}\nTarget language: {target_language}\nUnit ID: {unit_id}\n\n--- SOURCE ---\n{protected_source}\n--- END SOURCE ---"
     )
 }
 
@@ -69,6 +123,6 @@ pub fn repair_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "{REPAIR_RULES}\n\nTarget language: {target_language}\nUnit ID: {unit_id}\n\nFindings:\n{findings}\n\n--- SOURCE ---\n{protected_source}\n--- END SOURCE ---\n\n--- CANDIDATE ---\n{candidate}\n--- END CANDIDATE ---"
+        "{PROMPT_VERSION}\nResource: repair\n\n{REPAIR}\nTarget language: {target_language}\nUnit ID: {unit_id}\n\nFindings:\n{findings}\n\n--- SOURCE ---\n{protected_source}\n--- END SOURCE ---\n\n--- CANDIDATE ---\n{candidate}\n--- END CANDIDATE ---"
     )
 }

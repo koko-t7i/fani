@@ -1,12 +1,14 @@
 use crate::adapters::process::process_identity;
 use crate::application::ports::{
     AttemptCandidateInput, AttemptInput, AttemptReceipt, CanonicalFile, CanonicalFileInput,
-    FindingInput, OutboxEntry, OutboxKind, PullRequestStateInput, RecoveredAttempt, StateStore,
-    StoredPullRequest, TrustTranslationInput, UnitHistory,
+    CanonicalTranslationInput, FindingInput, OutboxEntry, OutboxKind, PublicationManifestInput,
+    PullRequestStateInput, RecoveredAttempt, StateStore, StoredPullRequest, TrustTranslationInput,
+    UnitHistory,
 };
+use crate::domain::model::{CanonicalTransition, PublicationState};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, MAIN_DB, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const APPLICATION_ID: i64 = 0x4641_4e49;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -25,11 +27,18 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_native_authority",
-    sql: include_str!("../../migrations/0001_native_authority.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_native_authority",
+        sql: include_str!("../../migrations/0001_native_authority.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_orthogonal_translation_state",
+        sql: include_str!("../../migrations/0002_orthogonal_translation_state.sql"),
+    },
+];
 
 const MIGRATION_LEDGER_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -189,6 +198,76 @@ fn apply_migrations(conn: &mut Connection, migrations: &[Migration]) -> Result<(
     Ok(())
 }
 
+fn validate_physical_integrity(conn: &Connection) -> Result<()> {
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!("SQLite integrity check failed: {integrity}");
+    }
+    let violations: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 {
+        bail!("SQLite foreign key check found {violations} violation(s)");
+    }
+    Ok(())
+}
+
+fn validate_existing_connection(conn: &Connection) -> Result<()> {
+    let actual = application_id(conn)?;
+    if actual != APPLICATION_ID {
+        bail!(
+            "SQLite application_id {actual:#x} does not identify a fani database ({APPLICATION_ID:#x})"
+        );
+    }
+    validate_physical_integrity(conn)?;
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version != SCHEMA_VERSION {
+        bail!("SQLite user_version is {user_version}; expected migration version {SCHEMA_VERSION}");
+    }
+    let marker: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT generation,version FROM state_schema WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if marker.as_ref() != Some(&("native-authoritative".to_owned(), SCHEMA_VERSION)) {
+        bail!("database has an invalid state_schema marker");
+    }
+    let applied = {
+        let mut statement =
+            conn.prepare("SELECT version,name,checksum FROM schema_migrations ORDER BY version")?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if applied.len() != MIGRATIONS.len() {
+        bail!(
+            "database has {} migrations; expected {}",
+            applied.len(),
+            MIGRATIONS.len()
+        );
+    }
+    for (migration, (version, name, checksum)) in MIGRATIONS.iter().zip(applied) {
+        let expected_checksum = migration_checksum(migration.sql);
+        if version != migration.version || name != migration.name || checksum != expected_checksum {
+            bail!(
+                "migration {} checksum/name mismatch: database has {name} {checksum}, binary expects {} {expected_checksum}",
+                migration.version,
+                migration.name
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct Database {
     path: PathBuf,
@@ -213,6 +292,7 @@ impl Database {
             })?;
         }
         db.migrate()?;
+        db.integrity_check()?;
         Ok(db)
     }
 
@@ -232,24 +312,23 @@ impl Database {
     }
 
     pub fn snapshot(source: &Path, destination: &Path) -> Result<()> {
-        if destination.exists() {
-            fs::remove_file(destination).with_context(|| {
-                format!("cannot replace database snapshot {}", destination.display())
-            })?;
-        }
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create snapshot directory {}", parent.display()))?;
         let conn = Connection::open_with_flags(
             source,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("cannot open SQLite database {} read-only", source.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        let actual = application_id(&conn)?;
-        if actual != APPLICATION_ID {
-            bail!(
-                "cannot snapshot SQLite application_id {actual:#x}; expected fani {APPLICATION_ID:#x}"
-            );
-        }
-        conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
+        validate_existing_connection(&conn)?;
+
+        let temporary = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("cannot create temporary snapshot in {}", parent.display()))?;
+        conn.backup(MAIN_DB, temporary.path(), None)
             .with_context(|| {
                 format!(
                     "cannot snapshot database {} to {}",
@@ -257,11 +336,37 @@ impl Database {
                     destination.display()
                 )
             })?;
+        temporary.as_file().sync_all()?;
+        let snapshot = Connection::open_with_flags(
+            temporary.path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        validate_existing_connection(&snapshot)?;
+        drop(snapshot);
+        temporary
+            .persist(destination)
+            .map_err(|error| error.error)
+            .with_context(|| {
+                format!("cannot install database snapshot {}", destination.display())
+            })?;
+        fs::File::open(parent)?.sync_all()?;
         Ok(())
+    }
+
+    pub fn restore(source: &Path, destination: &Path) -> Result<Self> {
+        Self::snapshot(source, destination).with_context(|| {
+            format!(
+                "cannot restore database {} from {}",
+                destination.display(),
+                source.display()
+            )
+        })?;
+        Self::open(destination)
     }
 
     pub fn migrate(&self) -> Result<()> {
         let mut conn = open_connection(&self.path)?;
+        validate_physical_integrity(&conn)?;
         apply_migrations(&mut conn, MIGRATIONS)?;
         let marker: Option<(String, i64)> = conn
             .query_row(
@@ -325,19 +430,7 @@ impl Database {
     }
 
     pub fn integrity_check(&self) -> Result<()> {
-        let conn = self.connect()?;
-        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-        if integrity != "ok" {
-            bail!("SQLite integrity check failed: {integrity}");
-        }
-        let violations: i64 =
-            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })?;
-        if violations != 0 {
-            bail!("SQLite foreign key check found {violations} violation(s)");
-        }
-        Ok(())
+        validate_existing_connection(&self.connect()?)
     }
 
     pub fn upsert_repository(
@@ -420,21 +513,40 @@ impl Database {
                  updated_at=excluded.updated_at"#,
             params![document_id, unit_key, ordinal, source_text, source_hash, context_json, now],
         )?;
-        Ok(conn.query_row(
+        let unit_id = conn.query_row(
             "SELECT id FROM units WHERE document_id=?1 AND unit_key=?2",
             params![document_id, unit_key],
             |row| row.get(0),
-        )?)
+        )?;
+        let source_revision: String = conn.query_row(
+            "SELECT COALESCE(source_revision,'') FROM documents WHERE id=?1",
+            [document_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            r#"INSERT OR IGNORE INTO unit_versions(
+                   unit_id,source_revision,source_text,source_hash,context_json,created_at)
+               VALUES (?1,?2,?3,?4,?5,?6)"#,
+            params![
+                unit_id,
+                source_revision,
+                source_text,
+                source_hash,
+                context_json,
+                now
+            ],
+        )?;
+        Ok(unit_id)
     }
 
     pub fn unit_history(&self, document_id: i64, locale: &str) -> Result<Vec<UnitHistory>> {
         let conn = self.connect()?;
         let mut statement = conn.prepare(
             r#"SELECT u.id,u.unit_key,u.ordinal,u.source_text,u.source_hash,u.context_json,
-                      COALESCE(t.target_text,c.target_text),CASE WHEN t.id IS NULL THEN 0 ELSE 1 END
+                      t.target_text,CASE WHEN t.id IS NULL THEN 0 ELSE 1 END
                FROM units u
-               LEFT JOIN canonical_candidates c ON c.unit_id=u.id AND c.locale=?2 AND c.selected=1
-               LEFT JOIN trusted_translation_memory t ON t.unit_id=u.id AND t.locale=?2 AND t.superseded_at IS NULL
+               LEFT JOIN translation_memory_entries t
+                 ON t.unit_id=u.id AND t.locale=?2 AND t.tier='trusted' AND t.superseded_at IS NULL
                WHERE u.document_id=?1 AND u.active=1 ORDER BY u.ordinal,u.id"#,
         )?;
         let rows = statement.query_map(params![document_id, locale], |row| {
@@ -461,25 +573,57 @@ impl Database {
             context_key,
             target_text,
             provenance,
+            policy_fingerprint,
         } = input;
-        let conn = self.connect()?;
-        conn.execute(
-            r#"INSERT INTO trusted_translation_memory(
-                   repository_id,unit_id,locale,source_hash,context_key,target_text,provenance,trusted_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-               ON CONFLICT(repository_id,locale,source_hash,context_key) DO UPDATE SET
-                 unit_id=excluded.unit_id,
-                 target_text=excluded.target_text,
-                 provenance=excluded.provenance,
-                 trusted_at=excluded.trusted_at,
-                 superseded_at=NULL"#,
-            params![repository_id, unit_id, locale, source_hash, context_key, target_text, provenance, now_ms()],
+        require_fingerprint(policy_fingerprint, "translation policy")?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            r#"UPDATE translation_memory_entries
+               SET unit_id=?2,target_text=?6,provenance=?7,policy_fingerprint=?8,
+                   created_at=?9,superseded_at=NULL
+               WHERE repository_id=?1 AND locale=?3 AND source_hash=?4 AND context_key=?5
+                 AND tier='trusted' AND superseded_at IS NULL"#,
+            params![
+                repository_id,
+                unit_id,
+                locale,
+                source_hash,
+                context_key,
+                target_text,
+                provenance,
+                policy_fingerprint,
+                now_ms()
+            ],
         )?;
-        Ok(conn.query_row(
-            "SELECT id FROM trusted_translation_memory WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4",
+        if updated == 0 {
+            tx.execute(
+                r#"INSERT INTO translation_memory_entries(
+                       repository_id,unit_id,locale,source_hash,context_key,target_text,tier,
+                       provenance,policy_fingerprint,created_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,'trusted',?7,?8,?9)"#,
+                params![
+                    repository_id,
+                    unit_id,
+                    locale,
+                    source_hash,
+                    context_key,
+                    target_text,
+                    provenance,
+                    policy_fingerprint,
+                    now_ms()
+                ],
+            )?;
+        }
+        let id = tx.query_row(
+            r#"SELECT id FROM translation_memory_entries
+               WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4
+                 AND tier='trusted' AND superseded_at IS NULL"#,
             params![repository_id, locale, source_hash, context_key],
             |row| row.get(0),
-        )?)
+        )?;
+        tx.commit()?;
+        Ok(id)
     }
 
     pub fn begin_run(
@@ -488,8 +632,10 @@ impl Database {
         invocation_key: &str,
         config_path: &Path,
         metadata_json: &str,
+        policy_fingerprint: &str,
     ) -> Result<String> {
         require_json(metadata_json)?;
+        require_fingerprint(policy_fingerprint, "run policy")?;
         let conn = self.connect()?;
         let existing: Option<String> = conn
             .query_row(
@@ -509,8 +655,8 @@ impl Database {
         let id = new_id("run");
         let now = now_ms();
         conn.execute(
-            "INSERT INTO runs(id,repository_id,invocation_key,config_path,started_at,heartbeat_at,metadata_json) VALUES (?1,?2,?3,?4,?5,?5,?6)",
-            params![id, repository_id, invocation_key, config_path.display().to_string(), now, metadata_json],
+            "INSERT INTO runs(id,repository_id,invocation_key,config_path,started_at,heartbeat_at,metadata_json,policy_fingerprint) VALUES (?1,?2,?3,?4,?5,?5,?6,?7)",
+            params![id, repository_id, invocation_key, config_path.display().to_string(), now, metadata_json, policy_fingerprint],
         )?;
         Ok(id)
     }
@@ -536,11 +682,14 @@ impl Database {
         let now = now_ms();
         let conn = self.connect()?;
         conn.execute(
-            r#"INSERT INTO work_items(run_id,unit_id,locale,kind,priority,input_json,created_at,updated_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?7)
+            r#"INSERT INTO work_items(
+                   run_id,unit_id,locale,kind,priority,input_json,created_at,updated_at,policy_fingerprint)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?7,
+                       (SELECT policy_fingerprint FROM runs WHERE id=?1))
                ON CONFLICT(run_id,unit_id,locale,kind) DO UPDATE SET
                  priority=excluded.priority,
                  input_json=excluded.input_json,
+                 policy_fingerprint=excluded.policy_fingerprint,
                  updated_at=excluded.updated_at"#,
             params![run_id, unit_id, locale, kind, priority, input_json, now],
         )?;
@@ -552,6 +701,7 @@ impl Database {
     }
 
     pub fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt> {
+        require_attempt_provenance(&input)?;
         require_json(input.request_json)?;
         if let Some(response) = input.response_json {
             require_json(response)?;
@@ -579,9 +729,30 @@ impl Database {
         )?;
         let now = now_ms();
         tx.execute(
-            r#"INSERT INTO attempts(work_item_id,dedupe_key,attempt_no,agent,status,request_json,response_json,error,started_at,finished_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,CASE WHEN ?5='started' THEN NULL ELSE ?9 END)"#,
-            params![input.work_item_id, input.dedupe_key, attempt_no, input.agent, input.status, input.request_json, input.response_json, input.error, now],
+            r#"INSERT INTO attempts(
+                   work_item_id,dedupe_key,attempt_no,agent,provider,model,adapter,
+                   provider_fingerprint,prompt_version,prompt_hash,policy_fingerprint,status,
+                   request_json,response_json,error,started_at,finished_at)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+                       CASE WHEN ?12='started' THEN NULL ELSE ?16 END)"#,
+            params![
+                input.work_item_id,
+                input.dedupe_key,
+                attempt_no,
+                input.agent,
+                input.provider,
+                input.model,
+                input.adapter,
+                input.provider_fingerprint,
+                input.prompt_version,
+                input.prompt_hash,
+                input.policy_fingerprint,
+                input.status,
+                input.request_json,
+                input.response_json,
+                input.error,
+                now
+            ],
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
@@ -634,6 +805,8 @@ impl Database {
         if input.attempt.status != "succeeded" {
             bail!("only a successful attempt can select a canonical candidate");
         }
+        require_fingerprint(input.policy_fingerprint, "translation policy")?;
+        require_attempt_provenance(&input.attempt)?;
         require_json(input.attempt.request_json)?;
         let response = input
             .attempt
@@ -671,13 +844,23 @@ impl Database {
             )?;
             let now = now_ms();
             tx.execute(
-                r#"INSERT INTO attempts(work_item_id,dedupe_key,attempt_no,agent,status,request_json,response_json,error,started_at,finished_at)
-                   VALUES (?1,?2,?3,?4,'succeeded',?5,?6,NULL,?7,?7)"#,
+                r#"INSERT INTO attempts(
+                       work_item_id,dedupe_key,attempt_no,agent,provider,model,adapter,
+                       provider_fingerprint,prompt_version,prompt_hash,policy_fingerprint,status,
+                       request_json,response_json,error,started_at,finished_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'succeeded',?12,?13,NULL,?14,?14)"#,
                 params![
                     input.attempt.work_item_id,
                     input.attempt.dedupe_key,
                     attempt_no,
                     input.attempt.agent,
+                    input.attempt.provider,
+                    input.attempt.model,
+                    input.attempt.adapter,
+                    input.attempt.provider_fingerprint,
+                    input.attempt.prompt_version,
+                    input.attempt.prompt_hash,
+                    input.attempt.policy_fingerprint,
                     input.attempt.request_json,
                     response,
                     now,
@@ -705,6 +888,100 @@ impl Database {
                 now_ms(),
             ],
         )?;
+        let (unit_version_id, repository_id, source_hash, source_revision, context_key): (
+            i64,
+            i64,
+            String,
+            String,
+            String,
+        ) = tx.query_row(
+            r#"SELECT uv.id,d.repository_id,uv.source_hash,uv.source_revision,
+                          COALESCE(json_extract(uv.context_json,'$.kind'),'')
+                   FROM units u
+                   JOIN documents d ON d.id=u.document_id
+                   JOIN unit_versions uv ON uv.unit_id=u.id AND uv.source_hash=u.source_hash
+                   WHERE u.id=?1 ORDER BY uv.id DESC LIMIT 1"#,
+            [input.unit_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        let translation_version_id = if let Some(id) = tx
+            .query_row(
+                "SELECT id FROM translation_versions WHERE source_attempt_id=?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            id
+        } else {
+            tx.execute(
+                r#"INSERT INTO translation_versions(
+                       unit_version_id,locale,target_text,target_hash,freshness,provenance,
+                       validation_state,review_state,publication_state,policy_fingerprint,
+                       source_attempt_id,created_at)
+                   VALUES (?1,?2,?3,?4,'exact',?5,'passed','unreviewed','candidate',?6,?7,?8)"#,
+                params![
+                    unit_version_id,
+                    input.locale,
+                    input.target_text,
+                    migration_checksum(input.target_text),
+                    input.provenance.as_str(),
+                    input.policy_fingerprint,
+                    attempt_id,
+                    now_ms()
+                ],
+            )?;
+            tx.last_insert_rowid()
+        };
+        let updated = tx.execute(
+            r#"UPDATE translation_memory_entries
+               SET unit_id=?2,translation_version_id=?3,source_revision=?6,target_text=?8,provenance=?9,
+                   policy_fingerprint=?10,created_at=?11
+               WHERE repository_id=?1 AND locale=?4 AND source_hash=?5 AND context_key=?7
+                 AND tier='candidate' AND superseded_at IS NULL"#,
+            params![
+                repository_id,
+                input.unit_id,
+                translation_version_id,
+                input.locale,
+                source_hash,
+                source_revision,
+                context_key,
+                input.target_text,
+                input.provenance.as_str(),
+                input.policy_fingerprint,
+                now_ms()
+            ],
+        )?;
+        if updated == 0 {
+            tx.execute(
+                r#"INSERT INTO translation_memory_entries(
+                       repository_id,unit_id,translation_version_id,locale,source_hash,source_revision,context_key,
+                       target_text,tier,provenance,policy_fingerprint,created_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'candidate',?9,?10,?11)"#,
+                params![
+                    repository_id,
+                    input.unit_id,
+                    translation_version_id,
+                    input.locale,
+                    source_hash,
+                    source_revision,
+                    context_key,
+                    input.target_text,
+                    input.provenance.as_str(),
+                    input.policy_fingerprint,
+                    now_ms()
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(AttemptReceipt {
             id: attempt_id,
@@ -1121,35 +1398,612 @@ impl Database {
             .optional()?)
     }
 
-    pub fn promote_merged_locale(
+    pub fn persist_canonical_file(
+        &self,
+        input: CanonicalFileInput<'_>,
+        translations: &[CanonicalTranslationInput<'_>],
+    ) -> Result<CanonicalFile> {
+        let CanonicalFileInput {
+            repository_id,
+            locale,
+            path,
+            source_revision,
+            content,
+            content_hash,
+            materialized_hash,
+            freshness,
+            provenance,
+            validation,
+            review,
+            publication,
+            trust_tier,
+            policy_fingerprint,
+        } = input;
+        require_fingerprint(policy_fingerprint, "translation policy")?;
+        let state = if trust_tier.as_str() == "trusted" {
+            "adopted"
+        } else {
+            "candidate"
+        };
+        let now = now_ms();
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            r#"INSERT INTO canonical_files(
+                   repository_id,locale,path,source_revision,content,content_hash,materialized_hash,
+                   state,freshness,provenance,validation_state,review_state,publication_state,
+                   trust_tier,policy_fingerprint,updated_at)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+               ON CONFLICT(repository_id,locale,path) DO UPDATE SET
+                 source_revision=excluded.source_revision,content=excluded.content,
+                 content_hash=excluded.content_hash,materialized_hash=excluded.materialized_hash,
+                 state=excluded.state,freshness=excluded.freshness,provenance=excluded.provenance,
+                 validation_state=excluded.validation_state,review_state=excluded.review_state,
+                 publication_state=excluded.publication_state,trust_tier=excluded.trust_tier,
+                 policy_fingerprint=excluded.policy_fingerprint,updated_at=excluded.updated_at"#,
+            params![
+                repository_id,
+                locale,
+                path,
+                source_revision,
+                content,
+                content_hash,
+                materialized_hash,
+                state,
+                freshness.as_str(),
+                provenance.as_str(),
+                validation.as_str(),
+                review.as_str(),
+                publication.as_str(),
+                trust_tier.as_str(),
+                policy_fingerprint,
+                now
+            ],
+        )?;
+        let canonical_file_id: i64 = tx.query_row(
+            "SELECT id FROM canonical_files WHERE repository_id=?1 AND locale=?2 AND path=?3",
+            params![repository_id, locale, path],
+            |row| row.get(0),
+        )?;
+        let existing_content: Option<(i64, String, Vec<u8>)> = tx
+            .query_row(
+                "SELECT id,source_revision,content FROM canonical_content_versions WHERE canonical_file_id=?1 AND content_hash=?2",
+                params![canonical_file_id, content_hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((_, stored_revision, stored_content)) = &existing_content {
+            if stored_revision != source_revision || stored_content != content {
+                bail!("canonical content hash conflicts with immutable durable content");
+            }
+        }
+        tx.execute(
+            r#"INSERT OR IGNORE INTO canonical_content_versions(
+                   canonical_file_id,source_revision,content,content_hash,publication_state,created_at)
+               VALUES (?1,?2,?3,?4,?5,?6)"#,
+            params![
+                canonical_file_id,
+                source_revision,
+                content,
+                content_hash,
+                publication.as_str(),
+                now
+            ],
+        )?;
+        let content_version_id: i64 = tx.query_row(
+            "SELECT id FROM canonical_content_versions WHERE canonical_file_id=?1 AND content_hash=?2",
+            params![canonical_file_id, content_hash],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "UPDATE canonical_files SET current_content_version_id=?2 WHERE id=?1",
+            params![canonical_file_id, content_version_id],
+        )?;
+        crate::adapters::failpoint::reach("canonical_content_before_translation_links");
+        let mut translation_version_ids = Vec::with_capacity(translations.len());
+        for translation in translations {
+            let unit_version: (i64, String, String) = tx
+                .query_row(
+                    r#"SELECT uv.id,uv.source_hash,
+                              COALESCE(json_extract(uv.context_json,'$.kind'),'')
+                       FROM unit_versions uv
+                       JOIN units u ON u.id=uv.unit_id
+                       JOIN documents d ON d.id=u.document_id
+                       WHERE uv.unit_id=?1 AND uv.source_revision=?2
+                         AND d.repository_id=?3
+                       ORDER BY uv.id DESC LIMIT 1"#,
+                    params![translation.unit_id, source_revision, repository_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unit {} has no immutable source version for revision {}",
+                        translation.unit_id,
+                        source_revision
+                    )
+                })?;
+            let translation_version_id: Option<i64> = tx
+                .query_row(
+                    r#"SELECT tv.id
+                       FROM translation_versions tv
+                       WHERE tv.unit_version_id=?1 AND tv.locale=?2 AND tv.target_text=?3
+                       ORDER BY tv.id DESC LIMIT 1"#,
+                    params![unit_version.0, locale, translation.target_text],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let translation_version_id = if let Some(id) = translation_version_id {
+                id
+            } else {
+                let tm_tier: Option<String> = tx
+                    .query_row(
+                        r#"SELECT tier FROM translation_memory_entries
+                           WHERE repository_id=?1 AND unit_id=?2 AND locale=?3
+                             AND source_hash=?4 AND context_key=?5 AND target_text=?6
+                             AND superseded_at IS NULL
+                           ORDER BY CASE tier WHEN 'trusted' THEN 0 ELSE 1 END,id DESC LIMIT 1"#,
+                        params![
+                            repository_id,
+                            translation.unit_id,
+                            locale,
+                            unit_version.1,
+                            unit_version.2,
+                            translation.target_text
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let version_provenance = match tm_tier.as_deref() {
+                    Some("trusted") => "trusted_tm",
+                    Some("candidate") => "candidate_tm",
+                    _ => provenance.as_str(),
+                };
+                tx.execute(
+                    r#"INSERT INTO translation_versions(
+                           unit_version_id,locale,target_text,target_hash,freshness,provenance,
+                           validation_state,review_state,publication_state,policy_fingerprint,created_at)
+                       VALUES (?1,?2,?3,?4,'exact',?5,'passed',?6,?7,?8,?9)"#,
+                    params![
+                        unit_version.0,
+                        locale,
+                        translation.target_text,
+                        migration_checksum(translation.target_text),
+                        version_provenance,
+                        review.as_str(),
+                        publication.as_str(),
+                        policy_fingerprint,
+                        now
+                    ],
+                )?;
+                tx.last_insert_rowid()
+            };
+            translation_version_ids.push(translation_version_id);
+        }
+        if !translation_version_ids.is_empty() {
+            translation_version_ids.sort_unstable();
+            translation_version_ids.dedup();
+            let stored = {
+                let mut statement = tx.prepare(
+                    "SELECT translation_version_id FROM canonical_file_translations WHERE canonical_content_version_id=?1 ORDER BY translation_version_id",
+                )?;
+                statement
+                    .query_map([content_version_id], |row| row.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if stored.is_empty() {
+                for translation_version_id in &translation_version_ids {
+                    tx.execute(
+                        "INSERT INTO canonical_file_translations(canonical_content_version_id,translation_version_id) VALUES (?1,?2)",
+                        params![content_version_id, translation_version_id],
+                    )?;
+                }
+            } else if stored != translation_version_ids {
+                bail!("canonical content translation set conflicts with immutable durable links");
+            }
+        }
+        tx.commit()?;
+        Ok(CanonicalFile {
+            id: canonical_file_id,
+            content_version_id,
+            source_revision: source_revision.to_owned(),
+            content: content.to_vec(),
+            content_hash: content_hash.to_owned(),
+            materialized_hash: materialized_hash.map(str::to_owned),
+            state: state.to_owned(),
+        })
+    }
+
+    pub fn record_canonical_file_translations(
+        &self,
+        canonical_file_id: i64,
+        translations: &[CanonicalTranslationInput<'_>],
+        locale: &str,
+    ) -> Result<usize> {
+        let conn = self.connect()?;
+        let row: (i64, String, String, Vec<u8>, String, Option<String>, String) = conn
+            .query_row(
+                r#"SELECT repository_id,path,source_revision,content,content_hash,
+                          materialized_hash,policy_fingerprint
+                   FROM canonical_files WHERE id=?1 AND locale=?2"#,
+                params![canonical_file_id, locale],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                anyhow!("canonical file {canonical_file_id} does not exist for {locale}")
+            })?;
+        drop(conn);
+        self.persist_canonical_file(
+            CanonicalFileInput {
+                repository_id: row.0,
+                locale,
+                path: &row.1,
+                source_revision: &row.2,
+                content: &row.3,
+                content_hash: &row.4,
+                materialized_hash: row.5.as_deref(),
+                freshness: crate::domain::model::Freshness::Exact,
+                provenance: crate::domain::model::TranslationProvenance::Ai,
+                validation: crate::domain::model::ValidationState::Passed,
+                review: crate::domain::model::ReviewState::Unreviewed,
+                publication: PublicationState::Candidate,
+                trust_tier: crate::domain::model::MemoryTier::Candidate,
+                policy_fingerprint: &row.6,
+            },
+            translations,
+        )?;
+        Ok(translations.len())
+    }
+
+    pub fn record_publication_manifest(&self, input: PublicationManifestInput<'_>) -> Result<i64> {
+        let PublicationManifestInput {
+            repository_id,
+            run_id,
+            locale,
+            source_revision,
+            candidate_commit,
+            policy_fingerprint,
+            files,
+        } = input;
+        require_fingerprint(policy_fingerprint, "publication policy")?;
+        if candidate_commit.is_empty() {
+            bail!("publication candidate commit cannot be empty");
+        }
+        if files.is_empty() {
+            bail!("publication manifest must contain at least one canonical file");
+        }
+        let mut requested = files
+            .iter()
+            .map(|file| {
+                (
+                    file.canonical_content_version_id,
+                    file.canonical_file_id,
+                    file.content_hash.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        requested.sort();
+        requested.dedup();
+        if requested.len() != files.len() {
+            bail!("publication manifest contains duplicate canonical content versions");
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT repository_id,policy_fingerprint FROM runs WHERE id=?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if run.as_ref() != Some(&(repository_id, policy_fingerprint.to_owned())) {
+            bail!("publication run does not match repository and policy fingerprint");
+        }
+        let now = now_ms();
+        let inserted = tx.execute(
+            r#"INSERT OR IGNORE INTO publication_manifests(
+                   repository_id,run_id,locale,source_revision,candidate_commit,
+                   policy_fingerprint,state,created_at)
+               VALUES (?1,?2,?3,?4,?5,?6,'commit_created',?7)"#,
+            params![
+                repository_id,
+                run_id,
+                locale,
+                source_revision,
+                candidate_commit,
+                policy_fingerprint,
+                now
+            ],
+        )? == 1;
+        let manifest: (i64, String, String, String) = tx.query_row(
+            r#"SELECT id,run_id,source_revision,policy_fingerprint
+               FROM publication_manifests
+               WHERE repository_id=?1 AND locale=?2 AND candidate_commit=?3"#,
+            params![repository_id, locale, candidate_commit],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if manifest.1 != run_id || manifest.2 != source_revision || manifest.3 != policy_fingerprint
+        {
+            bail!("publication candidate commit conflicts with its durable manifest");
+        }
+        for file in files {
+            let valid = tx.query_row(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM canonical_content_versions ccv
+                       JOIN canonical_files cf ON cf.id=ccv.canonical_file_id
+                       WHERE ccv.id=?1 AND ccv.canonical_file_id=?2 AND ccv.content_hash=?3
+                         AND ccv.source_revision=?4 AND cf.repository_id=?5 AND cf.locale=?6)"#,
+                params![
+                    file.canonical_content_version_id,
+                    file.canonical_file_id,
+                    file.content_hash,
+                    source_revision,
+                    repository_id,
+                    locale
+                ],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if !valid {
+                bail!(
+                    "canonical content version {} does not match publication manifest content",
+                    file.canonical_content_version_id
+                );
+            }
+        }
+        let stored = {
+            let mut statement = tx.prepare(
+                "SELECT canonical_content_version_id,canonical_file_id,content_hash FROM publication_manifest_files WHERE manifest_id=?1 ORDER BY canonical_content_version_id,canonical_file_id,content_hash",
+            )?;
+            statement
+                .query_map([manifest.0], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if inserted {
+            for file in files {
+                tx.execute(
+                    "INSERT INTO publication_manifest_files(manifest_id,canonical_content_version_id,canonical_file_id,content_hash) VALUES (?1,?2,?3,?4)",
+                    params![manifest.0, file.canonical_content_version_id, file.canonical_file_id, file.content_hash],
+                )?;
+            }
+        } else if stored != requested {
+            bail!("publication manifest file set conflicts with durable state");
+        }
+        tx.execute(
+            r#"UPDATE canonical_content_versions SET publication_state=
+                   CASE WHEN publication_state='merged' THEN 'merged' ELSE 'commit_created' END
+               WHERE id IN (SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)"#,
+            [manifest.0],
+        )?;
+        tx.execute(
+            r#"UPDATE canonical_files SET publication_state=
+                   CASE WHEN publication_state='merged' THEN 'merged' ELSE 'commit_created' END,
+                   updated_at=?2
+               WHERE current_content_version_id IN (
+                   SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)"#,
+            params![manifest.0, now],
+        )?;
+        tx.execute(
+            r#"UPDATE translation_versions SET publication_state=
+                   CASE WHEN publication_state='merged' THEN 'merged' ELSE 'commit_created' END
+               WHERE id IN (
+                   SELECT cft.translation_version_id
+                   FROM publication_manifest_files pmf
+                   JOIN canonical_file_translations cft
+                     ON cft.canonical_content_version_id=pmf.canonical_content_version_id
+                   WHERE pmf.manifest_id=?1)"#,
+            [manifest.0],
+        )?;
+        tx.commit()?;
+        Ok(manifest.0)
+    }
+
+    pub fn transition_publication_manifest(
         &self,
         repository_id: i64,
         locale: &str,
+        candidate_commit: &str,
+        state: PublicationState,
+    ) -> Result<()> {
+        let state = state.as_str();
+        if !matches!(
+            state,
+            "commit_created" | "push_pending" | "pr_open" | "superseded"
+        ) {
+            bail!("publication manifest cannot transition directly to {state}");
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let manifest: (i64, String) = tx
+            .query_row(
+                "SELECT id,state FROM publication_manifests WHERE repository_id=?1 AND locale=?2 AND candidate_commit=?3",
+                params![repository_id, locale, candidate_commit],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("publication manifest for commit {candidate_commit} does not exist"))?;
+        let effective = if manifest.1 == "merged"
+            || manifest.1 == "superseded"
+            || publication_rank(&manifest.1) >= publication_rank(state)
+        {
+            manifest.1.as_str()
+        } else {
+            state
+        };
+        let now = now_ms();
+        tx.execute(
+            "UPDATE publication_manifests SET state=?2 WHERE id=?1",
+            params![manifest.0, effective],
+        )?;
+        tx.execute(
+            r#"UPDATE canonical_content_versions SET publication_state=?2
+               WHERE id IN (SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)
+                 AND publication_state<>'merged'"#,
+            params![manifest.0, effective],
+        )?;
+        tx.execute(
+            r#"UPDATE canonical_files SET
+                   state=CASE WHEN ?2='pr_open' THEN 'published' ELSE state END,
+                   publication_state=?2,updated_at=?3
+               WHERE current_content_version_id IN (
+                   SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)
+                 AND publication_state<>'merged'"#,
+            params![manifest.0, effective, now],
+        )?;
+        tx.execute(
+            r#"UPDATE translation_versions SET publication_state=?2
+               WHERE id IN (
+                   SELECT cft.translation_version_id
+                   FROM publication_manifest_files pmf
+                   JOIN canonical_file_translations cft
+                     ON cft.canonical_content_version_id=pmf.canonical_content_version_id
+                   WHERE pmf.manifest_id=?1)
+                 AND publication_state<>'merged'"#,
+            params![manifest.0, effective],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn promote_merged_publication(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        candidate_commit: &str,
         provenance: &str,
     ) -> Result<usize> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let manifest_id: i64 = tx
+            .query_row(
+                "SELECT id FROM publication_manifests WHERE repository_id=?1 AND locale=?2 AND candidate_commit=?3 AND state<>'superseded'",
+                params![repository_id, locale, candidate_commit],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("verified merged commit has no publication manifest"))?;
+        let translations = {
+            let mut statement = tx.prepare(
+                r#"SELECT DISTINCT tv.id,uv.unit_id,uv.source_hash,uv.source_revision,
+                          COALESCE(json_extract(uv.context_json,'$.kind'),''),tv.target_text,
+                          tv.policy_fingerprint
+                   FROM publication_manifest_files pmf
+                   JOIN canonical_file_translations cft
+                     ON cft.canonical_content_version_id=pmf.canonical_content_version_id
+                   JOIN translation_versions tv ON tv.id=cft.translation_version_id
+                   JOIN unit_versions uv ON uv.id=tv.unit_version_id
+                   JOIN units u ON u.id=uv.unit_id
+                   JOIN documents d ON d.id=u.document_id
+                   WHERE pmf.manifest_id=?1 AND d.repository_id=?2 AND tv.locale=?3"#,
+            )?;
+            statement
+                .query_map(params![manifest_id, repository_id, locale], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if translations.is_empty() {
+            bail!("publication manifest contains no exact translation versions");
+        }
         let now = now_ms();
-        let promoted = tx.execute(
-            r#"INSERT INTO trusted_translation_memory(
-                   repository_id,unit_id,locale,source_hash,context_key,target_text,provenance,trusted_at)
-               SELECT d.repository_id,u.id,c.locale,u.source_hash,
-                      COALESCE(json_extract(u.context_json,'$.kind'),''),c.target_text,?3,?4
-               FROM canonical_candidates c
-               JOIN units u ON u.id=c.unit_id
-               JOIN documents d ON d.id=u.document_id
-               WHERE d.repository_id=?1 AND c.locale=?2 AND c.selected=1 AND u.active=1
-               ON CONFLICT(repository_id,locale,source_hash,context_key) DO UPDATE SET
-                 unit_id=excluded.unit_id,target_text=excluded.target_text,
-                 provenance=excluded.provenance,trusted_at=excluded.trusted_at,superseded_at=NULL"#,
-            params![repository_id, locale, provenance, now],
+        for (
+            version_id,
+            unit_id,
+            source_hash,
+            source_revision,
+            context_key,
+            target_text,
+            fingerprint,
+        ) in &translations
+        {
+            let updated = tx.execute(
+                r#"UPDATE translation_memory_entries
+                   SET unit_id=?2,translation_version_id=?3,source_revision=?6,target_text=?8,provenance=?9,
+                       policy_fingerprint=?10,created_at=?11,superseded_at=NULL
+                   WHERE repository_id=?1 AND locale=?4 AND source_hash=?5 AND context_key=?7
+                     AND tier='trusted' AND superseded_at IS NULL"#,
+                params![
+                    repository_id,
+                    unit_id,
+                    version_id,
+                    locale,
+                    source_hash,
+                    source_revision,
+                    context_key,
+                    target_text,
+                    provenance,
+                    fingerprint,
+                    now
+                ],
+            )?;
+            if updated == 0 {
+                tx.execute(
+                    r#"INSERT INTO translation_memory_entries(
+                           repository_id,unit_id,translation_version_id,locale,source_hash,
+                           source_revision,context_key,target_text,tier,provenance,policy_fingerprint,created_at)
+                       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'trusted',?9,?10,?11)"#,
+                    params![
+                        repository_id,
+                        unit_id,
+                        version_id,
+                        locale,
+                        source_hash,
+                        source_revision,
+                        context_key,
+                        target_text,
+                        provenance,
+                        fingerprint,
+                        now
+                    ],
+                )?;
+            }
+        }
+        tx.execute(
+            "UPDATE translation_versions SET publication_state='merged',review_state='approved' WHERE id IN (SELECT cft.translation_version_id FROM publication_manifest_files pmf JOIN canonical_file_translations cft ON cft.canonical_content_version_id=pmf.canonical_content_version_id WHERE pmf.manifest_id=?1)",
+            [manifest_id],
         )?;
         tx.execute(
-            "UPDATE canonical_files SET state='merged',updated_at=?3 WHERE repository_id=?1 AND locale=?2",
-            params![repository_id, locale, now],
+            "UPDATE canonical_content_versions SET publication_state='merged' WHERE id IN (SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)",
+            [manifest_id],
+        )?;
+        tx.execute(
+            r#"UPDATE canonical_files SET state='merged',publication_state='merged',
+                   review_state='approved',trust_tier='trusted',updated_at=?2
+               WHERE current_content_version_id IN (
+                   SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)"#,
+            params![manifest_id, now],
+        )?;
+        tx.execute(
+            "UPDATE publication_manifests SET state='merged',merged_at=?2 WHERE id=?1",
+            params![manifest_id, now],
         )?;
         tx.commit()?;
-        Ok(promoted)
+        Ok(translations.len())
     }
 
     pub fn acquire_lease(
@@ -1245,7 +2099,7 @@ impl Database {
         context_key: &str,
     ) -> Result<Option<String>> {
         Ok(self.connect()?.query_row(
-            "SELECT target_text FROM trusted_translation_memory WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4 AND superseded_at IS NULL",
+            "SELECT target_text FROM translation_memory_entries WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4 AND tier='trusted' AND superseded_at IS NULL",
             params![repository_id, locale, source_hash, context_key],
             |row| row.get(0),
         ).optional()?)
@@ -1259,31 +2113,28 @@ impl Database {
         ).optional()?)
     }
 
+    pub fn recoverable_candidate(
+        &self,
+        run_id: &str,
+        unit_id: i64,
+        locale: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                r#"SELECT c.target_text
+                   FROM canonical_candidates c
+                   JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
+                   JOIN work_items w ON w.id=a.work_item_id
+                   WHERE w.run_id=?1 AND c.unit_id=?2 AND c.locale=?3 AND c.selected=1"#,
+                params![run_id, unit_id, locale],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn upsert_canonical_file(&self, input: CanonicalFileInput<'_>) -> Result<i64> {
-        let CanonicalFileInput {
-            repository_id,
-            locale,
-            path,
-            source_revision,
-            content,
-            content_hash,
-            materialized_hash,
-            state,
-        } = input;
-        let conn = self.connect()?;
-        conn.execute(
-            r#"INSERT INTO canonical_files(repository_id,locale,path,source_revision,content,content_hash,materialized_hash,state,updated_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-               ON CONFLICT(repository_id,locale,path) DO UPDATE SET
-                 source_revision=excluded.source_revision,content=excluded.content,content_hash=excluded.content_hash,
-                 materialized_hash=excluded.materialized_hash,state=excluded.state,updated_at=excluded.updated_at"#,
-            params![repository_id, locale, path, source_revision, content, content_hash, materialized_hash, state, now_ms()],
-        )?;
-        Ok(conn.query_row(
-            "SELECT id FROM canonical_files WHERE repository_id=?1 AND locale=?2 AND path=?3",
-            params![repository_id, locale, path],
-            |row| row.get(0),
-        )?)
+        Ok(self.persist_canonical_file(input, &[])?.id)
     }
 
     pub fn canonical_file(
@@ -1293,33 +2144,76 @@ impl Database {
         path: &str,
     ) -> Result<Option<CanonicalFile>> {
         Ok(self.connect()?.query_row(
-            "SELECT id,source_revision,content,content_hash,materialized_hash,state FROM canonical_files WHERE repository_id=?1 AND locale=?2 AND path=?3",
+            "SELECT id,current_content_version_id,source_revision,content,content_hash,materialized_hash,state FROM canonical_files WHERE repository_id=?1 AND locale=?2 AND path=?3",
             params![repository_id, locale, path],
             |row| Ok(CanonicalFile {
                 id: row.get(0)?,
-                source_revision: row.get(1)?,
-                content: row.get(2)?,
-                content_hash: row.get(3)?,
-                materialized_hash: row.get(4)?,
-                state: row.get(5)?,
+                content_version_id: row.get(1)?,
+                source_revision: row.get(2)?,
+                content: row.get(3)?,
+                content_hash: row.get(4)?,
+                materialized_hash: row.get(5)?,
+                state: row.get(6)?,
             }),
         ).optional()?)
     }
 
-    pub fn set_canonical_file_state(
+    pub fn transition_canonical_file(
         &self,
         id: i64,
-        state: &str,
+        transition: CanonicalTransition,
         materialized_hash: Option<&str>,
     ) -> Result<()> {
-        let changed = self.connect()?.execute(
-            "UPDATE canonical_files SET state=?2,materialized_hash=?3,updated_at=?4 WHERE id=?1",
-            params![id, state, materialized_hash, now_ms()],
-        )?;
+        let conn = self.connect()?;
+        let changed = match transition {
+            CanonicalTransition::Materialized => conn.execute(
+                "UPDATE canonical_files SET state='materialized',materialized_hash=?2,updated_at=?3 WHERE id=?1",
+                params![id, materialized_hash, now_ms()],
+            )?,
+            CanonicalTransition::HumanEdit => conn.execute(
+                "UPDATE canonical_files SET state='human_edit',materialized_hash=?2,review_state='needs_review',updated_at=?3 WHERE id=?1",
+                params![id, materialized_hash, now_ms()],
+            )?,
+            CanonicalTransition::Adopted => conn.execute(
+                "UPDATE canonical_files SET state='adopted',materialized_hash=?2,freshness='exact',provenance='human',validation_state='passed',review_state='approved',trust_tier='trusted',updated_at=?3 WHERE id=?1",
+                params![id, materialized_hash, now_ms()],
+            )?,
+            CanonicalTransition::CommitCreated => conn.execute(
+                "UPDATE canonical_files SET publication_state='commit_created',updated_at=?2 WHERE id=?1",
+                params![id, now_ms()],
+            )?,
+            CanonicalTransition::PushPending => conn.execute(
+                "UPDATE canonical_files SET publication_state='push_pending',updated_at=?2 WHERE id=?1",
+                params![id, now_ms()],
+            )?,
+            CanonicalTransition::PrOpen => conn.execute(
+                "UPDATE canonical_files SET state='published',publication_state='pr_open',updated_at=?2 WHERE id=?1",
+                params![id, now_ms()],
+            )?,
+            CanonicalTransition::Merged => conn.execute(
+                "UPDATE canonical_files SET state='merged',publication_state='merged',review_state='approved',trust_tier='trusted',updated_at=?2 WHERE id=?1",
+                params![id, now_ms()],
+            )?,
+            CanonicalTransition::Superseded => conn.execute(
+                "UPDATE canonical_files SET publication_state='superseded',trust_tier='history',updated_at=?2 WHERE id=?1",
+                params![id, now_ms()],
+            )?,
+        };
         if changed != 1 {
             bail!("canonical file {id} does not exist");
         }
         Ok(())
+    }
+}
+
+fn publication_rank(state: &str) -> u8 {
+    match state {
+        "candidate" => 0,
+        "commit_created" => 1,
+        "push_pending" => 2,
+        "pr_open" => 3,
+        "merged" | "superseded" => 4,
+        _ => 0,
     }
 }
 
@@ -1367,10 +2261,34 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
     })
 }
 
+fn require_attempt_provenance(input: &AttemptInput<'_>) -> Result<()> {
+    for (label, value) in [
+        ("Agent", input.agent),
+        ("provider", input.provider),
+        ("model", input.model),
+        ("adapter", input.adapter),
+        ("prompt version", input.prompt_version),
+    ] {
+        if value.trim().is_empty() {
+            bail!("{label} identity must not be empty");
+        }
+    }
+    require_fingerprint(input.provider_fingerprint, "provider")?;
+    require_fingerprint(input.prompt_hash, "prompt")?;
+    require_fingerprint(input.policy_fingerprint, "policy")
+}
+
 fn require_json(value: &str) -> Result<()> {
     serde_json::from_str::<serde_json::Value>(value)
         .map(|_| ())
         .map_err(|error| anyhow!("invalid JSON payload: {error}"))
+}
+
+fn require_fingerprint(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{label} fingerprint must be exactly 64 hexadecimal characters");
+    }
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -1459,6 +2377,7 @@ impl StateStore for Database {
         invocation_key: &str,
         config_path: &Path,
         metadata_json: &str,
+        policy_fingerprint: &str,
     ) -> Result<String> {
         Database::begin_run(
             self,
@@ -1466,6 +2385,7 @@ impl StateStore for Database {
             invocation_key,
             config_path,
             metadata_json,
+            policy_fingerprint,
         )
     }
 
@@ -1495,6 +2415,15 @@ impl StateStore for Database {
 
     fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>> {
         Database::attempt_status(self, work_item_id, dedupe_key)
+    }
+
+    fn recoverable_candidate(
+        &self,
+        run_id: &str,
+        unit_id: i64,
+        locale: &str,
+    ) -> Result<Option<String>> {
+        Database::recoverable_candidate(self, run_id, unit_id, locale)
     }
 
     fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt> {
@@ -1542,13 +2471,30 @@ impl StateStore for Database {
         Database::upsert_canonical_file(self, input)
     }
 
-    fn set_canonical_file_state(
+    fn persist_canonical_file(
+        &self,
+        input: CanonicalFileInput<'_>,
+        translations: &[CanonicalTranslationInput<'_>],
+    ) -> Result<CanonicalFile> {
+        Database::persist_canonical_file(self, input, translations)
+    }
+
+    fn record_canonical_file_translations(
+        &self,
+        canonical_file_id: i64,
+        translations: &[CanonicalTranslationInput<'_>],
+        locale: &str,
+    ) -> Result<usize> {
+        Database::record_canonical_file_translations(self, canonical_file_id, translations, locale)
+    }
+
+    fn transition_canonical_file(
         &self,
         id: i64,
-        state: &str,
+        transition: CanonicalTransition,
         materialized_hash: Option<&str>,
     ) -> Result<()> {
-        Database::set_canonical_file_state(self, id, state, materialized_hash)
+        Database::transition_canonical_file(self, id, transition, materialized_hash)
     }
 
     fn supersede_materializations(
@@ -1646,13 +2592,40 @@ impl StateStore for Database {
         Database::record_pr_state(self, input)
     }
 
-    fn promote_merged_locale(
+    fn record_publication_manifest(&self, input: PublicationManifestInput<'_>) -> Result<i64> {
+        Database::record_publication_manifest(self, input)
+    }
+
+    fn transition_publication_manifest(
         &self,
         repository_id: i64,
         locale: &str,
+        candidate_commit: &str,
+        state: PublicationState,
+    ) -> Result<()> {
+        Database::transition_publication_manifest(
+            self,
+            repository_id,
+            locale,
+            candidate_commit,
+            state,
+        )
+    }
+
+    fn promote_merged_publication(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        candidate_commit: &str,
         provenance: &str,
     ) -> Result<usize> {
-        Database::promote_merged_locale(self, repository_id, locale, provenance)
+        Database::promote_merged_publication(
+            self,
+            repository_id,
+            locale,
+            candidate_commit,
+            provenance,
+        )
     }
 }
 

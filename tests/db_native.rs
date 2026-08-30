@@ -1,9 +1,19 @@
+use fani::domain::{
+    model::{
+        CanonicalTransition, Freshness, MemoryTier, PublicationState, ReviewState,
+        TranslationProvenance, ValidationState,
+    },
+    prompts,
+};
 use fani::test_support::db::{
-    AttemptCandidateInput, AttemptInput, Database, OutboxKind, TrustTranslationInput,
+    AttemptCandidateInput, AttemptInput, CanonicalFileInput, CanonicalTranslationInput, Database,
+    OutboxKind, PublicationManifestFile, PublicationManifestInput, TrustTranslationInput,
 };
 use rusqlite::params;
 use std::fs;
 use tempfile::TempDir;
+
+const TEST_FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 struct Fixture {
     _temp: TempDir,
@@ -39,6 +49,7 @@ fn fixture() -> Fixture {
             "sync:abc123:zh-CN",
             temp.path().join("fani.toml").as_path(),
             "{}",
+            &prompts::policy_fingerprint(),
         )
         .unwrap();
     let work_item_id = db
@@ -98,25 +109,50 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
     let user_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    let migration: (i64, String, String) = conn
-        .query_row(
-            "SELECT version,name,checksum FROM schema_migrations",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    let expected = format!(
-        "{:x}",
-        Sha256::digest(include_str!("../migrations/0001_native_authority.sql").as_bytes())
-    );
+    let migrations = {
+        let mut statement = conn
+            .prepare("SELECT version,name,checksum FROM schema_migrations ORDER BY version")
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let expected = [
+        (
+            1,
+            "0001_native_authority".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(include_str!("../migrations/0001_native_authority.sql").as_bytes())
+            ),
+        ),
+        (
+            2,
+            "0002_orthogonal_translation_state".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    include_str!("../migrations/0002_orthogonal_translation_state.sql").as_bytes()
+                )
+            ),
+        ),
+    ];
     assert_eq!(application_id, 0x4641_4e49);
-    assert_eq!(user_version, 1);
-    assert_eq!(migration, (1, "0001_native_authority".into(), expected));
+    assert_eq!(user_version, 2);
+    assert_eq!(migrations, expected);
     drop(conn);
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 1);
+    assert_eq!(reopened.schema_version().unwrap(), 2);
     let count: i64 = reopened
         .connect()
         .unwrap()
@@ -124,7 +160,170 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn version_one_database_upgrades_transactionally_to_latest() {
+    use sha2::{Digest, Sha256};
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fani-v1.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.pragma_update(None, "application_id", 0x4641_4e49_i64)
+        .unwrap();
+    conn.execute_batch(include_str!("../migrations/0001_native_authority.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations(
+            version INTEGER PRIMARY KEY CHECK(version > 0),
+            name TEXT NOT NULL UNIQUE,
+            checksum TEXT NOT NULL CHECK(length(checksum) = 64),
+            applied_at INTEGER NOT NULL
+        ) STRICT;",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES (1,?1,?2,1)",
+        params![
+            "0001_native_authority",
+            format!(
+                "{:x}",
+                Sha256::digest(include_str!("../migrations/0001_native_authority.sql").as_bytes())
+            )
+        ],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 1).unwrap();
+    drop(conn);
+
+    let upgraded = Database::open(&path).unwrap();
+    assert_eq!(upgraded.schema_version().unwrap(), 2);
+    let conn = upgraded.connect().unwrap();
+    assert!(conn
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version=2 AND name='0002_orthogonal_translation_state'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .is_ok());
+    assert!(
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='translation_memory_entries'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn orthogonal_translation_state_and_memory_tiers_are_independent() {
+    let fixture = fixture();
+    let fingerprint = prompts::policy_fingerprint();
+    let canonical_id = fixture
+        .db
+        .upsert_canonical_file(CanonicalFileInput {
+            repository_id: fixture.repository_id,
+            locale: "zh-CN",
+            path: "zh-CN/guide.md",
+            source_revision: "abc123",
+            content: &[1],
+            content_hash: "hash",
+            materialized_hash: None,
+            freshness: Freshness::Exact,
+            provenance: TranslationProvenance::Ai,
+            validation: ValidationState::Passed,
+            review: ReviewState::Approved,
+            publication: PublicationState::Candidate,
+            trust_tier: MemoryTier::Candidate,
+            policy_fingerprint: &fingerprint,
+        })
+        .unwrap();
+    fixture
+        .db
+        .transition_canonical_file(canonical_id, CanonicalTransition::CommitCreated, None)
+        .unwrap();
+    fixture
+        .db
+        .transition_canonical_file(
+            canonical_id,
+            CanonicalTransition::Materialized,
+            Some("hash"),
+        )
+        .unwrap();
+    let conn = fixture.db.connect().unwrap();
+    let state: (String, String, String, String, String, String) = conn
+        .query_row(
+            "SELECT freshness,provenance,validation_state,review_state,publication_state,trust_tier
+             FROM canonical_files WHERE path='zh-CN/guide.md'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            "exact".into(),
+            "ai".into(),
+            "passed".into(),
+            "approved".into(),
+            "commit_created".into(),
+            "candidate".into(),
+        )
+    );
+    assert!(
+        conn.execute(
+            "UPDATE canonical_files SET validation_state='not-a-state' WHERE path='zh-CN/guide.md'",
+            [],
+        )
+        .is_err()
+    );
+
+    for tier in ["trusted", "candidate", "history"] {
+        conn.execute(
+            "INSERT INTO translation_memory_entries(
+                repository_id,unit_id,locale,source_hash,context_key,target_text,tier,provenance,
+                policy_fingerprint,created_at)
+             VALUES (?1,?2,'zh-CN','source-hash','Paragraph',?3,?4,'test',?5,1)",
+            params![
+                fixture.repository_id,
+                fixture.unit_id,
+                format!("translation-{tier}"),
+                tier,
+                fingerprint
+            ],
+        )
+        .unwrap();
+    }
+    let tiers: Vec<String> = {
+        let mut statement = conn
+            .prepare("SELECT tier FROM translation_memory_entries ORDER BY tier")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(tiers, ["candidate", "history", "trusted"]);
+    assert!(conn
+        .execute(
+            "INSERT INTO translation_memory_entries(
+                repository_id,locale,source_hash,target_text,tier,provenance,policy_fingerprint,created_at)
+             VALUES (?1,'zh-CN','bad','bad','untrusted','test',?2,1)",
+            params![fixture.repository_id, fingerprint],
+        )
+        .is_err());
 }
 
 #[test]
@@ -195,6 +394,13 @@ fn attempt_recording_is_idempotent_by_work_item_and_dedupe_key() {
             work_item_id: fixture.work_item_id,
             dedupe_key: "dispatch:heading:intro:1",
             agent: "translator",
+            provider: "fixture-provider",
+            model: "fixture-model",
+            adapter: "command-json-v1",
+            provider_fingerprint: TEST_FINGERPRINT,
+            prompt_version: prompts::PROMPT_VERSION,
+            prompt_hash: TEST_FINGERPRINT,
+            policy_fingerprint: TEST_FINGERPRINT,
             status: "succeeded",
             request_json: r#"{"prompt":"translate"}"#,
             response_json: Some(r#"{"text":"介绍"}"#),
@@ -207,6 +413,13 @@ fn attempt_recording_is_idempotent_by_work_item_and_dedupe_key() {
             work_item_id: fixture.work_item_id,
             dedupe_key: "dispatch:heading:intro:1",
             agent: "translator",
+            provider: "fixture-provider",
+            model: "fixture-model",
+            adapter: "command-json-v1",
+            provider_fingerprint: TEST_FINGERPRINT,
+            prompt_version: prompts::PROMPT_VERSION,
+            prompt_hash: TEST_FINGERPRINT,
+            policy_fingerprint: TEST_FINGERPRINT,
             status: "failed",
             request_json: r#"{"prompt":"different replay"}"#,
             response_json: None,
@@ -241,6 +454,13 @@ fn successful_attempt_and_candidate_commit_atomically_and_are_recoverable() {
                 work_item_id: fixture.work_item_id,
                 dedupe_key: "translate:heading:intro",
                 agent: "translator",
+                provider: "fixture-provider",
+                model: "fixture-model",
+                adapter: "command-json-v1",
+                provider_fingerprint: TEST_FINGERPRINT,
+                prompt_version: prompts::PROMPT_VERSION,
+                prompt_hash: TEST_FINGERPRINT,
+                policy_fingerprint: TEST_FINGERPRINT,
                 status: "succeeded",
                 request_json: r#"{"prompt":"translate"}"#,
                 response_json: Some(response),
@@ -251,6 +471,8 @@ fn successful_attempt_and_candidate_commit_atomically_and_are_recoverable() {
             candidate_key: "attempt:translate:heading:intro",
             target_text: "介绍",
             score: Some(1.0),
+            policy_fingerprint: &prompts::policy_fingerprint(),
+            provenance: TranslationProvenance::Ai,
         })
         .unwrap();
 
@@ -277,6 +499,13 @@ fn successful_attempt_and_candidate_commit_atomically_and_are_recoverable() {
                 work_item_id: fixture.work_item_id,
                 dedupe_key: "translate:heading:intro",
                 agent: "translator",
+                provider: "fixture-provider",
+                model: "fixture-model",
+                adapter: "command-json-v1",
+                provider_fingerprint: TEST_FINGERPRINT,
+                prompt_version: prompts::PROMPT_VERSION,
+                prompt_hash: TEST_FINGERPRINT,
+                policy_fingerprint: TEST_FINGERPRINT,
                 status: "succeeded",
                 request_json: r#"{"prompt":"translate"}"#,
                 response_json: Some(response),
@@ -287,10 +516,136 @@ fn successful_attempt_and_candidate_commit_atomically_and_are_recoverable() {
             candidate_key: "attempt:translate:heading:intro",
             target_text: "介绍",
             score: Some(1.0),
+            policy_fingerprint: &prompts::policy_fingerprint(),
+            provenance: TranslationProvenance::Ai,
         })
         .unwrap();
     assert!(!replay.inserted);
     assert_eq!(replay.id, receipt.id);
+}
+
+#[test]
+fn candidate_memory_is_not_reused_until_explicitly_trusted() {
+    let fixture = fixture();
+    fixture
+        .db
+        .record_attempt_candidate(AttemptCandidateInput {
+            attempt: AttemptInput {
+                work_item_id: fixture.work_item_id,
+                dedupe_key: "candidate-only",
+                agent: "translator",
+                provider: "fixture-provider",
+                model: "fixture-model",
+                adapter: "command-json-v1",
+                provider_fingerprint: TEST_FINGERPRINT,
+                prompt_version: prompts::PROMPT_VERSION,
+                prompt_hash: TEST_FINGERPRINT,
+                policy_fingerprint: TEST_FINGERPRINT,
+                status: "succeeded",
+                request_json: r#"{"task":"candidate-only"}"#,
+                response_json: Some(r#"{"output":"候选译文"}"#),
+                error: None,
+            },
+            unit_id: fixture.unit_id,
+            locale: "zh-CN",
+            candidate_key: "attempt:candidate-only",
+            target_text: "候选译文",
+            score: Some(1.0),
+            policy_fingerprint: &prompts::policy_fingerprint(),
+            provenance: TranslationProvenance::Ai,
+        })
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .db
+            .recoverable_candidate(&fixture.run_id, fixture.unit_id, "zh-CN")
+            .unwrap()
+            .as_deref(),
+        Some("候选译文")
+    );
+    let fingerprint = prompts::policy_fingerprint();
+    let conn = fixture.db.connect().unwrap();
+    let persisted: (String, String, String, String) = conn
+        .query_row(
+            r#"SELECT r.policy_fingerprint,w.policy_fingerprint,
+                      tv.policy_fingerprint,tm.policy_fingerprint
+               FROM runs r
+               JOIN work_items w ON w.run_id=r.id
+               JOIN attempts a ON a.work_item_id=w.id
+               JOIN translation_versions tv ON tv.source_attempt_id=a.id
+               JOIN translation_memory_entries tm ON tm.translation_version_id=tv.id
+               WHERE r.id=?1 AND tm.tier='candidate'"#,
+            [&fixture.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted,
+        (
+            fingerprint.clone(),
+            fingerprint.clone(),
+            fingerprint.clone(),
+            fingerprint,
+        )
+    );
+    drop(conn);
+    assert_eq!(
+        fixture
+            .db
+            .recoverable_candidate("different-run", fixture.unit_id, "zh-CN")
+            .unwrap(),
+        None
+    );
+
+    let history = fixture
+        .db
+        .unit_history(
+            fixture
+                .db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT document_id FROM units WHERE id=?1",
+                    [fixture.unit_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "zh-CN",
+        )
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].translation, None);
+    assert!(!history[0].trusted);
+    assert_eq!(
+        fixture
+            .db
+            .trusted_translation(fixture.repository_id, "zh-CN", "source-hash", "heading")
+            .unwrap(),
+        None
+    );
+
+    fixture
+        .db
+        .trust_translation(TrustTranslationInput {
+            repository_id: fixture.repository_id,
+            unit_id: Some(fixture.unit_id),
+            locale: "zh-CN",
+            source_hash: "source-hash",
+            context_key: "heading",
+            target_text: "人工认可译文",
+            provenance: "human_adopted",
+            policy_fingerprint: &prompts::policy_fingerprint(),
+        })
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .trusted_translation(fixture.repository_id, "zh-CN", "source-hash", "heading")
+            .unwrap()
+            .as_deref(),
+        Some("人工认可译文")
+    );
 }
 
 #[test]
@@ -518,6 +873,219 @@ fn leases_exclude_live_owners_and_fence_expired_owners() {
 }
 
 #[test]
+fn merged_publication_promotes_only_exact_manifest_translation_versions() {
+    let fixture = fixture();
+    let fingerprint = prompts::policy_fingerprint();
+    fixture
+        .db
+        .record_attempt_candidate(AttemptCandidateInput {
+            attempt: AttemptInput {
+                work_item_id: fixture.work_item_id,
+                dedupe_key: "published-candidate",
+                agent: "translator",
+                provider: "fixture-provider",
+                model: "fixture-model",
+                adapter: "command-json-v1",
+                provider_fingerprint: TEST_FINGERPRINT,
+                prompt_version: prompts::PROMPT_VERSION,
+                prompt_hash: TEST_FINGERPRINT,
+                policy_fingerprint: TEST_FINGERPRINT,
+                status: "succeeded",
+                request_json: r#"{"task":"published"}"#,
+                response_json: Some(r#"{"output":"已发布译文"}"#),
+                error: None,
+            },
+            unit_id: fixture.unit_id,
+            locale: "zh-CN",
+            candidate_key: "attempt:published",
+            target_text: "已发布译文",
+            score: Some(1.0),
+            policy_fingerprint: &fingerprint,
+            provenance: TranslationProvenance::Ai,
+        })
+        .unwrap();
+
+    let other_document_id = fixture
+        .db
+        .upsert_document(
+            fixture.repository_id,
+            "other.md",
+            Some("abc123"),
+            "other-doc-hash",
+            "{}",
+        )
+        .unwrap();
+    let other_unit_id = fixture
+        .db
+        .upsert_unit(
+            other_document_id,
+            "paragraph:other",
+            0,
+            "Other",
+            "other-source-hash",
+            "{}",
+        )
+        .unwrap();
+    let other_work_item_id = fixture
+        .db
+        .enqueue_work_item(
+            &fixture.run_id,
+            other_unit_id,
+            "zh-CN",
+            "translate",
+            10,
+            "{}",
+        )
+        .unwrap();
+    fixture
+        .db
+        .record_attempt_candidate(AttemptCandidateInput {
+            attempt: AttemptInput {
+                work_item_id: other_work_item_id,
+                dedupe_key: "unpublished-candidate",
+                agent: "translator",
+                provider: "fixture-provider",
+                model: "fixture-model",
+                adapter: "command-json-v1",
+                provider_fingerprint: TEST_FINGERPRINT,
+                prompt_version: prompts::PROMPT_VERSION,
+                prompt_hash: TEST_FINGERPRINT,
+                policy_fingerprint: TEST_FINGERPRINT,
+                status: "succeeded",
+                request_json: r#"{"task":"unpublished"}"#,
+                response_json: Some(r#"{"output":"未发布译文"}"#),
+                error: None,
+            },
+            unit_id: other_unit_id,
+            locale: "zh-CN",
+            candidate_key: "attempt:unpublished",
+            target_text: "未发布译文",
+            score: Some(1.0),
+            policy_fingerprint: &fingerprint,
+            provenance: TranslationProvenance::Ai,
+        })
+        .unwrap();
+
+    let canonical_id = fixture
+        .db
+        .upsert_canonical_file(CanonicalFileInput {
+            repository_id: fixture.repository_id,
+            locale: "zh-CN",
+            path: "zh-CN/guide.md",
+            source_revision: "abc123",
+            content: "# 已发布译文\n".as_bytes(),
+            content_hash: "published-content-hash",
+            materialized_hash: Some("published-content-hash"),
+            freshness: Freshness::Exact,
+            provenance: TranslationProvenance::Ai,
+            validation: ValidationState::Passed,
+            review: ReviewState::Unreviewed,
+            publication: PublicationState::Candidate,
+            trust_tier: MemoryTier::Candidate,
+            policy_fingerprint: &fingerprint,
+        })
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .record_canonical_file_translations(
+                canonical_id,
+                &[CanonicalTranslationInput {
+                    unit_id: fixture.unit_id,
+                    target_text: "已发布译文",
+                }],
+                "zh-CN",
+            )
+            .unwrap(),
+        1
+    );
+    let canonical_content_version_id: i64 = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT current_content_version_id FROM canonical_files WHERE id=?1",
+            [canonical_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    fixture
+        .db
+        .record_publication_manifest(PublicationManifestInput {
+            repository_id: fixture.repository_id,
+            run_id: &fixture.run_id,
+            locale: "zh-CN",
+            source_revision: "abc123",
+            candidate_commit: "candidate-commit",
+            policy_fingerprint: &fingerprint,
+            files: &[PublicationManifestFile {
+                canonical_content_version_id,
+                canonical_file_id: canonical_id,
+                content_hash: "published-content-hash".into(),
+            }],
+        })
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .promote_merged_publication(
+                fixture.repository_id,
+                "zh-CN",
+                "candidate-commit",
+                "github_merged",
+            )
+            .unwrap(),
+        1
+    );
+
+    let conn = fixture.db.connect().unwrap();
+    let trusted = {
+        let mut statement = conn
+            .prepare(
+                "SELECT source_hash,target_text FROM translation_memory_entries WHERE tier='trusted' AND superseded_at IS NULL ORDER BY source_hash",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(trusted, vec![("source-hash".into(), "已发布译文".into())]);
+    let states = {
+        let mut statement = conn
+            .prepare(
+                "SELECT tm.source_hash,tv.publication_state FROM translation_memory_entries tm JOIN translation_versions tv ON tv.id=tm.translation_version_id WHERE tm.tier='candidate' ORDER BY tm.source_hash",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        states,
+        vec![
+            ("other-source-hash".into(), "candidate".into()),
+            ("source-hash".into(), "merged".into()),
+        ]
+    );
+    let manifest_state: String = conn
+        .query_row(
+            "SELECT state FROM publication_manifests WHERE candidate_commit='candidate-commit'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(manifest_state, "merged");
+}
+
+#[test]
 fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
     let fixture = fixture();
     let attempt = fixture
@@ -526,6 +1094,13 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
             work_item_id: fixture.work_item_id,
             dedupe_key: "candidate-1",
             agent: "translator",
+            provider: "fixture-provider",
+            model: "fixture-model",
+            adapter: "command-json-v1",
+            provider_fingerprint: TEST_FINGERPRINT,
+            prompt_version: prompts::PROMPT_VERSION,
+            prompt_hash: TEST_FINGERPRINT,
+            policy_fingerprint: TEST_FINGERPRINT,
             status: "succeeded",
             request_json: "{}",
             response_json: Some("{}"),
@@ -564,6 +1139,7 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
             context_key: "heading",
             target_text: "介绍",
             provenance: "reviewed",
+            policy_fingerprint: &prompts::policy_fingerprint(),
         })
         .unwrap();
     let replay_tm = fixture
@@ -576,6 +1152,7 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
             context_key: "heading",
             target_text: "简介",
             provenance: "approved",
+            policy_fingerprint: &prompts::policy_fingerprint(),
         })
         .unwrap();
 
@@ -591,11 +1168,486 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
     assert_eq!(selected, (1, "简介".into()));
     let tm: (i64, String, String) = conn
         .query_row(
-            "SELECT COUNT(*),target_text,provenance FROM trusted_translation_memory WHERE repository_id=?1 AND locale='zh-CN'",
+            "SELECT COUNT(*),target_text,provenance FROM translation_memory_entries WHERE repository_id=?1 AND locale='zh-CN' AND tier='trusted' AND superseded_at IS NULL",
             [fixture.repository_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!(tm, (1, "简介".into(), "approved".into()));
     fixture.db.integrity_check().unwrap();
+}
+
+fn canonical_version(fixture: &Fixture, path: &str, content_hash: &str) -> (i64, i64) {
+    let canonical = fixture
+        .db
+        .persist_canonical_file(
+            CanonicalFileInput {
+                repository_id: fixture.repository_id,
+                locale: "zh-CN",
+                path,
+                source_revision: "abc123",
+                content: content_hash.as_bytes(),
+                content_hash,
+                materialized_hash: Some(content_hash),
+                freshness: Freshness::Exact,
+                provenance: TranslationProvenance::Ai,
+                validation: ValidationState::Passed,
+                review: ReviewState::Unreviewed,
+                publication: PublicationState::Candidate,
+                trust_tier: MemoryTier::Candidate,
+                policy_fingerprint: &prompts::policy_fingerprint(),
+            },
+            &[],
+        )
+        .unwrap();
+    (canonical.id, canonical.content_version_id)
+}
+
+#[test]
+fn canonical_content_links_trusted_assembled_text_not_stale_selected_candidate() {
+    let fixture = fixture();
+    let fingerprint = prompts::policy_fingerprint();
+    fixture
+        .db
+        .record_attempt_candidate(AttemptCandidateInput {
+            attempt: AttemptInput {
+                work_item_id: fixture.work_item_id,
+                dedupe_key: "stale-selected",
+                agent: "translator",
+                provider: "fixture-provider",
+                model: "fixture-model",
+                adapter: "command-json-v1",
+                provider_fingerprint: TEST_FINGERPRINT,
+                prompt_version: prompts::PROMPT_VERSION,
+                prompt_hash: TEST_FINGERPRINT,
+                policy_fingerprint: TEST_FINGERPRINT,
+                status: "succeeded",
+                request_json: "{}",
+                response_json: Some(r#"{"output":"陈旧候选"}"#),
+                error: None,
+            },
+            unit_id: fixture.unit_id,
+            locale: "zh-CN",
+            candidate_key: "attempt:stale",
+            target_text: "陈旧候选",
+            score: Some(1.0),
+            policy_fingerprint: &fingerprint,
+            provenance: TranslationProvenance::Ai,
+        })
+        .unwrap();
+    fixture
+        .db
+        .trust_translation(TrustTranslationInput {
+            repository_id: fixture.repository_id,
+            unit_id: Some(fixture.unit_id),
+            locale: "zh-CN",
+            source_hash: "source-hash",
+            context_key: "",
+            target_text: "可信组装译文",
+            provenance: "reviewed",
+            policy_fingerprint: &fingerprint,
+        })
+        .unwrap();
+
+    let canonical = fixture
+        .db
+        .persist_canonical_file(
+            CanonicalFileInput {
+                repository_id: fixture.repository_id,
+                locale: "zh-CN",
+                path: "zh-CN/trusted.md",
+                source_revision: "abc123",
+                content: "# 可信组装译文\n".as_bytes(),
+                content_hash: "trusted-assembled-hash",
+                materialized_hash: Some("trusted-assembled-hash"),
+                freshness: Freshness::Exact,
+                provenance: TranslationProvenance::Ai,
+                validation: ValidationState::Passed,
+                review: ReviewState::Unreviewed,
+                publication: PublicationState::Candidate,
+                trust_tier: MemoryTier::Candidate,
+                policy_fingerprint: &fingerprint,
+            },
+            &[CanonicalTranslationInput {
+                unit_id: fixture.unit_id,
+                target_text: "可信组装译文",
+            }],
+        )
+        .unwrap();
+
+    let conn = fixture.db.connect().unwrap();
+    let linked: String = conn
+        .query_row(
+            r#"SELECT tv.target_text
+               FROM canonical_file_translations cft
+               JOIN translation_versions tv ON tv.id=cft.translation_version_id
+               WHERE cft.canonical_content_version_id=?1"#,
+            [canonical.content_version_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let selected: String = conn
+        .query_row(
+            "SELECT target_text FROM canonical_candidates WHERE unit_id=?1 AND locale='zh-CN' AND selected=1",
+            [fixture.unit_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked, "可信组装译文");
+    assert_eq!(selected, "陈旧候选");
+}
+
+#[test]
+fn merged_tm_uses_immutable_source_version_after_live_source_mutation() {
+    let fixture = fixture();
+    let fingerprint = prompts::policy_fingerprint();
+    fixture
+        .db
+        .record_attempt_candidate(AttemptCandidateInput {
+            attempt: AttemptInput {
+                work_item_id: fixture.work_item_id,
+                dedupe_key: "immutable-source",
+                agent: "translator",
+                provider: "fixture-provider",
+                model: "fixture-model",
+                adapter: "command-json-v1",
+                provider_fingerprint: TEST_FINGERPRINT,
+                prompt_version: prompts::PROMPT_VERSION,
+                prompt_hash: TEST_FINGERPRINT,
+                policy_fingerprint: TEST_FINGERPRINT,
+                status: "succeeded",
+                request_json: "{}",
+                response_json: Some(r#"{"output":"不可变来源译文"}"#),
+                error: None,
+            },
+            unit_id: fixture.unit_id,
+            locale: "zh-CN",
+            candidate_key: "attempt:immutable",
+            target_text: "不可变来源译文",
+            score: Some(1.0),
+            policy_fingerprint: &fingerprint,
+            provenance: TranslationProvenance::Ai,
+        })
+        .unwrap();
+    let canonical = fixture
+        .db
+        .persist_canonical_file(
+            CanonicalFileInput {
+                repository_id: fixture.repository_id,
+                locale: "zh-CN",
+                path: "zh-CN/immutable.md",
+                source_revision: "abc123",
+                content: "# 不可变来源译文\n".as_bytes(),
+                content_hash: "immutable-content-hash",
+                materialized_hash: Some("immutable-content-hash"),
+                freshness: Freshness::Exact,
+                provenance: TranslationProvenance::Ai,
+                validation: ValidationState::Passed,
+                review: ReviewState::Unreviewed,
+                publication: PublicationState::Candidate,
+                trust_tier: MemoryTier::Candidate,
+                policy_fingerprint: &fingerprint,
+            },
+            &[CanonicalTranslationInput {
+                unit_id: fixture.unit_id,
+                target_text: "不可变来源译文",
+            }],
+        )
+        .unwrap();
+    fixture
+        .db
+        .record_publication_manifest(PublicationManifestInput {
+            repository_id: fixture.repository_id,
+            run_id: &fixture.run_id,
+            locale: "zh-CN",
+            source_revision: "abc123",
+            candidate_commit: "immutable-commit",
+            policy_fingerprint: &fingerprint,
+            files: &[PublicationManifestFile {
+                canonical_content_version_id: canonical.content_version_id,
+                canonical_file_id: canonical.id,
+                content_hash: canonical.content_hash.clone(),
+            }],
+        })
+        .unwrap();
+
+    let document_id: i64 = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT document_id FROM units WHERE id=?1",
+            [fixture.unit_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    fixture
+        .db
+        .upsert_document(
+            fixture.repository_id,
+            "guide.md",
+            Some("def456"),
+            "mutated-document-hash",
+            "{}",
+        )
+        .unwrap();
+    fixture
+        .db
+        .upsert_unit(
+            document_id,
+            "heading:intro",
+            0,
+            "Mutated introduction",
+            "mutated-source-hash",
+            r#"{"kind":"Paragraph"}"#,
+        )
+        .unwrap();
+    fixture
+        .db
+        .promote_merged_publication(
+            fixture.repository_id,
+            "zh-CN",
+            "immutable-commit",
+            "github_merged",
+        )
+        .unwrap();
+
+    let tm: (String, String, String) = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT source_hash,source_revision,context_key FROM translation_memory_entries WHERE tier='trusted' AND target_text='不可变来源译文'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(tm, ("source-hash".into(), "abc123".into(), "".into()));
+}
+
+#[test]
+fn publication_manifest_rejects_swapped_multi_file_hashes() {
+    let fixture = fixture();
+    let fingerprint = prompts::policy_fingerprint();
+    let (first_file, first_version) = canonical_version(&fixture, "zh-CN/first.md", "first-hash");
+    let (second_file, second_version) =
+        canonical_version(&fixture, "zh-CN/second.md", "second-hash");
+    let error = fixture
+        .db
+        .record_publication_manifest(PublicationManifestInput {
+            repository_id: fixture.repository_id,
+            run_id: &fixture.run_id,
+            locale: "zh-CN",
+            source_revision: "abc123",
+            candidate_commit: "swapped-commit",
+            policy_fingerprint: &fingerprint,
+            files: &[
+                PublicationManifestFile {
+                    canonical_content_version_id: first_version,
+                    canonical_file_id: first_file,
+                    content_hash: "second-hash".into(),
+                },
+                PublicationManifestFile {
+                    canonical_content_version_id: second_version,
+                    canonical_file_id: second_file,
+                    content_hash: "first-hash".into(),
+                },
+            ],
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not match publication manifest content")
+    );
+}
+
+#[test]
+fn merged_publication_remains_terminal_under_manifest_replay() {
+    let fixture = fixture();
+    let fingerprint = prompts::policy_fingerprint();
+    fixture
+        .db
+        .record_attempt_candidate(AttemptCandidateInput {
+            attempt: AttemptInput {
+                work_item_id: fixture.work_item_id,
+                dedupe_key: "merged-replay",
+                agent: "translator",
+                provider: "fixture-provider",
+                model: "fixture-model",
+                adapter: "command-json-v1",
+                provider_fingerprint: TEST_FINGERPRINT,
+                prompt_version: prompts::PROMPT_VERSION,
+                prompt_hash: TEST_FINGERPRINT,
+                policy_fingerprint: TEST_FINGERPRINT,
+                status: "succeeded",
+                request_json: "{}",
+                response_json: Some(r#"{"output":"终态译文"}"#),
+                error: None,
+            },
+            unit_id: fixture.unit_id,
+            locale: "zh-CN",
+            candidate_key: "attempt:merged-replay",
+            target_text: "终态译文",
+            score: Some(1.0),
+            policy_fingerprint: &fingerprint,
+            provenance: TranslationProvenance::Ai,
+        })
+        .unwrap();
+    let canonical = fixture
+        .db
+        .persist_canonical_file(
+            CanonicalFileInput {
+                repository_id: fixture.repository_id,
+                locale: "zh-CN",
+                path: "zh-CN/terminal.md",
+                source_revision: "abc123",
+                content: "终态译文".as_bytes(),
+                content_hash: "terminal-hash",
+                materialized_hash: Some("terminal-hash"),
+                freshness: Freshness::Exact,
+                provenance: TranslationProvenance::Ai,
+                validation: ValidationState::Passed,
+                review: ReviewState::Unreviewed,
+                publication: PublicationState::Candidate,
+                trust_tier: MemoryTier::Candidate,
+                policy_fingerprint: &fingerprint,
+            },
+            &[CanonicalTranslationInput {
+                unit_id: fixture.unit_id,
+                target_text: "终态译文",
+            }],
+        )
+        .unwrap();
+    let files = [PublicationManifestFile {
+        canonical_content_version_id: canonical.content_version_id,
+        canonical_file_id: canonical.id,
+        content_hash: canonical.content_hash.clone(),
+    }];
+    fixture
+        .db
+        .record_publication_manifest(PublicationManifestInput {
+            repository_id: fixture.repository_id,
+            run_id: &fixture.run_id,
+            locale: "zh-CN",
+            source_revision: "abc123",
+            candidate_commit: "terminal-commit",
+            policy_fingerprint: &fingerprint,
+            files: &files,
+        })
+        .unwrap();
+    fixture
+        .db
+        .promote_merged_publication(
+            fixture.repository_id,
+            "zh-CN",
+            "terminal-commit",
+            "github_merged",
+        )
+        .unwrap();
+    fixture
+        .db
+        .record_publication_manifest(PublicationManifestInput {
+            repository_id: fixture.repository_id,
+            run_id: &fixture.run_id,
+            locale: "zh-CN",
+            source_revision: "abc123",
+            candidate_commit: "terminal-commit",
+            policy_fingerprint: &fingerprint,
+            files: &files,
+        })
+        .unwrap();
+    fixture
+        .db
+        .transition_publication_manifest(
+            fixture.repository_id,
+            "zh-CN",
+            "terminal-commit",
+            PublicationState::PushPending,
+        )
+        .unwrap();
+
+    let states: (String, String, String, String) = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            r#"SELECT pm.state,ccv.publication_state,cf.publication_state,tv.publication_state
+               FROM publication_manifests pm
+               JOIN publication_manifest_files pmf ON pmf.manifest_id=pm.id
+               JOIN canonical_content_versions ccv ON ccv.id=pmf.canonical_content_version_id
+               JOIN canonical_files cf ON cf.current_content_version_id=ccv.id
+               JOIN canonical_file_translations cft ON cft.canonical_content_version_id=ccv.id
+               JOIN translation_versions tv ON tv.id=cft.translation_version_id
+               WHERE pm.candidate_commit='terminal-commit'"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        states,
+        (
+            "merged".into(),
+            "merged".into(),
+            "merged".into(),
+            "merged".into()
+        )
+    );
+}
+
+#[test]
+fn publication_manifest_replay_requires_the_exact_file_set() {
+    let fixture = fixture();
+    let fingerprint = prompts::policy_fingerprint();
+    let (first_file, first_version) = canonical_version(&fixture, "zh-CN/replay-a.md", "replay-a");
+    let (second_file, second_version) =
+        canonical_version(&fixture, "zh-CN/replay-b.md", "replay-b");
+    let (third_file, third_version) = canonical_version(&fixture, "zh-CN/replay-c.md", "replay-c");
+    fixture
+        .db
+        .record_publication_manifest(PublicationManifestInput {
+            repository_id: fixture.repository_id,
+            run_id: &fixture.run_id,
+            locale: "zh-CN",
+            source_revision: "abc123",
+            candidate_commit: "replay-set-commit",
+            policy_fingerprint: &fingerprint,
+            files: &[
+                PublicationManifestFile {
+                    canonical_content_version_id: first_version,
+                    canonical_file_id: first_file,
+                    content_hash: "replay-a".into(),
+                },
+                PublicationManifestFile {
+                    canonical_content_version_id: second_version,
+                    canonical_file_id: second_file,
+                    content_hash: "replay-b".into(),
+                },
+            ],
+        })
+        .unwrap();
+    let error = fixture
+        .db
+        .record_publication_manifest(PublicationManifestInput {
+            repository_id: fixture.repository_id,
+            run_id: &fixture.run_id,
+            locale: "zh-CN",
+            source_revision: "abc123",
+            candidate_commit: "replay-set-commit",
+            policy_fingerprint: &fingerprint,
+            files: &[
+                PublicationManifestFile {
+                    canonical_content_version_id: first_version,
+                    canonical_file_id: first_file,
+                    content_hash: "replay-a".into(),
+                },
+                PublicationManifestFile {
+                    canonical_content_version_id: third_version,
+                    canonical_file_id: third_file,
+                    content_hash: "replay-c".into(),
+                },
+            ],
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("file set conflicts"));
 }

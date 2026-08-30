@@ -2,6 +2,7 @@ mod adapters;
 pub mod application;
 mod cli;
 mod composition;
+mod diagnostics;
 pub mod domain;
 
 pub use adapters::process::run_process_wrapper_if_requested;
@@ -17,7 +18,8 @@ pub mod test_support {
     pub mod db {
         pub use crate::adapters::db::Database;
         pub use crate::application::ports::{
-            AttemptCandidateInput, AttemptInput, OutboxKind, TrustTranslationInput,
+            AttemptCandidateInput, AttemptInput, CanonicalFileInput, CanonicalTranslationInput,
+            OutboxKind, PublicationManifestFile, PublicationManifestInput, TrustTranslationInput,
         };
     }
 

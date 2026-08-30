@@ -15,10 +15,13 @@ concurrency:
 
 jobs:
   quality:
+    name: Quality
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
       - name: Install stable Rust with components
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -27,21 +30,107 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Run native unit, integration, and CLI tests
+      - name: Verify clean-clone candidate reproducibility
+        run: cargo test --locked --test reproducible_candidate
+      - name: Run native unit and integration tests
         run: cargo test --locked --all-targets
       - name: Build release binary
         run: cargo build --locked --release
       - name: Smoke-test release entry point
         run: target/release/fani --version
 
-  msrv:
+  native-cli-e2e:
+    name: Native CLI E2E
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Run native CLI end-to-end contract
+        run: cargo test --locked --test native_cli
+
+  sqlite-recovery:
+    name: SQLite Recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Run SQLite crash and recovery contract
+        run: cargo test --locked --test sqlite_recovery
+
+  git-contract:
+    name: Git Contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Run Git publication contract
+        run: cargo test --locked --test git_publication
+
+  linux-process-contract:
+    name: Linux Process Contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Run Linux process lifecycle contract
+        run: cargo test --locked --test process_wrapper
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
       - name: Install declared minimum Rust
         run: |
           rustup toolchain install 1.85.0 --profile minimal
           rustup default 1.85.0
       - name: Check minimum supported Rust version
         run: cargo check --locked --all-targets
+
+  reproducible-release:
+    name: Reproducible Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install locked Rust toolchains
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.85.0
+      - name: Install release verification tools
+        run: |
+          sudo install -d -m 0755 /workspace
+          cargo install --locked cargo-cyclonedx@0.5.9
+          scripts/release/install-reproducible-dist.sh
+      - name: Verify two-environment release reproducibility
+        run: scripts/release/verify-reproducible-release.sh

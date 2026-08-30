@@ -1,0 +1,53 @@
+[
+  {
+    "name": "default branch push",
+    "event": "push",
+    "ref": "refs/heads/main",
+    "default_branch": "main",
+    "allowed": true
+  },
+  {
+    "name": "scheduled default branch run",
+    "event": "schedule",
+    "ref": "refs/heads/main",
+    "default_branch": "main",
+    "allowed": true
+  },
+  {
+    "name": "manual default branch run",
+    "event": "workflow_dispatch",
+    "ref": "refs/heads/main",
+    "default_branch": "main",
+    "allowed": true
+  },
+  {
+    "name": "fork pull request",
+    "event": "pull_request",
+    "ref": "refs/pull/17/merge",
+    "default_branch": "main",
+    "fork": true,
+    "allowed": false
+  },
+  {
+    "name": "same repository pull request",
+    "event": "pull_request",
+    "ref": "refs/pull/18/merge",
+    "default_branch": "main",
+    "fork": false,
+    "allowed": false
+  },
+  {
+    "name": "pull request target",
+    "event": "pull_request_target",
+    "ref": "refs/heads/main",
+    "default_branch": "main",
+    "allowed": false
+  },
+  {
+    "name": "non-default branch push",
+    "event": "push",
+    "ref": "refs/heads/feature",
+    "default_branch": "main",
+    "allowed": false
+  }
+]

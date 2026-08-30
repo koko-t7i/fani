@@ -97,6 +97,7 @@ pub struct UnitTranslation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Finding {
     pub severity: FindingSeverity,
     pub code: String,
@@ -110,6 +111,144 @@ pub struct Finding {
 pub enum FindingSeverity {
     Error,
     Warning,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Freshness {
+    Exact,
+    SourceChanged,
+    StructurallyChanged,
+    Orphaned,
+}
+
+impl Freshness {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::SourceChanged => "source_changed",
+            Self::StructurallyChanged => "structurally_changed",
+            Self::Orphaned => "orphaned",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslationProvenance {
+    Human,
+    Imported,
+    TrustedTm,
+    CandidateTm,
+    Ai,
+    RepairedAi,
+}
+
+impl TranslationProvenance {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Imported => "imported",
+            Self::TrustedTm => "trusted_tm",
+            Self::CandidateTm => "candidate_tm",
+            Self::Ai => "ai",
+            Self::RepairedAi => "repaired_ai",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationState {
+    Pending,
+    Passed,
+    Failed,
+    Quarantined,
+}
+
+impl ValidationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Quarantined => "quarantined",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewState {
+    Unreviewed,
+    NeedsReview,
+    Approved,
+    Rejected,
+}
+
+impl ReviewState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreviewed => "unreviewed",
+            Self::NeedsReview => "needs_review",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationState {
+    Candidate,
+    CommitCreated,
+    PushPending,
+    PrOpen,
+    Merged,
+    Superseded,
+}
+
+impl PublicationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::CommitCreated => "commit_created",
+            Self::PushPending => "push_pending",
+            Self::PrOpen => "pr_open",
+            Self::Merged => "merged",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryTier {
+    Trusted,
+    Candidate,
+    History,
+}
+
+impl MemoryTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Candidate => "candidate",
+            Self::History => "history",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalTransition {
+    Materialized,
+    HumanEdit,
+    Adopted,
+    CommitCreated,
+    PushPending,
+    PrOpen,
+    Merged,
+    Superseded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -146,6 +285,7 @@ impl AgentStage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentTask {
     pub id: String,
     pub stage: AgentStage,
@@ -167,6 +307,16 @@ pub struct AgentResult {
     pub attempts: usize,
     pub duration_s: f64,
     pub diagnostic: String,
+    #[serde(skip)]
+    pub request_json: String,
+    #[serde(skip)]
+    pub response_json: Option<String>,
+    #[serde(skip)]
+    pub prompt_version: String,
+    #[serde(skip)]
+    pub prompt_hash: String,
+    #[serde(skip)]
+    pub policy_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

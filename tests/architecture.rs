@@ -78,6 +78,7 @@ fn application_owns_ports_without_concrete_adapters() {
         "src/application/ports.rs",
         &[
             "pub trait AgentExecutor",
+            "pub trait DocumentationChecker",
             "pub trait StateStore",
             "pub trait Materializer",
             "pub trait GitPublisher",
@@ -94,6 +95,7 @@ fn application_owns_ports_without_concrete_adapters() {
             "database: &'a dyn StateStore",
             "materializer: &'a dyn Materializer",
             "agents: &'a dyn AgentExecutor",
+            "documentation: &'a dyn DocumentationChecker",
             "git: &'a dyn GitPublisher",
             "code_host: &'a dyn CodeHost",
             "output: &'a dyn OutputReporter",
@@ -126,6 +128,10 @@ fn adapters_implement_and_native_composes_application_ports() {
     );
     assert_contains_all("src/adapters/db.rs", &["impl StateStore for Database"]);
     assert_contains_all(
+        "src/adapters/documentation.rs",
+        &["impl DocumentationChecker for NativeDocumentationChecker"],
+    );
+    assert_contains_all(
         "src/adapters/materialize.rs",
         &["impl Materializer for FilesystemMaterializer"],
     );
@@ -142,6 +148,7 @@ fn adapters_implement_and_native_composes_application_ports() {
         &[
             "RoutedAgentExecutor::new",
             "FilesystemMaterializer",
+            "NativeDocumentationChecker",
             "NativeGitPublisher",
             "GithubCodeHost",
             "Orchestrator::new",
@@ -173,6 +180,7 @@ fn cli_only_parses_requests_and_presents_results() {
         "src/composition.rs",
         &[
             "output: &dyn OutputReporter",
+            "crate::diagnostics::init()",
             "NativeOperations::new(output)",
         ],
     );

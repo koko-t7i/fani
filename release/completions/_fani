@@ -1,0 +1,31 @@
+#compdef fani
+
+_arguments -C \
+  '(-h --help)'{-h,--help}'[Print help]' \
+  '(-V --version)'{-V,--version}'[Print version]' \
+  '1:command:(sync status check doctor adopt discard help)' \
+  '*::argument:->args'
+
+case "$words[2]" in
+  sync)
+    _arguments \
+      '--config=[Configuration file]:file:_files' \
+      '--repo=[Repository path or basename]:repository:' \
+      '--lang=[Language]:language:' \
+      '--report-dir=[Report directory]:directory:_directories' \
+      '--quiet[Suppress progress output]' \
+      '(-h --help)'{-h,--help}'[Print help]'
+    ;;
+  status|check|adopt|discard)
+    _arguments \
+      '--config=[Configuration file]:file:_files' \
+      '--repo=[Repository path or basename]:repository:' \
+      '--lang=[Language]:language:' \
+      '(-h --help)'{-h,--help}'[Print help]'
+    ;;
+  doctor)
+    _arguments \
+      '--config=[Configuration file]:file:_files' \
+      '(-h --help)'{-h,--help}'[Print help]'
+    ;;
+esac

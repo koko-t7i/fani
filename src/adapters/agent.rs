@@ -3,10 +3,15 @@ use crate::adapters::process::{
     enable_subreaper, finish_process_group, process_token, spawn_tracked, terminate_process_group,
     wrapped_command,
 };
-use crate::application::ports::{AgentExecution, AgentExecutor};
+use crate::application::ports::{
+    AGENT_REQUEST_SCHEMA, AGENT_RESPONSE_SCHEMA, AgentExecution, AgentExecutor, AgentPolicy,
+    AgentPrompt, AgentRequestEnvelope, AgentResponseEnvelope,
+};
 use crate::domain::model::{AgentResult, AgentTask, DecisionCode};
+use crate::domain::prompts;
 use anyhow::{Context, Result, anyhow};
 use nix::unistd::{Pid, setpgid};
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -69,21 +74,6 @@ fn spawn_reader<R: Read + Send + 'static>(
     });
 }
 
-fn normalise(text: &str) -> String {
-    let trimmed = text.trim();
-    let lines: Vec<_> = trimmed.lines().collect();
-    if lines.len() >= 2
-        && lines[0].trim_start().starts_with("```")
-        && lines.last().is_some_and(|line| line.trim() == "```")
-    {
-        let language = lines[0].trim().trim_matches('`').trim();
-        if ["", "md", "markdown", "text"].contains(&language) {
-            return lines[1..lines.len() - 1].join("\n").trim().to_owned();
-        }
-    }
-    trimmed.to_owned()
-}
-
 fn isolated_environment(command: &mut std::process::Command, config: &AgentConfig, home: &Path) {
     let path = std::env::var_os("PATH");
     command.env_clear().env("HOME", home).env("LANG", "C.UTF-8");
@@ -111,13 +101,14 @@ fn read_output_file(path: &Path) -> Result<String> {
 
 fn execute_once(
     config: &AgentConfig,
-    prompt: &str,
-) -> Result<(String, String, f64), (String, String)> {
+    task_id: &str,
+    request_json: &str,
+) -> Result<(String, String, String, f64), (String, String)> {
     let started = Instant::now();
-    if prompt.len() > MAX_STDIN_BYTES {
+    if request_json.len() > MAX_STDIN_BYTES {
         return Err((
             DecisionCode::AgentInvalid.as_str().into(),
-            "Agent prompt exceeds input limit".into(),
+            "Agent JSON request exceeds input limit".into(),
         ));
     }
     enable_subreaper()
@@ -159,7 +150,7 @@ fn execute_once(
     let (mut child, tracker) = spawn_tracked(&mut command, token)
         .map_err(|error| (DecisionCode::AgentExit.as_str().into(), error.to_string()))?;
     let mut stdin = child.stdin.take().expect("piped stdin");
-    let input = prompt.as_bytes().to_vec();
+    let input = request_json.as_bytes().to_vec();
     let (stdin_tx, stdin_rx) = mpsc::channel();
     thread::spawn(move || {
         let result = stdin.write_all(&input);
@@ -252,18 +243,28 @@ fn execute_once(
     finish_process_group(tracker);
     let (stdout, stdout_truncated) = stdout.expect("stdout collected");
     let (stderr, stderr_truncated) = stderr.expect("stderr collected");
-    let mut diagnostic = String::from_utf8_lossy(&stderr).into_owned();
-    if stderr_truncated {
-        diagnostic.insert_str(0, "[diagnostic tail truncated]\n");
-    }
+    let diagnostic = if stderr.is_empty() {
+        String::new()
+    } else if stderr_truncated {
+        format!(
+            "Agent stderr captured (at least {} bytes; content redacted)",
+            stderr.len()
+        )
+    } else {
+        format!(
+            "Agent stderr captured ({} bytes; content redacted)",
+            stderr.len()
+        )
+    };
     if !status.success() {
+        let suffix = if diagnostic.is_empty() {
+            String::new()
+        } else {
+            format!("; {diagnostic}")
+        };
         return Err((
             DecisionCode::AgentExit.as_str().into(),
-            format!(
-                "exit {}: {}",
-                status.code().unwrap_or(-1),
-                diagnostic.trim()
-            ),
+            format!("exit {}{suffix}", status.code().unwrap_or(-1)),
         ));
     }
     let raw = if config
@@ -291,14 +292,42 @@ fn execute_once(
             )
         })?
     };
-    let output = normalise(&raw);
-    if output.is_empty() {
+    let response: AgentResponseEnvelope = serde_json::from_str(&raw).map_err(|error| {
+        (
+            DecisionCode::AgentInvalid.as_str().into(),
+            format!("Agent returned invalid JSON envelope: {error}"),
+        )
+    })?;
+    if response.schema != AGENT_RESPONSE_SCHEMA {
         return Err((
             DecisionCode::AgentInvalid.as_str().into(),
-            "Agent returned empty output".into(),
+            "Agent response uses an unsupported schema".into(),
         ));
     }
-    Ok((output, diagnostic, started.elapsed().as_secs_f64()))
+    if response.task_id != task_id {
+        return Err((
+            DecisionCode::AgentInvalid.as_str().into(),
+            "Agent response task_id does not match the request".into(),
+        ));
+    }
+    if response.output.is_empty() {
+        return Err((
+            DecisionCode::AgentInvalid.as_str().into(),
+            "Agent response output is empty".into(),
+        ));
+    }
+    let response_json = serde_json::to_string(&response).map_err(|error| {
+        (
+            DecisionCode::AgentInvalid.as_str().into(),
+            format!("cannot serialize Agent response envelope: {error}"),
+        )
+    })?;
+    Ok((
+        response.output,
+        response_json,
+        diagnostic,
+        started.elapsed().as_secs_f64(),
+    ))
 }
 
 #[derive(Clone)]
@@ -314,13 +343,29 @@ impl CommandAgent {
     }
 
     fn execute_one(&self, task: &AgentTask) -> AgentResult {
-        let prompt = crate::domain::prompts::render(task);
+        let prompt_version = prompts::PROMPT_VERSION.to_owned();
+        let prompt_hash = prompts::task_prompt_hash(task);
+        let policy_fingerprint = prompts::policy_fingerprint();
+        let request = AgentRequestEnvelope {
+            schema: AGENT_REQUEST_SCHEMA.to_owned(),
+            task: task.clone(),
+            prompt: AgentPrompt {
+                version: prompt_version.clone(),
+                resource: prompts::resource_name(task).to_owned(),
+                hash: prompt_hash.clone(),
+                content: prompts::render(task),
+            },
+            policy: AgentPolicy {
+                fingerprint: policy_fingerprint.clone(),
+            },
+        };
+        let request_json = serde_json::to_string(&request).expect("Agent request is serializable");
         let started = Instant::now();
         let mut last_code = DecisionCode::AgentExit.as_str().to_owned();
         let mut last_message = String::new();
         for attempt in 1..=self.config.retries + 1 {
-            match execute_once(&self.config, &prompt) {
-                Ok((output, diagnostic, duration_s)) => {
+            match execute_once(&self.config, &task.id, &request_json) {
+                Ok((output, response_json, diagnostic, duration_s)) => {
                     return AgentResult {
                         task_id: task.id.clone(),
                         ok: true,
@@ -329,6 +374,11 @@ impl CommandAgent {
                         attempts: attempt,
                         duration_s,
                         diagnostic,
+                        request_json,
+                        response_json: Some(response_json),
+                        prompt_version,
+                        prompt_hash,
+                        policy_fingerprint,
                     };
                 }
                 Err((code, message)) => {
@@ -345,6 +395,11 @@ impl CommandAgent {
             attempts: self.config.retries + 1,
             duration_s: started.elapsed().as_secs_f64(),
             diagnostic: last_message,
+            request_json,
+            response_json: None,
+            prompt_version,
+            prompt_hash,
+            policy_fingerprint,
         }
     }
 }
@@ -408,9 +463,62 @@ impl<'a> RoutedAgentExecutor<'a> {
 impl AgentExecutor for RoutedAgentExecutor<'_> {
     fn execute(&self, tasks: &[AgentTask]) -> Result<AgentExecution> {
         let config = self.config_for_tasks(tasks)?;
+        let stage = tasks[0].stage.as_str();
+        let started = Instant::now();
+        let agent_id = crate::diagnostics::safe_id(&config.name);
+        let provider_id = crate::diagnostics::safe_id(&config.provider);
+        let model_id = crate::diagnostics::safe_id(&config.model);
+        tracing::info!(
+            event = "provider.batch.started",
+            stage,
+            agent_id,
+            provider_id,
+            model_id,
+            adapter = config.adapter,
+            task_count = tasks.len(),
+        );
+        let mut identity = Sha256::new();
+        for value in [&config.provider, &config.model, &config.adapter] {
+            identity.update((value.len() as u64).to_be_bytes());
+            identity.update(value.as_bytes());
+        }
+        let provider_fingerprint = format!("{:x}", identity.finalize());
+        let results = CommandAgent::new(config).execute(tasks)?;
+        for result in &results {
+            tracing::info!(
+                event = "provider.task.completed",
+                stage,
+                task_id = %crate::diagnostics::safe_id(&result.task_id),
+                status = if result.ok { "succeeded" } else { "failed" },
+                code = result.code.as_deref().unwrap_or("ok"),
+                attempts = result.attempts,
+                duration_ms = (result.duration_s * 1000.0) as u64,
+                prompt_id = %crate::diagnostics::safe_id(&result.prompt_hash),
+            );
+        }
+        tracing::info!(
+            event = "provider.batch.completed",
+            stage,
+            agent_id,
+            provider_id,
+            model_id,
+            adapter = config.adapter,
+            provider_fingerprint = %crate::diagnostics::safe_id(&provider_fingerprint),
+            status = if results.iter().all(|result| result.ok) {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            task_count = results.len(),
+            duration_ms = started.elapsed().as_millis() as u64,
+        );
         Ok(AgentExecution {
             agent: config.name.clone(),
-            results: CommandAgent::new(config).execute(tasks)?,
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            adapter: config.adapter.clone(),
+            provider_fingerprint,
+            results,
         })
     }
 }

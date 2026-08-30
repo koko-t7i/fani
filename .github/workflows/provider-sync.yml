@@ -1,0 +1,71 @@
+name: Trusted provider sync
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "31 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: provider-state-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: >-
+      vars.FANI_CONFIG_PATH != '' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      FANI_BIN: target/release/fani
+      FANI_CONFIG_PATH: ${{ vars.FANI_CONFIG_PATH }}
+      FANI_STATE_DB: ${{ vars.FANI_STATE_DB || '.fani/fani.db' }}
+      FANI_STATE_REF: refs/heads/fani-state
+      FANI_STATE_REMOTE: origin
+      GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Enforce trusted provider trigger
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+        run: scripts/ci/trusted-provider-gate.sh
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build locked release binary
+        run: cargo build --locked --release
+      - name: Restore authoritative state ref
+        id: restore
+        env:
+          FANI_STATE_TOKEN: ${{ github.token }}
+        run: scripts/ci/state-ref.sh restore
+      - name: Run provider-backed sync
+        id: provider
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set +e
+          "${FANI_BIN}" sync --config "${FANI_CONFIG_PATH}" --quiet
+          status=$?
+          set -e
+          case "$status" in
+            0|1|3) exit 0 ;;
+            *) exit "$status" ;;
+          esac
+      - name: Validate and publish authoritative state with CAS
+        if: ${{ always() && steps.restore.outcome == 'success' && hashFiles(env.FANI_STATE_DB) != '' }}
+        env:
+          FANI_STATE_TOKEN: ${{ github.token }}
+        run: scripts/ci/state-ref.sh publish

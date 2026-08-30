@@ -23,6 +23,9 @@ pub enum ConfigError {
 pub struct AgentConfig {
     #[serde(skip)]
     pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub adapter: String,
     pub cmd: Vec<String>,
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
@@ -148,6 +151,28 @@ impl Config {
                 "target_pattern",
                 &repo.path,
             )?;
+            if !repo.documentation.timeout_s.is_finite() || repo.documentation.timeout_s <= 0.0 {
+                return Err(ConfigError::Invalid(format!(
+                    "{}: documentation.timeout_s must be a positive finite number",
+                    repo.path.display()
+                )));
+            }
+            for (index, command) in repo.documentation.commands.iter().enumerate() {
+                if command.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "{}: documentation.commands[{index}] must be a non-empty argv array",
+                        repo.path.display()
+                    )));
+                }
+                for argument in command {
+                    if argument.is_empty() || argument.as_bytes().contains(&0) {
+                        return Err(ConfigError::Invalid(format!(
+                            "{}: documentation.commands[{index}] contains an invalid argv value",
+                            repo.path.display()
+                        )));
+                    }
+                }
+            }
             if repo.publish.enabled {
                 if !repo.publish.branch.contains("{lang}") {
                     return Err(ConfigError::Invalid(format!(
@@ -179,6 +204,23 @@ impl Config {
         }
         for (name, agent) in &mut cfg.agents {
             agent.name = name.clone();
+            for (field, value) in [
+                ("provider", agent.provider.as_str()),
+                ("model", agent.model.as_str()),
+                ("adapter", agent.adapter.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "[agents.{name}]: {field} must not be empty"
+                    )));
+                }
+            }
+            if agent.adapter != "command-json-v1" {
+                return Err(ConfigError::Invalid(format!(
+                    "[agents.{name}]: unsupported adapter {:?}",
+                    agent.adapter
+                )));
+            }
             if agent.cmd.is_empty() {
                 return Err(ConfigError::Invalid(format!(
                     "[agents.{name}]: cmd must not be empty"
@@ -265,6 +307,9 @@ path = "{}"
 languages = ["zh-CN"]
 target_pattern = "docs/{{lang}}/{{relpath}}"
 [agents.fake]
+provider = "fixture"
+model = "fixture"
+adapter = "command-json-v1"
 cmd = ["true"]
 [routing]
 translate = "fake"
@@ -297,6 +342,39 @@ translate = "fake"
             .unwrap_err()
             .to_string();
         assert!(error.contains("unknown field `skill`"), "{error}");
+    }
+
+    #[test]
+    fn rejects_missing_identity_and_unknown_agent_fields() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        let config = tmp.path().join("fani.toml");
+        fs::write(
+            &config,
+            minimal(tmp.path()).replace("provider = \"fixture\"\n", ""),
+        )
+        .unwrap();
+        assert!(
+            Config::load(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `provider`")
+        );
+
+        fs::write(
+            &config,
+            minimal(tmp.path()).replace(
+                "adapter = \"command-json-v1\"",
+                "adapter = \"command-json-v1\"\nlegacy_output = true",
+            ),
+        )
+        .unwrap();
+        assert!(
+            Config::load(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field `legacy_output`")
+        );
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use crate::application::command::OutputReporter;
 use crate::application::ports::{
-    AgentExecutor, AttemptCandidateInput, AttemptInput, CanonicalFileInput, CodeHost,
-    EnsurePullRequest, FindingInput, GitPublisher, Materialization, MaterializationResult,
-    Materializer, OutboxKind, PublicationFile, PullRequestStateInput, StateStore,
-    TrustTranslationInput,
+    AgentExecutor, AttemptCandidateInput, AttemptInput, CanonicalFileInput,
+    CanonicalTranslationInput, CodeHost, DocumentationChecker, EnsurePullRequest, FindingInput,
+    GitPublisher, Materialization, MaterializationResult, Materializer, OutboxKind,
+    PublicationFile, PublicationManifestFile, PublicationManifestInput, PullRequestStateInput,
+    StateStore, TrustTranslationInput,
 };
 use crate::application::settings::RepoConfig;
 use crate::domain::markdown::{
@@ -11,9 +12,11 @@ use crate::domain::markdown::{
 };
 use crate::domain::matching::{MatchKind, PreviousUnit, match_units};
 use crate::domain::model::{
-    AgentResult, AgentStage, AgentTask, DecisionCode, Finding, FindingSeverity, LanguageOutcome,
-    PlanSummary, Status,
+    AgentResult, AgentStage, AgentTask, CanonicalTransition, DecisionCode, Finding,
+    FindingSeverity, Freshness, LanguageOutcome, MemoryTier, PlanSummary, PublicationState,
+    ReviewState, Status, TranslationProvenance, ValidationState,
 };
+use crate::domain::prompts;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -83,6 +86,7 @@ fn previous_units(rows: &[crate::application::ports::UnitHistory]) -> Vec<Previo
             let kind = match kind.as_str() {
                 "Paragraph" => crate::domain::markdown::UnitKind::Paragraph,
                 "Heading" => crate::domain::markdown::UnitKind::Heading,
+                "ListItem" => crate::domain::markdown::UnitKind::ListItem,
                 "TableCell" => crate::domain::markdown::UnitKind::TableCell,
                 "DefinitionTerm" => crate::domain::markdown::UnitKind::DefinitionTerm,
                 "Definition" => crate::domain::markdown::UnitKind::Definition,
@@ -122,6 +126,8 @@ struct PlannedDocument {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PublicationRecord {
+    canonical_content_version_id: i64,
+    canonical_file_id: i64,
     content: String,
     content_hash: String,
     path: String,
@@ -135,6 +141,8 @@ struct PublicationPayload {
     expected_remote_tip: Option<Option<String>>,
     files: Vec<PublicationRecord>,
     language: String,
+    policy_fingerprint: String,
+    run_id: String,
     source_revision: String,
 }
 
@@ -143,6 +151,7 @@ pub struct Orchestrator<'a> {
     database: &'a dyn StateStore,
     materializer: &'a dyn Materializer,
     agents: &'a dyn AgentExecutor,
+    documentation: &'a dyn DocumentationChecker,
     git: &'a dyn GitPublisher,
     code_host: &'a dyn CodeHost,
     config_path: &'a Path,
@@ -159,6 +168,7 @@ impl<'a> Orchestrator<'a> {
         database: &'a dyn StateStore,
         materializer: &'a dyn Materializer,
         agents: &'a dyn AgentExecutor,
+        documentation: &'a dyn DocumentationChecker,
         git: &'a dyn GitPublisher,
         code_host: &'a dyn CodeHost,
         config_path: &'a Path,
@@ -172,6 +182,7 @@ impl<'a> Orchestrator<'a> {
             database,
             materializer,
             agents,
+            documentation,
             git,
             code_host,
             config_path,
@@ -186,6 +197,41 @@ impl<'a> Orchestrator<'a> {
         if !self.quiet {
             self.output.stderr(message);
         }
+    }
+
+    fn traced_stage<T>(
+        &self,
+        language: &str,
+        run_id: &str,
+        stage: &str,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let started = Instant::now();
+        let repository_id =
+            crate::diagnostics::safe_id(self.repo.path.to_string_lossy().as_bytes());
+        let run_id = crate::diagnostics::safe_id(run_id);
+        tracing::info!(
+            event = "stage.started",
+            repository_id,
+            run_id,
+            locale = language,
+            stage,
+        );
+        let result = operation();
+        tracing::info!(
+            event = "stage.completed",
+            repository_id,
+            run_id,
+            locale = language,
+            stage,
+            status = if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            duration_ms = started.elapsed().as_millis() as u64,
+        );
+        result
     }
 
     fn repository_id(&self) -> Result<i64> {
@@ -226,10 +272,11 @@ impl<'a> Orchestrator<'a> {
                 match matched.kind {
                     MatchKind::Ambiguous => conflicts += 1,
                     MatchKind::Exact | MatchKind::Moved
-                        if matched
-                            .previous_translation
-                            .as_ref()
-                            .is_some_and(|text| !text.is_empty()) =>
+                        if matched.trusted_reuse
+                            && matched
+                                .previous_translation
+                                .as_ref()
+                                .is_some_and(|text| !text.is_empty()) =>
                     {
                         reused += 1
                     }
@@ -286,10 +333,6 @@ impl<'a> Orchestrator<'a> {
             let markdown_units = extract_units(&source_text);
             let history = self.database.unit_history(document_id, language)?;
             let matched = match_units(&previous_units(&history), &markdown_units);
-            let history_by_key: HashMap<_, _> = history
-                .iter()
-                .map(|row| (row.unit_key.as_str(), row))
-                .collect();
             let mut units = Vec::new();
             for (ordinal, (markdown, matched)) in
                 markdown_units.into_iter().zip(matched).enumerate()
@@ -323,22 +366,21 @@ impl<'a> Orchestrator<'a> {
                     &source_hash,
                     &serde_json::to_string(&json!({"kind": context}))?,
                 )?;
-                let candidate = history_by_key.get(stable_id.as_str()).and_then(|row| {
-                    (row.source_hash == source_hash)
-                        .then(|| row.translation.clone())
-                        .flatten()
-                });
+                let candidate =
+                    self.database
+                        .recoverable_candidate(run_id, database_id, language)?;
                 let trusted = self.database.trusted_translation(
                     repository_id,
                     language,
                     &source_hash,
                     &context,
                 )?;
-                let reusable = candidate.or(trusted).or_else(|| {
-                    matches!(matched.kind, MatchKind::Exact | MatchKind::Moved)
-                        .then_some(matched.previous_translation.clone())
-                        .flatten()
-                        .filter(|text| !text.is_empty())
+                let reusable = trusted.or(candidate).or_else(|| {
+                    (matched.trusted_reuse
+                        && matches!(matched.kind, MatchKind::Exact | MatchKind::Moved))
+                    .then_some(matched.previous_translation.clone())
+                    .flatten()
+                    .filter(|text| !text.is_empty())
                 });
                 let mut planned = PlannedUnit {
                     markdown,
@@ -398,9 +440,9 @@ impl<'a> Orchestrator<'a> {
                     if canonical.materialized_hash.as_deref()
                         != Some(canonical.content_hash.as_str())
                     {
-                        self.database.set_canonical_file_state(
+                        self.database.transition_canonical_file(
                             canonical.id,
-                            "materialized",
+                            CanonicalTransition::Materialized,
                             Some(&canonical.content_hash),
                         )?;
                     }
@@ -494,6 +536,10 @@ impl<'a> Orchestrator<'a> {
         }
         let execution = self.agents.execute(&tasks)?;
         let agent_name = execution.agent;
+        let provider = execution.provider;
+        let model = execution.model;
+        let adapter = execution.adapter;
+        let provider_fingerprint = execution.provider_fingerprint;
         let results = execution.results;
         self.log(&format!(
             "    dispatched {} native Markdown unit(s) to {}",
@@ -512,13 +558,6 @@ impl<'a> Orchestrator<'a> {
                 let Some(result) = by_id.get(unit.stable_id.as_str()) else {
                     continue;
                 };
-                let request_json = serde_json::to_string(
-                    &json!({"task_id": unit.stable_id, "stage": "translate"}),
-                )?;
-                let response_json = result
-                    .ok
-                    .then(|| serde_json::to_string(&json!({"output": result.output})))
-                    .transpose()?;
                 let dedupe_key = format!("{}:translate", unit.stable_id);
                 if result.ok {
                     match validate_translation(&unit.markdown, &result.output) {
@@ -530,9 +569,16 @@ impl<'a> Orchestrator<'a> {
                                         work_item_id,
                                         dedupe_key: &dedupe_key,
                                         agent: &agent_name,
+                                        provider: &provider,
+                                        model: &model,
+                                        adapter: &adapter,
+                                        provider_fingerprint: &provider_fingerprint,
+                                        prompt_version: &result.prompt_version,
+                                        prompt_hash: &result.prompt_hash,
+                                        policy_fingerprint: &result.policy_fingerprint,
                                         status: "succeeded",
-                                        request_json: &request_json,
-                                        response_json: response_json.as_deref(),
+                                        request_json: result.request_json.as_str(),
+                                        response_json: result.response_json.as_deref(),
                                         error: None,
                                     },
                                     unit_id: unit.database_id,
@@ -540,6 +586,8 @@ impl<'a> Orchestrator<'a> {
                                     candidate_key: &candidate_key,
                                     target_text: &result.output,
                                     score: Some(1.0),
+                                    policy_fingerprint: &prompts::policy_fingerprint(),
+                                    provenance: TranslationProvenance::Ai,
                                 })?;
                             (self.failpoint)("agent_candidate_committed");
                             unit.translation = Some(result.output.clone());
@@ -549,9 +597,16 @@ impl<'a> Orchestrator<'a> {
                                 work_item_id,
                                 dedupe_key: &dedupe_key,
                                 agent: &agent_name,
+                                provider: &provider,
+                                model: &model,
+                                adapter: &adapter,
+                                provider_fingerprint: &provider_fingerprint,
+                                prompt_version: &result.prompt_version,
+                                prompt_hash: &result.prompt_hash,
+                                policy_fingerprint: &result.policy_fingerprint,
                                 status: "failed",
-                                request_json: &request_json,
-                                response_json: response_json.as_deref(),
+                                request_json: result.request_json.as_str(),
+                                response_json: result.response_json.as_deref(),
                                 error: Some("deterministic Markdown validation failed"),
                             })?;
                             for validation in findings {
@@ -578,8 +633,15 @@ impl<'a> Orchestrator<'a> {
                         work_item_id,
                         dedupe_key: &dedupe_key,
                         agent: &agent_name,
+                        provider: &provider,
+                        model: &model,
+                        adapter: &adapter,
+                        provider_fingerprint: &provider_fingerprint,
+                        prompt_version: &result.prompt_version,
+                        prompt_hash: &result.prompt_hash,
+                        policy_fingerprint: &result.policy_fingerprint,
                         status,
-                        request_json: &request_json,
+                        request_json: result.request_json.as_str(),
                         response_json: None,
                         error: Some(result.diagnostic.as_str()),
                     })?;
@@ -671,6 +733,10 @@ impl<'a> Orchestrator<'a> {
             rounds += 1;
             let execution = self.agents.execute(&tasks)?;
             let agent_name = execution.agent;
+            let provider = execution.provider;
+            let model = execution.model;
+            let adapter = execution.adapter;
+            let provider_fingerprint = execution.provider_fingerprint;
             let results = execution.results;
             let by_id: HashMap<_, _> = results
                 .iter()
@@ -684,13 +750,6 @@ impl<'a> Orchestrator<'a> {
                     let Some(result) = by_id.get(unit.stable_id.as_str()) else {
                         continue;
                     };
-                    let request_json = serde_json::to_string(
-                        &json!({"task_id": unit.stable_id, "stage": "repair", "round": round}),
-                    )?;
-                    let response_json = result
-                        .ok
-                        .then(|| serde_json::to_string(&json!({"output": result.output})))
-                        .transpose()?;
                     let dedupe_key = format!("{}:repair:{round}", unit.stable_id);
                     if result.ok && validate_translation(&unit.markdown, &result.output).is_ok() {
                         self.database
@@ -699,9 +758,16 @@ impl<'a> Orchestrator<'a> {
                                     work_item_id,
                                     dedupe_key: &dedupe_key,
                                     agent: &agent_name,
+                                    provider: &provider,
+                                    model: &model,
+                                    adapter: &adapter,
+                                    provider_fingerprint: &provider_fingerprint,
+                                    prompt_version: &result.prompt_version,
+                                    prompt_hash: &result.prompt_hash,
+                                    policy_fingerprint: &result.policy_fingerprint,
                                     status: "succeeded",
-                                    request_json: &request_json,
-                                    response_json: response_json.as_deref(),
+                                    request_json: result.request_json.as_str(),
+                                    response_json: result.response_json.as_deref(),
                                     error: None,
                                 },
                                 unit_id: unit.database_id,
@@ -709,6 +775,8 @@ impl<'a> Orchestrator<'a> {
                                 candidate_key: &format!("attempt:{dedupe_key}"),
                                 target_text: &result.output,
                                 score: Some(1.0),
+                                policy_fingerprint: &prompts::policy_fingerprint(),
+                                provenance: TranslationProvenance::RepairedAi,
                             })?;
                         (self.failpoint)("repair_candidate_committed");
                         unit.translation = Some(result.output.clone());
@@ -724,9 +792,16 @@ impl<'a> Orchestrator<'a> {
                             work_item_id,
                             dedupe_key: &dedupe_key,
                             agent: &agent_name,
+                            provider: &provider,
+                            model: &model,
+                            adapter: &adapter,
+                            provider_fingerprint: &provider_fingerprint,
+                            prompt_version: &result.prompt_version,
+                            prompt_hash: &result.prompt_hash,
+                            policy_fingerprint: &result.policy_fingerprint,
                             status,
-                            request_json: &request_json,
-                            response_json: response_json.as_deref(),
+                            request_json: result.request_json.as_str(),
+                            response_json: result.response_json.as_deref(),
                             error: Some(if result.ok {
                                 "deterministic Markdown validation failed"
                             } else {
@@ -839,6 +914,10 @@ impl<'a> Orchestrator<'a> {
             }
             let execution = self.agents.execute(&tasks)?;
             let agent_name = execution.agent;
+            let provider = execution.provider;
+            let model = execution.model;
+            let adapter = execution.adapter;
+            let provider_fingerprint = execution.provider_fingerprint;
             let results = execution.results;
             let by_id: HashMap<_, _> = results
                 .iter()
@@ -852,13 +931,6 @@ impl<'a> Orchestrator<'a> {
                     let Some(result) = by_id.get(unit.stable_id.as_str()) else {
                         continue;
                     };
-                    let request_json = serde_json::to_string(
-                        &json!({"task_id": unit.stable_id, "stage": stage_name}),
-                    )?;
-                    let response_json = result
-                        .ok
-                        .then(|| serde_json::to_string(&json!({"output": result.output})))
-                        .transpose()?;
                     let dedupe_key = format!("{}:{stage_name}", unit.stable_id);
                     if !result.ok {
                         let status = if result.code.as_deref()
@@ -872,8 +944,15 @@ impl<'a> Orchestrator<'a> {
                             work_item_id,
                             dedupe_key: &dedupe_key,
                             agent: &agent_name,
+                            provider: &provider,
+                            model: &model,
+                            adapter: &adapter,
+                            provider_fingerprint: &provider_fingerprint,
+                            prompt_version: &result.prompt_version,
+                            prompt_hash: &result.prompt_hash,
+                            policy_fingerprint: &result.policy_fingerprint,
                             status,
-                            request_json: &request_json,
+                            request_json: result.request_json.as_str(),
                             response_json: None,
                             error: Some(result.diagnostic.as_str()),
                         })?;
@@ -895,9 +974,16 @@ impl<'a> Orchestrator<'a> {
                             work_item_id,
                             dedupe_key: &dedupe_key,
                             agent: &agent_name,
+                            provider: &provider,
+                            model: &model,
+                            adapter: &adapter,
+                            provider_fingerprint: &provider_fingerprint,
+                            prompt_version: &result.prompt_version,
+                            prompt_hash: &result.prompt_hash,
+                            policy_fingerprint: &result.policy_fingerprint,
                             status: "succeeded",
-                            request_json: &request_json,
-                            response_json: response_json.as_deref(),
+                            request_json: result.request_json.as_str(),
+                            response_json: result.response_json.as_deref(),
                             error: None,
                         })?;
                         continue;
@@ -911,9 +997,16 @@ impl<'a> Orchestrator<'a> {
                                             work_item_id,
                                             dedupe_key: &dedupe_key,
                                             agent: &agent_name,
+                                            provider: &provider,
+                                            model: &model,
+                                            adapter: &adapter,
+                                            provider_fingerprint: &provider_fingerprint,
+                                            prompt_version: &result.prompt_version,
+                                            prompt_hash: &result.prompt_hash,
+                                            policy_fingerprint: &result.policy_fingerprint,
                                             status: "succeeded",
-                                            request_json: &request_json,
-                                            response_json: response_json.as_deref(),
+                                            request_json: result.request_json.as_str(),
+                                            response_json: result.response_json.as_deref(),
                                             error: None,
                                         },
                                         unit_id: unit.database_id,
@@ -921,6 +1014,8 @@ impl<'a> Orchestrator<'a> {
                                         candidate_key: &format!("attempt:{dedupe_key}"),
                                         target_text: &result.output,
                                         score: Some(1.0),
+                                        policy_fingerprint: &prompts::policy_fingerprint(),
+                                        provenance: TranslationProvenance::Ai,
                                     })?;
                                 (self.failpoint)("revision_candidate_committed");
                                 unit.translation = Some(result.output.clone());
@@ -930,9 +1025,16 @@ impl<'a> Orchestrator<'a> {
                                     work_item_id,
                                     dedupe_key: &dedupe_key,
                                     agent: &agent_name,
+                                    provider: &provider,
+                                    model: &model,
+                                    adapter: &adapter,
+                                    provider_fingerprint: &provider_fingerprint,
+                                    prompt_version: &result.prompt_version,
+                                    prompt_hash: &result.prompt_hash,
+                                    policy_fingerprint: &result.policy_fingerprint,
                                     status: "failed",
-                                    request_json: &request_json,
-                                    response_json: response_json.as_deref(),
+                                    request_json: result.request_json.as_str(),
+                                    response_json: result.response_json.as_deref(),
                                     error: Some("deterministic Markdown validation failed"),
                                 })?;
                                 findings.push(finding(
@@ -948,9 +1050,16 @@ impl<'a> Orchestrator<'a> {
                             work_item_id,
                             dedupe_key: &dedupe_key,
                             agent: &agent_name,
+                            provider: &provider,
+                            model: &model,
+                            adapter: &adapter,
+                            provider_fingerprint: &provider_fingerprint,
+                            prompt_version: &result.prompt_version,
+                            prompt_hash: &result.prompt_hash,
+                            policy_fingerprint: &result.policy_fingerprint,
                             status: "succeeded",
-                            request_json: &request_json,
-                            response_json: response_json.as_deref(),
+                            request_json: result.request_json.as_str(),
+                            response_json: result.response_json.as_deref(),
                             error: None,
                         })?;
                         findings.push(Finding {
@@ -975,8 +1084,9 @@ impl<'a> Orchestrator<'a> {
         language: &str,
         source_revision: &str,
         documents: &mut [PlannedDocument],
-    ) -> Result<(Vec<String>, Vec<Finding>)> {
+    ) -> Result<(Vec<String>, Vec<PublicationFile>, Vec<Finding>)> {
         let mut written = Vec::new();
+        let mut candidates = Vec::new();
         let mut findings = Vec::new();
         for document in documents {
             let missing: Vec<_> = document
@@ -1013,16 +1123,38 @@ impl<'a> Orchestrator<'a> {
             .with_context(|| format!("cannot assemble {}", document.source_path))?;
             let desired = assembled.into_bytes();
             let desired_hash = content_hash(&desired);
-            let canonical_id = self.database.upsert_canonical_file(CanonicalFileInput {
-                repository_id,
-                locale: language,
-                path: &document.target_path,
-                source_revision,
-                content: &desired,
-                content_hash: &desired_hash,
-                materialized_hash: document.expected_materialized_hash.as_deref(),
-                state: "candidate",
-            })?;
+            candidates.push(PublicationFile {
+                path: document.target_path.clone(),
+                content: desired.clone(),
+            });
+            let exact_translations = document
+                .units
+                .iter()
+                .map(|unit| CanonicalTranslationInput {
+                    unit_id: unit.database_id,
+                    target_text: unit.translation.as_deref().expect("checked translation"),
+                })
+                .collect::<Vec<_>>();
+            let canonical = self.database.persist_canonical_file(
+                CanonicalFileInput {
+                    repository_id,
+                    locale: language,
+                    path: &document.target_path,
+                    source_revision,
+                    content: &desired,
+                    content_hash: &desired_hash,
+                    materialized_hash: document.expected_materialized_hash.as_deref(),
+                    freshness: Freshness::Exact,
+                    provenance: TranslationProvenance::Ai,
+                    validation: ValidationState::Passed,
+                    review: ReviewState::Unreviewed,
+                    publication: PublicationState::Candidate,
+                    trust_tier: MemoryTier::Candidate,
+                    policy_fingerprint: &prompts::policy_fingerprint(),
+                },
+                &exact_translations,
+            )?;
+            let canonical_id = canonical.id;
             document.canonical_id = Some(canonical_id);
             let unit = document.units.first().ok_or_else(|| {
                 anyhow!(
@@ -1066,33 +1198,45 @@ impl<'a> Orchestrator<'a> {
                 60_000,
             )?;
             if let Some(entry) = claimed {
+                let outbox_started = Instant::now();
+                tracing::info!(
+                    event = "outbox.claimed",
+                    kind = "materialization",
+                    outbox_id = entry.id,
+                    run_id = %crate::diagnostics::safe_id(run_id),
+                    locale = language,
+                    item_id = %crate::diagnostics::safe_id(&dedupe),
+                );
                 let operation = Materialization {
                     path: document.target_path.clone().into(),
                     expected_hash: document.expected_materialized_hash.clone(),
                     desired,
                 };
+                (self.failpoint)("materialization_before_file_write");
                 let result = self.materializer.apply(&self.repo.path, &operation);
-                match result {
+                let operation_status = match result {
                     Ok(MaterializationResult::Written { hash }) => {
                         (self.failpoint)("materialized_file_written");
-                        self.database.set_canonical_file_state(
+                        self.database.transition_canonical_file(
                             canonical_id,
-                            "materialized",
+                            CanonicalTransition::Materialized,
                             Some(&hash),
                         )?;
                         written.push(document.target_path.clone());
+                        "written"
                     }
                     Ok(MaterializationResult::AlreadyCurrent { hash }) => {
-                        self.database.set_canonical_file_state(
+                        self.database.transition_canonical_file(
                             canonical_id,
-                            "materialized",
+                            CanonicalTransition::Materialized,
                             Some(&hash),
                         )?;
+                        "already_current"
                     }
                     Ok(MaterializationResult::HumanEdit { actual_hash }) => {
-                        self.database.set_canonical_file_state(
+                        self.database.transition_canonical_file(
                             canonical_id,
-                            "human_edit",
+                            CanonicalTransition::HumanEdit,
                             Some(&actual_hash),
                         )?;
                         findings.push(finding(
@@ -1101,8 +1245,18 @@ impl<'a> Orchestrator<'a> {
                             DecisionCode::HumanEdit.as_str(),
                             "target changed outside fani and was not overwritten",
                         ));
+                        "human_edit"
                     }
                     Err(error) => {
+                        tracing::warn!(
+                            event = "outbox.completed",
+                            kind = "materialization",
+                            outbox_id = entry.id,
+                            run_id = %crate::diagnostics::safe_id(run_id),
+                            locale = language,
+                            status = "retry",
+                            duration_ms = outbox_started.elapsed().as_millis() as u64,
+                        );
                         self.database.retry_outbox(
                             OutboxKind::Materialization,
                             entry.id,
@@ -1112,16 +1266,79 @@ impl<'a> Orchestrator<'a> {
                         )?;
                         return Err(error);
                     }
-                }
+                };
+                (self.failpoint)("materialization_state_transitioned");
                 if !self
                     .database
                     .complete_outbox(OutboxKind::Materialization, entry.id, &owner)?
                 {
                     bail!("materialization outbox lease was lost before completion");
                 }
+                tracing::info!(
+                    event = "outbox.completed",
+                    kind = "materialization",
+                    outbox_id = entry.id,
+                    run_id = %crate::diagnostics::safe_id(run_id),
+                    locale = language,
+                    status = operation_status,
+                    duration_ms = outbox_started.elapsed().as_millis() as u64,
+                );
             }
         }
-        Ok((written, findings))
+        Ok((written, candidates, findings))
+    }
+
+    fn check_documentation(
+        &self,
+        run_id: &str,
+        language: &str,
+        source_revision: &str,
+        documents: &[PlannedDocument],
+        candidates: &[PublicationFile],
+    ) -> Result<Vec<Finding>> {
+        if self.repo.documentation.commands.is_empty() || candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let result = self
+            .documentation
+            .check(self.repo, source_revision, candidates)?;
+        let unit = documents
+            .iter()
+            .flat_map(|document| &document.units)
+            .next()
+            .ok_or_else(|| anyhow!("documentation checks require a translated Markdown unit"))?;
+        let work_item_id = self.database.enqueue_work_item(
+            run_id,
+            unit.database_id,
+            language,
+            "documentation_check",
+            0,
+            &serde_json::to_string(&json!({"source_revision": source_revision}))?,
+        )?;
+        let mut findings = Vec::new();
+        for (index, failure) in result.failures {
+            let code = if failure.timed_out {
+                "DOC-CHECK-TIMEOUT"
+            } else {
+                "DOC-CHECK-FAILED"
+            };
+            let message = format!("documentation command {index} {}", failure.message);
+            self.database.record_finding(FindingInput {
+                work_item_id,
+                attempt_id: None,
+                finding_key: &format!("{code}:{index}"),
+                severity: "error",
+                code,
+                message: &message,
+                details_json: &serde_json::to_string(&json!({
+                    "argv": self.repo.documentation.commands[index],
+                    "command_index": index,
+                    "timed_out": failure.timed_out,
+                }))?,
+            })?;
+            findings.push(finding(".", None, code, message));
+        }
+        Ok(findings)
     }
 
     fn reconcile_pull_request(&self, repository_id: i64, language: &str) -> Result<()> {
@@ -1182,8 +1399,16 @@ impl<'a> Orchestrator<'a> {
             payload_json: &pull.payload_json,
         })?;
         if state == "merged" {
-            self.database
-                .promote_merged_locale(repository_id, language, "github_merged")?;
+            let candidate_commit = stored
+                .head_revision
+                .as_deref()
+                .ok_or_else(|| anyhow!("stored pull request has no candidate head revision"))?;
+            self.database.promote_merged_publication(
+                repository_id,
+                language,
+                candidate_commit,
+                "github_merged",
+            )?;
         }
         Ok(())
     }
@@ -1219,6 +1444,8 @@ impl<'a> Orchestrator<'a> {
                     format!("canonical publication content is not UTF-8: {path}")
                 })?;
                 files.push(PublicationRecord {
+                    canonical_content_version_id: canonical.content_version_id,
+                    canonical_file_id: canonical.id,
                     content,
                     content_hash: canonical.content_hash,
                     path: path.clone(),
@@ -1229,6 +1456,8 @@ impl<'a> Orchestrator<'a> {
                 expected_remote_tip: None,
                 files,
                 language: language.to_owned(),
+                policy_fingerprint: prompts::policy_fingerprint(),
+                run_id: run_id.to_owned(),
                 source_revision: outcome.source_revision.clone(),
             })?;
             let dedupe = format!(
@@ -1256,6 +1485,14 @@ impl<'a> Orchestrator<'a> {
             }
             return Ok(());
         };
+        let outbox_started = Instant::now();
+        tracing::info!(
+            event = "outbox.claimed",
+            kind = "publication",
+            outbox_id = entry.id,
+            run_id = %crate::diagnostics::safe_id(run_id),
+            locale = language,
+        );
         let mut payload: PublicationPayload = serde_json::from_str(&entry.payload_json)?;
         if payload.language != language {
             self.database.retry_outbox(
@@ -1270,32 +1507,65 @@ impl<'a> Orchestrator<'a> {
         }
         let payload_source_revision = payload.source_revision.clone();
         let records = payload.files.clone();
-        outcome.published = if let Some(commit) = payload.commit.as_deref() {
-            let mut published = self.git.publish_pending(
-                self.repo,
-                language,
-                commit,
-                payload
-                    .expected_remote_tip
-                    .as_ref()
-                    .and_then(|tip| tip.as_deref()),
-            )?;
-            published.paths = records.iter().map(|record| record.path.clone()).collect();
-            published
-        } else {
-            let mut durable_files = Vec::with_capacity(records.len());
-            for record in &records {
-                if content_hash(record.content.as_bytes()) != record.content_hash {
-                    bail!(
-                        "durable publication content hash changed for {}",
-                        record.path
-                    );
-                }
-                durable_files.push(PublicationFile {
-                    path: record.path.clone(),
-                    content: record.content.as_bytes().to_vec(),
-                });
+        let mut durable_files = Vec::with_capacity(records.len());
+        let manifest_files = records
+            .iter()
+            .map(|record| PublicationManifestFile {
+                canonical_content_version_id: record.canonical_content_version_id,
+                canonical_file_id: record.canonical_file_id,
+                content_hash: record.content_hash.clone(),
+            })
+            .collect::<Vec<_>>();
+        for record in &records {
+            if content_hash(record.content.as_bytes()) != record.content_hash {
+                bail!(
+                    "durable publication content hash changed for {}",
+                    record.path
+                );
             }
+            durable_files.push(PublicationFile {
+                path: record.path.clone(),
+                content: record.content.as_bytes().to_vec(),
+            });
+        }
+        outcome.published = if let Some(commit) = payload.commit.as_deref() {
+            self.database
+                .record_publication_manifest(PublicationManifestInput {
+                    repository_id,
+                    run_id: &payload.run_id,
+                    locale: language,
+                    source_revision: &payload_source_revision,
+                    candidate_commit: commit,
+                    policy_fingerprint: &payload.policy_fingerprint,
+                    files: &manifest_files,
+                })?;
+            if self.repo.publish.push {
+                self.database.transition_publication_manifest(
+                    repository_id,
+                    language,
+                    commit,
+                    PublicationState::PushPending,
+                )?;
+                let mut published = self.git.publish_pending(
+                    self.repo,
+                    language,
+                    commit,
+                    payload
+                        .expected_remote_tip
+                        .as_ref()
+                        .and_then(|tip| tip.as_deref()),
+                )?;
+                published.paths = records.iter().map(|record| record.path.clone()).collect();
+                published
+            } else {
+                crate::domain::model::Published {
+                    branch: self.git.branch(self.repo, language)?,
+                    commit: commit.to_owned(),
+                    paths: records.iter().map(|record| record.path.clone()).collect(),
+                    ..Default::default()
+                }
+            }
+        } else {
             let prepared_publication = self.git.prepare(
                 self.repo,
                 language,
@@ -1315,8 +1585,24 @@ impl<'a> Orchestrator<'a> {
             )? {
                 bail!("publication outbox ownership changed before commit persistence");
             }
+            self.database
+                .record_publication_manifest(PublicationManifestInput {
+                    repository_id,
+                    run_id: &payload.run_id,
+                    locale: language,
+                    source_revision: &payload_source_revision,
+                    candidate_commit: &prepared.commit,
+                    policy_fingerprint: &payload.policy_fingerprint,
+                    files: &manifest_files,
+                })?;
             (self.failpoint)("publication_candidate_persisted");
             if self.repo.publish.push {
+                self.database.transition_publication_manifest(
+                    repository_id,
+                    language,
+                    &prepared.commit,
+                    PublicationState::PushPending,
+                )?;
                 let pushed = self.git.publish_pending(
                     self.repo,
                     language,
@@ -1345,7 +1631,7 @@ impl<'a> Orchestrator<'a> {
                 let title = format!("i18n({language}): update translated documentation");
                 let body = format!(
                     "Automated verified documentation translation from `{}`.",
-                    outcome.source_revision
+                    payload_source_revision
                 );
                 let reconciled = self.code_host.ensure_pull_request(
                     self.repo,
@@ -1383,6 +1669,32 @@ impl<'a> Orchestrator<'a> {
                     event_key: &format!("ensure:{}", outcome.published.commit),
                     payload_json: &reconciled.payload_json,
                 })?;
+                match pr_state {
+                    "merged" => {
+                        self.database.promote_merged_publication(
+                            repository_id,
+                            language,
+                            &outcome.published.commit,
+                            "github_merged",
+                        )?;
+                    }
+                    "open" | "draft" => {
+                        self.database.transition_publication_manifest(
+                            repository_id,
+                            language,
+                            &outcome.published.commit,
+                            PublicationState::PrOpen,
+                        )?;
+                    }
+                    _ => {
+                        self.database.transition_publication_manifest(
+                            repository_id,
+                            language,
+                            &outcome.published.commit,
+                            PublicationState::Superseded,
+                        )?;
+                    }
+                }
             }
             Ok(())
         })();
@@ -1402,24 +1714,69 @@ impl<'a> Orchestrator<'a> {
         {
             bail!("publication outbox lease was lost before completion");
         }
+        tracing::info!(
+            event = "outbox.completed",
+            kind = "publication",
+            outbox_id = entry.id,
+            run_id = %crate::diagnostics::safe_id(run_id),
+            locale = language,
+            status = "completed",
+            publication_id = %crate::diagnostics::safe_id(&outcome.published.commit),
+            pushed = outcome.published.pushed,
+            duration_ms = outbox_started.elapsed().as_millis() as u64,
+        );
         self.publish(repository_id, run_id, language, &[], outcome)
     }
 
     pub fn run_language(&self, language: &str) -> LanguageOutcome {
         let started = Instant::now();
+        let repository_id =
+            crate::diagnostics::safe_id(self.repo.path.to_string_lossy().as_bytes());
+        tracing::info!(
+            event = "locale.run.started",
+            repository_id,
+            locale = language,
+        );
         let mut outcome = LanguageOutcome::new(&self.repo.path, language);
         let result = (|| -> Result<()> {
             let source_revision = self.git.resolve_source_revision(self.repo)?;
             outcome.source_revision = source_revision.clone();
             let repository_id = self.repository_id()?;
             self.reconcile_pull_request(repository_id, language)?;
-            let invocation = format!("sync:{repository_id}:{language}:{source_revision}");
-            let run_id =
-                self.database
-                    .begin_run(repository_id, &invocation, self.config_path, "{}")?;
+            let policy_fingerprint = prompts::policy_fingerprint();
+            let invocation =
+                format!("sync:{repository_id}:{language}:{source_revision}:{policy_fingerprint}");
+            let run_id = self.database.begin_run(
+                repository_id,
+                &invocation,
+                self.config_path,
+                "{}",
+                &policy_fingerprint,
+            )?;
             outcome.run_id = run_id.clone();
+            tracing::info!(
+                event = "run.started",
+                repository_id = %crate::diagnostics::safe_id(self.repo.path.to_string_lossy().as_bytes()),
+                run_id = %crate::diagnostics::safe_id(&run_id),
+                locale = language,
+                source_revision_id = %crate::diagnostics::safe_id(&source_revision),
+                policy_id = %crate::diagnostics::safe_id(&policy_fingerprint),
+            );
+            if self.repo.publish.enabled {
+                outcome.transitions.push("recovering:publication".into());
+                self.traced_stage(language, &run_id, "publication_recovery", || {
+                    self.publish(repository_id, &run_id, language, &[], &mut outcome)
+                })?;
+                if !outcome.published.commit.is_empty() {
+                    outcome.message = "recovered pending publication".into();
+                    outcome.transitions.push("complete:ok".into());
+                    return Ok(());
+                }
+            }
             let (mut documents, conflicts, reused, scheduled) =
-                self.prepare(repository_id, &run_id, language, &source_revision)?;
+                self.traced_stage(language, &run_id, "planning", || {
+                    self.prepare(repository_id, &run_id, language, &source_revision)
+                })?;
             outcome.reused_units = reused;
             outcome.conflicts = conflicts;
             if !outcome.conflicts.is_empty() {
@@ -1439,7 +1796,9 @@ impl<'a> Orchestrator<'a> {
             outcome.remaining_tasks = pending_total.saturating_sub(scheduled);
             if scheduled > 0 {
                 outcome.transitions.push("dispatching".into());
-                outcome.agent_calls = self.dispatch(&run_id, language, &mut documents)?;
+                outcome.agent_calls = self.traced_stage(language, &run_id, "translate", || {
+                    self.dispatch(&run_id, language, &mut documents)
+                })?;
                 if documents
                     .iter()
                     .flat_map(|document| &document.units)
@@ -1447,12 +1806,15 @@ impl<'a> Orchestrator<'a> {
                 {
                     outcome.transitions.push("repairing".into());
                     outcome.repair_rounds =
-                        self.repair(language, &mut documents, &mut outcome.agent_calls)?;
+                        self.traced_stage(language, &run_id, "repair", || {
+                            self.repair(language, &mut documents, &mut outcome.agent_calls)
+                        })?;
                 }
             }
             outcome.transitions.push("reviewing".into());
-            let mut review_findings =
-                self.review(language, &mut documents, &mut outcome.agent_calls)?;
+            let mut review_findings = self.traced_stage(language, &run_id, "review", || {
+                self.review(language, &mut documents, &mut outcome.agent_calls)
+            })?;
             let review_blocked = review_findings
                 .iter()
                 .any(|finding| finding.severity == FindingSeverity::Error);
@@ -1464,15 +1826,40 @@ impl<'a> Orchestrator<'a> {
                 return Ok(());
             }
             outcome.transitions.push("verifying".into());
-            let (written, mut findings) = self.assemble_and_materialize(
-                repository_id,
-                &run_id,
-                language,
-                &source_revision,
-                &mut documents,
-            )?;
+            let (written, candidates, mut findings) =
+                self.traced_stage(language, &run_id, "materialization", || {
+                    self.assemble_and_materialize(
+                        repository_id,
+                        &run_id,
+                        language,
+                        &source_revision,
+                        &mut documents,
+                    )
+                })?;
             outcome.written = written;
             outcome.findings.append(&mut findings);
+            if outcome
+                .findings
+                .iter()
+                .any(|finding| finding.severity == FindingSeverity::Error)
+            {
+                outcome.status = Status::NeedsHuman;
+                outcome.message = "deterministic findings block publication".into();
+                outcome.transitions.push("needs_human:verification".into());
+                return Ok(());
+            }
+            outcome.transitions.push("checking:documentation".into());
+            let mut documentation_findings =
+                self.traced_stage(language, &run_id, "documentation_check", || {
+                    self.check_documentation(
+                        &run_id,
+                        language,
+                        &source_revision,
+                        &documents,
+                        &candidates,
+                    )
+                })?;
+            outcome.findings.append(&mut documentation_findings);
             if outcome
                 .findings
                 .iter()
@@ -1496,13 +1883,10 @@ impl<'a> Orchestrator<'a> {
                     format!("verified {} translated document(s)", outcome.written.len());
             }
             outcome.transitions.push("publishing".into());
-            self.publish(
-                repository_id,
-                &run_id,
-                language,
-                &outcome.written.clone(),
-                &mut outcome,
-            )?;
+            let written = outcome.written.clone();
+            self.traced_stage(language, &run_id, "publication", || {
+                self.publish(repository_id, &run_id, language, &written, &mut outcome)
+            })?;
             outcome
                 .transitions
                 .push(format!("complete:{}", outcome.status.as_str()));
@@ -1524,6 +1908,21 @@ impl<'a> Orchestrator<'a> {
             }
         }
         outcome.duration_s = started.elapsed().as_secs_f64();
+        tracing::info!(
+            event = "run.completed",
+            repository_id = %crate::diagnostics::safe_id(self.repo.path.to_string_lossy().as_bytes()),
+            run_id = %crate::diagnostics::safe_id(&outcome.run_id),
+            locale = language,
+            status = outcome.status.as_str(),
+            duration_ms = (outcome.duration_s * 1000.0) as u64,
+            agent_calls = outcome.agent_calls.len(),
+            files_written = outcome.written.len(),
+            findings = outcome.findings.len(),
+            conflicts = outcome.conflicts.len(),
+            remaining_tasks = outcome.remaining_tasks,
+            publication_id = %crate::diagnostics::safe_id(&outcome.published.commit),
+            publication_pushed = outcome.published.pushed,
+        );
         outcome
     }
 }
@@ -1617,6 +2016,7 @@ pub fn adopt_human_edit(
                 context_key: &context,
                 target_text: &target_unit.protected_source,
                 provenance: "human_adopted",
+                policy_fingerprint: &prompts::policy_fingerprint(),
             })?;
         }
         let adopted_hash = content_hash(&bytes);
@@ -1628,9 +2028,19 @@ pub fn adopt_human_edit(
             content: &bytes,
             content_hash: &adopted_hash,
             materialized_hash: Some(&adopted_hash),
-            state: "adopted",
+            freshness: Freshness::Exact,
+            provenance: TranslationProvenance::Human,
+            validation: ValidationState::Passed,
+            review: ReviewState::Approved,
+            publication: PublicationState::Candidate,
+            trust_tier: MemoryTier::Trusted,
+            policy_fingerprint: &prompts::policy_fingerprint(),
         })?;
-        database.set_canonical_file_state(canonical.id, "adopted", Some(&adopted_hash))?;
+        database.transition_canonical_file(
+            canonical.id,
+            CanonicalTransition::Adopted,
+            Some(&adopted_hash),
+        )?;
         adopted += 1;
     }
     Ok(adopted)
@@ -1676,7 +2086,11 @@ pub fn discard_human_edit(
                 return Err(anyhow!("cannot discard {target}"));
             }
         };
-        database.set_canonical_file_state(canonical.id, "materialized", Some(&hash))?;
+        database.transition_canonical_file(
+            canonical.id,
+            CanonicalTransition::Materialized,
+            Some(&hash),
+        )?;
         discarded += 1;
     }
     Ok(discarded)

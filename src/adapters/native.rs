@@ -1,6 +1,7 @@
 use crate::adapters::agent::{RoutedAgentExecutor, executable_on_path};
 use crate::adapters::config::Config;
 use crate::adapters::db::Database;
+use crate::adapters::documentation::NativeDocumentationChecker;
 use crate::adapters::github::GithubCodeHost;
 use crate::adapters::gitout::NativeGitPublisher;
 use crate::adapters::lock::RepoLock;
@@ -71,6 +72,10 @@ fn database_path(repo: &RepoConfig) -> PathBuf {
     repo.path.join(&repo.data_dir).join("fani.db")
 }
 
+fn repository_trace_id(repo: &RepoConfig) -> String {
+    crate::diagnostics::safe_id(repo.path.to_string_lossy().as_bytes())
+}
+
 fn open_database(repo: &RepoConfig) -> Result<Database> {
     Database::open(database_path(repo))
 }
@@ -94,6 +99,7 @@ fn status(args: Selection, output: &dyn OutputReporter) -> Result<CommandOutput>
         let database = Database::open(&snapshot_path)?;
         let materializer = FilesystemMaterializer;
         let agents = RoutedAgentExecutor::new(&config);
+        let documentation = NativeDocumentationChecker;
         let git = NativeGitPublisher;
         let code_host = GithubCodeHost;
         let owner_identity = owner_identity()?;
@@ -102,6 +108,7 @@ fn status(args: Selection, output: &dyn OutputReporter) -> Result<CommandOutput>
             &database,
             &materializer,
             &agents,
+            &documentation,
             &git,
             &code_host,
             &args.config,
@@ -111,6 +118,7 @@ fn status(args: Selection, output: &dyn OutputReporter) -> Result<CommandOutput>
             true,
         );
         for language in languages(repo, args.language.as_deref())? {
+            let started = std::time::Instant::now();
             let plan = orchestrator.plan_language(&language)?;
             let status = if plan.conflicts > 0 {
                 Status::NeedsHuman
@@ -122,6 +130,19 @@ fn status(args: Selection, output: &dyn OutputReporter) -> Result<CommandOutput>
             if report::overall(&[outcome_for_status(worst), outcome_for_status(status)]) == status {
                 worst = status;
             }
+            tracing::info!(
+                event = "locale.plan.completed",
+                repository_id = %repository_trace_id(repo),
+                locale = language,
+                status = status.as_str(),
+                source_revision_id = %crate::diagnostics::safe_id(&plan.source_revision),
+                documents = plan.documents,
+                pending_units = plan.pending_units,
+                reused_units = plan.reused_units,
+                conflicts = plan.conflicts,
+                deferred_units = plan.deferred_units,
+                duration_ms = started.elapsed().as_millis() as u64,
+            );
             output.stdout(&format!(
                 "{} [{}] source={} documents={} pending={} reused={} conflicts={} deferred={}",
                 repo.path
@@ -157,6 +178,11 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
         .unwrap_or_else(|| PathBuf::from(".fani-report"));
     let mut outcomes = Vec::new();
     let mut database_paths = Vec::new();
+    tracing::info!(
+        event = "sync.started",
+        repository_count = repositories.len(),
+        quiet = args.quiet,
+    );
 
     for repo in repositories {
         let database = open_database(repo)?;
@@ -176,6 +202,7 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
         };
         let materializer = FilesystemMaterializer;
         let agents = RoutedAgentExecutor::new(&config);
+        let documentation = NativeDocumentationChecker;
         let git = NativeGitPublisher;
         let code_host = GithubCodeHost;
         let owner_identity = owner_identity()?;
@@ -184,6 +211,7 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
             &database,
             &materializer,
             &agents,
+            &documentation,
             &git,
             &code_host,
             &args.selection.config,
@@ -194,6 +222,17 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
         );
         for language in languages(repo, args.selection.language.as_deref())? {
             let outcome = orchestrator.run_language(&language);
+            tracing::info!(
+                event = "locale.run.reported",
+                repository_id = %repository_trace_id(repo),
+                locale = %language,
+                run_id = %crate::diagnostics::safe_id(&outcome.run_id),
+                status = outcome.status.as_str(),
+                duration_ms = (outcome.duration_s * 1000.0) as u64,
+                agent_calls = outcome.agent_calls.len(),
+                files_written = outcome.written.len(),
+                findings = outcome.findings.len(),
+            );
             if !args.quiet {
                 output.stderr(&format!(
                     "  {} [{}] {}: {}",
@@ -225,7 +264,13 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
             report_dir.join("report.md").display()
         ));
     }
-    Ok(command_output(report::overall(&outcomes).exit_code()))
+    let overall = report::overall(&outcomes);
+    tracing::info!(
+        event = "sync.completed",
+        status = overall.as_str(),
+        locale_count = outcomes.len(),
+    );
+    Ok(command_output(overall.exit_code()))
 }
 
 fn doctor(config_path: PathBuf, output: &dyn OutputReporter) -> Result<CommandOutput> {
@@ -254,6 +299,26 @@ fn doctor(config_path: PathBuf, output: &dyn OutputReporter) -> Result<CommandOu
             output.stdout(&format!("FAIL Agent {name}: {} not found", agent.cmd[0]));
         } else {
             output.stdout(&format!("ok   Agent {name}: {}", agent.cmd[0]));
+        }
+    }
+    for repo in &config.repos {
+        for (index, command) in repo.documentation.commands.iter().enumerate() {
+            if executable_on_path(&command[0]).is_none() {
+                problems += 1;
+                output.stdout(&format!(
+                    "FAIL documentation check {}[{}]: {} not found",
+                    repo.path.display(),
+                    index,
+                    command[0]
+                ));
+            } else {
+                output.stdout(&format!(
+                    "ok   documentation check {}[{}]: {}",
+                    repo.path.display(),
+                    index,
+                    command[0]
+                ));
+            }
         }
     }
     for stage in ["translate", "repair", "revision", "proofread"] {

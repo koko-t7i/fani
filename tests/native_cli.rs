@@ -1,5 +1,6 @@
 use fani::test_support::db::Database;
 use serde_json::Value;
+use sha2::Digest;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -26,6 +27,72 @@ fn fani(args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+fn strict_provider_case(script: &str, output_file: bool) -> (i32, Value) {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("docs/guide.md"), "# Hello\n").unwrap();
+    run(&repo, &["init", "-q", "-b", "main"]);
+    run(&repo, &["config", "user.email", "test@example.invalid"]);
+    run(&repo, &["config", "user.name", "Test"]);
+    run(&repo, &["add", "."]);
+    run(&repo, &["commit", "-qm", "source"]);
+
+    let provider = tmp.path().join("provider.sh");
+    fs::write(&provider, script).unwrap();
+    let mut permissions = fs::metadata(&provider).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&provider, permissions).unwrap();
+    let command = if output_file {
+        format!("cmd = [\"{}\", \"{{output_file}}\"]", provider.display())
+    } else {
+        format!("cmd = [\"{}\"]", provider.display())
+    };
+    let config = tmp.path().join("fani.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[repo]]
+path = "{}"
+languages = ["zh-CN"]
+include = ["docs/**/*.md"]
+target_pattern = "translations/{{lang}}/{{relpath}}"
+repair_budget = 0
+[repo.quality]
+revision = false
+proofread = false
+[repo.publish]
+enabled = false
+source_ref = "HEAD"
+[agents.fixture]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
+{}
+timeout_s = 5
+retries = 0
+[routing]
+translate = "fixture"
+"#,
+            repo.display(),
+            command
+        ),
+    )
+    .unwrap();
+    let reports = tmp.path().join("reports");
+    let output = fani(&[
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--report-dir",
+        reports.to_str().unwrap(),
+        "--quiet",
+    ]);
+    let report =
+        serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
+    (output.status.code().unwrap(), report)
 }
 
 fn kill_sync_at_failpoint(config: &Path, reports: &Path, point: &str, marker: &Path) {
@@ -83,7 +150,7 @@ fn doctor_status_and_repeated_native_sync_need_no_external_skill() {
     fs::write(
         &provider,
         format!(
-            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\nawk '/^--- SOURCE ---$/ {{ take=1; next }} /^--- END SOURCE ---$/ {{ take=0 }} take' | sed -e 's/Hello/你好/g' -e 's/Welcome/欢迎/g' -e 's/Read/阅读/g' -e 's/the guide/指南/g'\n",
+            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\njq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(.task.source | gsub(\"Hello\";\"你好\") | gsub(\"Welcome\";\"欢迎\") | gsub(\"Read\";\"阅读\") | gsub(\"the guide\";\"指南\"))}}'\n",
             counter = counter.display()
         ),
     )
@@ -111,6 +178,9 @@ proofread = false
 enabled = false
 source_ref = "HEAD"
 [agents.fixture]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
 cmd = ["{}"]
 concurrency = 2
 timeout_s = 5
@@ -134,7 +204,7 @@ repair = "fixture"
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
-    assert!(String::from_utf8_lossy(&doctor.stdout).contains("native schema 1"));
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("native schema 2"));
 
     let status = fani(&["status", "--config", config.to_str().unwrap()]);
     assert_eq!(status.status.code(), Some(0));
@@ -174,6 +244,38 @@ repair = "fixture"
     let report: Value =
         serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
     assert_eq!(report["totals"]["agent_calls"], 2);
+    let database = Database::open(repo.join(".fani/fani.db")).unwrap();
+    let provenance: (String, String, String, String, String, String, String, String) = database
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT provider,model,adapter,provider_fingerprint,prompt_version,prompt_hash,policy_fingerprint,request_json FROM attempts LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(provenance.0, "fixture-provider");
+    assert_eq!(provenance.1, "fixture-model");
+    assert_eq!(provenance.2, "command-json-v1");
+    assert_eq!(provenance.3.len(), 64);
+    assert_eq!(provenance.4, fani::domain::prompts::PROMPT_VERSION);
+    assert_eq!(provenance.5.len(), 64);
+    assert_eq!(provenance.6, fani::domain::prompts::policy_fingerprint());
+    let durable_request: Value = serde_json::from_str(&provenance.7).unwrap();
+    assert_eq!(durable_request["schema"], "fani.agent.request.v1");
+    assert!(durable_request["prompt"]["content"].is_string());
+    assert!(!report.to_string().contains("--- SOURCE ---"));
 
     let second = fani(&[
         "sync",
@@ -201,6 +303,268 @@ repair = "fixture"
 }
 
 #[test]
+fn command_adapter_accepts_only_strict_versioned_json_envelopes() {
+    let (code, report) = strict_provider_case(
+        r##"#!/bin/sh
+set -eu
+input=$(cat)
+printf '%s' "$input" | jq -c '{schema:"fani.agent.response.v1",task_id:.task.id,output:(.task.source | gsub("Hello";"你好"))}' > "$1"
+"##,
+        true,
+    );
+    assert_eq!(code, 0, "{report}");
+
+    let invalid = [
+        r##"#!/bin/sh
+jq -c '{schema:"fani.agent.response.v2",task_id:.task.id,output:"# 你好"}'
+"##,
+        r##"#!/bin/sh
+jq -c '{schema:"fani.agent.response.v1",task_id:.task.id,output:"# 你好",extra:true}'
+"##,
+        r##"#!/bin/sh
+jq -c '{schema:"fani.agent.response.v1",task_id:.task.id}'
+"##,
+        r##"#!/bin/sh
+jq -c '{schema:"fani.agent.response.v1",task_id:.task.id,output:42}'
+"##,
+        r##"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"schema":"fani.agent.response.v1","task_id":"wrong-task","output":"# 你好"}'
+"##,
+        r##"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '# raw output'
+"##,
+        r##"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '```json' '{"schema":"fani.agent.response.v1","task_id":"ignored","output":"# 你好"}' '```'
+"##,
+    ];
+    for script in invalid {
+        let (code, report) = strict_provider_case(script, false);
+        assert_ne!(code, 0, "{report}");
+        assert_eq!(
+            report["languages"][0]["agent_calls"][0]["code"], "AGENT-INVALID",
+            "{report}"
+        );
+    }
+
+    let (code, report) = strict_provider_case(
+        r##"#!/bin/sh
+set -eu
+cat >/dev/null
+printf '%s' '# raw output' > "$1"
+"##,
+        true,
+    );
+    assert_ne!(code, 0, "{report}");
+    assert_eq!(
+        report["languages"][0]["agent_calls"][0]["code"],
+        "AGENT-INVALID"
+    );
+
+    let (code, report) = strict_provider_case(
+        r##"#!/bin/sh
+set -eu
+cat >/dev/null
+printf '%s' '{"schema":"fani.agent.response.v1","task_id":"task","output":"' > "$1"
+head -c 4194305 /dev/zero | tr '\000' a >> "$1"
+printf '%s' '"}' >> "$1"
+"##,
+        true,
+    );
+    assert_ne!(code, 0, "{report}");
+    assert_eq!(
+        report["languages"][0]["agent_calls"][0]["code"],
+        "AGENT-INVALID"
+    );
+    assert!(
+        report["languages"][0]["agent_calls"][0]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("exceeded")
+    );
+
+    let (_, report) = strict_provider_case(
+        r##"#!/bin/sh
+cat >/dev/null
+printf '%s\n' 'secret-token full prompt content' >&2
+exit 1
+"##,
+        false,
+    );
+    let ordinary_diagnostics = report.to_string();
+    assert!(!ordinary_diagnostics.contains("secret-token"));
+    assert!(!ordinary_diagnostics.contains("full prompt content"));
+    assert!(ordinary_diagnostics.contains("content redacted"));
+}
+
+fn adversarial_diagnostics_case(json: bool) -> Output {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(
+        repo.join("docs/guide.md"),
+        "# SOURCE_SECRET_DO_NOT_LOG\n\nCREDENTIAL_SOURCE_DO_NOT_LOG {{TOKEN_PLACEHOLDER_SECRET_DO_NOT_LOG}}\n",
+    )
+    .unwrap();
+    run(&repo, &["init", "-q", "-b", "main"]);
+    run(&repo, &["config", "user.email", "test@example.invalid"]);
+    run(&repo, &["config", "user.name", "Test"]);
+    run(&repo, &["add", "."]);
+    run(&repo, &["commit", "-qm", "source"]);
+
+    let provider = tmp.path().join("provider.sh");
+    fs::write(
+        &provider,
+        r##"#!/bin/sh
+set -eu
+printf '%s\n' 'PROVIDER_STDERR_SECRET_DO_NOT_LOG' >&2
+jq -c '{schema:"fani.agent.response.v1",task_id:.task.id,output:(.task.source | gsub("SOURCE_SECRET_DO_NOT_LOG";"TRANSLATION_SECRET_DO_NOT_LOG") | gsub("CREDENTIAL_SOURCE_DO_NOT_LOG";"TRANSLATED_CREDENTIAL_DO_NOT_LOG"))}'
+"##,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&provider).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&provider, permissions).unwrap();
+
+    let config = tmp.path().join("fani.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[repo]]
+path = "{}"
+languages = ["zh-CN"]
+include = ["docs/**/*.md"]
+target_pattern = "translations/{{lang}}/{{relpath}}"
+repair_budget = 0
+[repo.quality]
+revision = false
+proofread = false
+[repo.publish]
+enabled = false
+source_ref = "HEAD"
+[agents.fixture]
+provider = "PROVIDER_METADATA_SECRET_DO_NOT_LOG"
+model = "MODEL_CREDENTIAL_SECRET_DO_NOT_LOG"
+adapter = "command-json-v1"
+cmd = ["{}"]
+timeout_s = 5
+retries = 0
+env_allow = ["FANI_TEST_DIAGNOSTIC_TOKEN"]
+[routing]
+translate = "fixture"
+"#,
+            repo.display(),
+            provider.display(),
+        ),
+    )
+    .unwrap();
+    let reports = tmp.path().join("reports");
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fani"));
+    command
+        .args([
+            "sync",
+            "--config",
+            config.to_str().unwrap(),
+            "--report-dir",
+            reports.to_str().unwrap(),
+            "--quiet",
+        ])
+        .env("FANI_LOG", "info")
+        .env("FANI_TEST_DIAGNOSTIC_TOKEN", "ENV_TOKEN_SECRET_DO_NOT_LOG");
+    if json {
+        command.env("FANI_LOG_FORMAT", "json");
+    } else {
+        command.env_remove("FANI_LOG_FORMAT");
+    }
+    command.output().unwrap()
+}
+
+fn assert_diagnostics_are_redacted(output: &Output) -> String {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "quiet sync changed stdout semantics: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let diagnostics = String::from_utf8(output.stderr.clone()).unwrap();
+    for secret in [
+        "SOURCE_SECRET_DO_NOT_LOG",
+        "CREDENTIAL_SOURCE_DO_NOT_LOG",
+        "TOKEN_PLACEHOLDER_SECRET_DO_NOT_LOG",
+        "TRANSLATION_SECRET_DO_NOT_LOG",
+        "TRANSLATED_CREDENTIAL_DO_NOT_LOG",
+        "PROVIDER_STDERR_SECRET_DO_NOT_LOG",
+        "PROVIDER_METADATA_SECRET_DO_NOT_LOG",
+        "MODEL_CREDENTIAL_SECRET_DO_NOT_LOG",
+        "ENV_TOKEN_SECRET_DO_NOT_LOG",
+    ] {
+        assert!(
+            !diagnostics.contains(secret),
+            "diagnostics leaked {secret}: {diagnostics}"
+        );
+    }
+    diagnostics
+}
+
+#[test]
+fn human_diagnostics_are_structured_and_redacted() {
+    let diagnostics = assert_diagnostics_are_redacted(&adversarial_diagnostics_case(false));
+    for event in [
+        "cli.command.started",
+        "run.started",
+        "stage.completed",
+        "provider.batch.completed",
+        "outbox.completed",
+        "run.completed",
+    ] {
+        assert!(
+            diagnostics.contains(event),
+            "missing {event}: {diagnostics}"
+        );
+    }
+    assert!(diagnostics.contains("duration_ms"), "{diagnostics}");
+    assert!(diagnostics.contains("locale=\"zh-CN\""), "{diagnostics}");
+}
+
+#[test]
+fn json_diagnostics_are_structured_and_redacted() {
+    let diagnostics = assert_diagnostics_are_redacted(&adversarial_diagnostics_case(true));
+    let records = diagnostics
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|error| panic!("invalid JSON diagnostic {line:?}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(!records.is_empty());
+    let events = records
+        .iter()
+        .filter_map(|record| record["fields"]["event"].as_str())
+        .collect::<Vec<_>>();
+    for event in [
+        "cli.command.started",
+        "run.started",
+        "stage.completed",
+        "provider.batch.completed",
+        "outbox.completed",
+        "run.completed",
+    ] {
+        assert!(events.contains(&event), "missing {event}: {diagnostics}");
+    }
+    assert!(records.iter().any(|record| {
+        record["fields"]["duration_ms"].is_number() && record["fields"]["status"].is_string()
+    }));
+}
+
+#[test]
 fn unknown_config_field_fails_before_database_side_effect() {
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -209,7 +573,7 @@ fn unknown_config_field_fails_before_database_side_effect() {
     fs::write(
         &config,
         format!(
-            "skill = '/tmp/old-skill'\n[[repo]]\npath = '{}'\nlanguages = ['zh-CN']\n[agents.fake]\ncmd = ['true']\n",
+            "skill = '/tmp/old-skill'\n[[repo]]\npath = '{}'\nlanguages = ['zh-CN']\n[agents.fake]\nprovider = 'fixture-provider'\nmodel = 'fixture-model'\nadapter = 'command-json-v1'\ncmd = ['true']\n",
             repo.display()
         ),
     )
@@ -246,6 +610,9 @@ target_pattern = "translations/{{lang}}/{{relpath}}"
 enabled = false
 source_ref = "HEAD"
 [agents.fixture]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
 cmd = ["true"]
 [routing]
 translate = "fixture"
@@ -302,6 +669,9 @@ target_pattern = "translations/{{lang}}/{{relpath}}"
 source_ref = "refs/heads/missing"
 
 [agents.fake]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
 cmd = ["true"]
 [routing]
 translate = "fake"
@@ -344,7 +714,7 @@ fn adopt_promotes_human_translation_and_discard_restores_it() {
     fs::write(
         &provider,
         format!(
-            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\nawk '/^--- SOURCE ---$/ {{ take=1; next }} /^--- END SOURCE ---$/ {{ take=0 }} take' | sed 's/Hello/你好/g'\n",
+            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\njq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(.task.source | gsub(\"Hello\";\"你好\"))}}'\n",
             counter = counter.display()
         ),
     )
@@ -370,6 +740,9 @@ proofread = false
 enabled = false
 source_ref = "HEAD"
 [agents.fixture]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
 cmd = ["{}"]
 timeout_s = 5
 [routing]
@@ -445,6 +818,17 @@ repair = "fixture"
     assert_eq!(reused.status.code(), Some(0));
     assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
     assert_eq!(fs::read_to_string(&target).unwrap(), "# 人工翻译 `fani`\n");
+    let database = Database::open(repo.join(".fani/fani.db")).unwrap();
+    let canonical_content: Vec<u8> = database
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT content FROM canonical_files WHERE locale='zh-CN' AND path='translations/zh-CN/docs/guide.md'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(canonical_content, human_translation.as_bytes());
 
     fs::write(&target, "# 删除了受保护代码\n").unwrap();
     let rejected = fani(&["adopt", "--config", config.to_str().unwrap()]);
@@ -483,7 +867,7 @@ fn killed_sync_recovers_agent_materialization_and_publication_without_duplicate_
     fs::write(
         &provider,
         format!(
-            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\nawk '/^--- SOURCE ---$/ {{ take=1; next }} /^--- END SOURCE ---$/ {{ take=0 }} take' | sed 's/Hello/你好/g'\n",
+            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\njq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(.task.source | gsub(\"Hello\";\"你好\"))}}'\n",
             counter = counter.display()
         ),
     )
@@ -517,6 +901,9 @@ remote = "origin"
 [repo.publish.github]
 enabled = false
 [agents.fixture]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
 cmd = ["{}"]
 timeout_s = 5
 retries = 0
@@ -682,6 +1069,67 @@ repair = "fixture"
         .unwrap();
     assert_eq!(publication_state.0, publication_state.1);
     assert!(publication_state.0 >= 1);
+    let unrelated_candidates: i64 = conn
+        .query_row(
+            r#"SELECT COUNT(*)
+               FROM translation_memory_entries tm
+               WHERE tm.tier='candidate' AND tm.locale='zh-CN'
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM publication_manifests pm
+                     JOIN publication_manifest_files pmf ON pmf.manifest_id=pm.id
+                     JOIN canonical_file_translations cft
+                       ON cft.canonical_content_version_id=pmf.canonical_content_version_id
+                     WHERE pm.candidate_commit=?1
+                       AND cft.translation_version_id=tm.translation_version_id
+                 )"#,
+            [&durable_publication_commit],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(unrelated_candidates >= 1);
+    drop(conn);
+    assert!(
+        database
+            .promote_merged_publication(
+                database
+                    .connect()
+                    .unwrap()
+                    .query_row("SELECT id FROM repositories LIMIT 1", [], |row| row.get(0))
+                    .unwrap(),
+                "zh-CN",
+                &durable_publication_commit,
+                "github_merged",
+            )
+            .unwrap()
+            >= 1
+    );
+    let conn = database.connect().unwrap();
+    let trusted_unrelated: i64 = conn
+        .query_row(
+            r#"SELECT COUNT(*)
+               FROM translation_memory_entries trusted
+               WHERE trusted.tier='trusted' AND trusted.locale='zh-CN'
+                 AND EXISTS (
+                     SELECT 1 FROM translation_memory_entries candidate
+                     WHERE candidate.tier='candidate'
+                       AND candidate.source_hash=trusted.source_hash
+                       AND candidate.locale=trusted.locale
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM publication_manifests pm
+                           JOIN publication_manifest_files pmf ON pmf.manifest_id=pm.id
+                           JOIN canonical_file_translations cft
+                             ON cft.canonical_content_version_id=pmf.canonical_content_version_id
+                           WHERE pm.candidate_commit=?1
+                             AND cft.translation_version_id=candidate.translation_version_id
+                       )
+                 )"#,
+            [&durable_publication_commit],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(trusted_unrelated, 0);
     drop(conn);
 
     write_config(false, true);
@@ -716,4 +1164,200 @@ repair = "fixture"
         .unwrap();
     assert_eq!(durable_revision_attempts, 1);
     database.integrity_check().unwrap();
+}
+
+struct DocumentationCheckCase {
+    _tmp: tempfile::TempDir,
+    repo: std::path::PathBuf,
+    config: std::path::PathBuf,
+    reports: std::path::PathBuf,
+    capture: std::path::PathBuf,
+}
+
+fn documentation_check_case(checker_body: &str, timeout_s: f64) -> DocumentationCheckCase {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("docs/guide.md"), "# Hello\n").unwrap();
+    run(&repo, &["init", "-q", "-b", "main"]);
+    run(&repo, &["config", "user.email", "test@example.invalid"]);
+    run(&repo, &["config", "user.name", "Test"]);
+    run(&repo, &["add", "."]);
+    run(&repo, &["commit", "-qm", "source"]);
+
+    let provider = tmp.path().join("provider.sh");
+    fs::write(
+        &provider,
+        r##"#!/bin/sh
+set -eu
+jq -c '{schema:"fani.agent.response.v1",task_id:.task.id,output:(.task.source | gsub("Hello";"你好"))}'
+"##,
+    )
+    .unwrap();
+    let checker = tmp.path().join("checker.sh");
+    fs::write(&checker, format!("#!/bin/sh\nset -eu\n{checker_body}\n")).unwrap();
+    for executable in [&provider, &checker] {
+        let mut permissions = fs::metadata(executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+    let capture = tmp.path().join("checked.md");
+    let config = tmp.path().join("fani.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[repo]]
+path = "{}"
+languages = ["zh-CN"]
+include = ["docs/**/*.md"]
+target_pattern = "translations/{{lang}}/{{relpath}}"
+repair_budget = 0
+[repo.quality]
+revision = false
+proofread = false
+[repo.documentation]
+commands = [["{}", "{}"]]
+timeout_s = {}
+[repo.publish]
+enabled = false
+source_ref = "HEAD"
+[agents.fixture]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
+cmd = ["{}"]
+timeout_s = 5
+retries = 0
+env_allow = ["FANI_TEST_PROVIDER_SECRET"]
+[routing]
+translate = "fixture"
+"#,
+            repo.display(),
+            checker.display(),
+            capture.display(),
+            timeout_s,
+            provider.display(),
+        ),
+    )
+    .unwrap();
+    let reports = tmp.path().join("reports");
+    DocumentationCheckCase {
+        _tmp: tmp,
+        repo,
+        config,
+        reports,
+        capture,
+    }
+}
+
+fn run_documentation_case(case: &DocumentationCheckCase) -> Output {
+    Command::new(assert_cmd::cargo::cargo_bin!("fani"))
+        .args([
+            "sync",
+            "--config",
+            case.config.to_str().unwrap(),
+            "--report-dir",
+            case.reports.to_str().unwrap(),
+            "--quiet",
+        ])
+        .env("FANI_TEST_PROVIDER_SECRET", "provider-only-secret")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn documentation_check_runs_successfully_without_provider_environment() {
+    let case = documentation_check_case(
+        r#"[ -z "${FANI_TEST_PROVIDER_SECRET:-}" ]
+[ "${FANI_DOCUMENTATION_CHECK:-}" = "1" ]
+test -f translations/zh-CN/docs/guide.md
+cp translations/zh-CN/docs/guide.md "$1""#,
+        5.0,
+    );
+    let output = run_documentation_case(&case);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(&case.capture).unwrap(),
+        b"# \xe4\xbd\xa0\xe5\xa5\xbd\n"
+    );
+}
+
+#[test]
+fn documentation_check_receives_exact_candidate_bytes() {
+    let case = documentation_check_case(
+        r#"sha256sum translations/zh-CN/docs/guide.md | cut -d' ' -f1 > "$1""#,
+        5.0,
+    );
+    let output = run_documentation_case(&case);
+    assert_eq!(output.status.code(), Some(0));
+    let candidate = fs::read(case.repo.join("translations/zh-CN/docs/guide.md")).unwrap();
+    let expected = format!("{:x}\n", sha2::Sha256::digest(&candidate));
+    assert_eq!(fs::read_to_string(&case.capture).unwrap(), expected);
+    assert_eq!(candidate, b"# \xe4\xbd\xa0\xe5\xa5\xbd\n");
+}
+
+#[test]
+fn nonzero_documentation_check_is_a_persisted_blocking_finding() {
+    let case = documentation_check_case("printf 'bad docs' >&2\nexit 7", 5.0);
+    let output = run_documentation_case(&case);
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(case.reports.join("report.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        report["languages"][0]["findings"][0]["code"],
+        "DOC-CHECK-FAILED"
+    );
+    assert!(
+        report["languages"][0]["published"]["commit"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    let database = Database::open(case.repo.join(".fani/fani.db")).unwrap();
+    let persisted: i64 = database
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE code='DOC-CHECK-FAILED' AND severity='error'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted, 1);
+}
+
+#[test]
+fn timed_out_documentation_check_is_a_blocking_finding() {
+    let case = documentation_check_case("sleep 5", 0.05);
+    let started = Instant::now();
+    let output = run_documentation_case(&case);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(case.reports.join("report.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        report["languages"][0]["findings"][0]["code"],
+        "DOC-CHECK-TIMEOUT"
+    );
+}
+
+#[test]
+fn unknown_documentation_check_config_fails_before_side_effects() {
+    let case = documentation_check_case("true", 5.0);
+    let text = fs::read_to_string(&case.config)
+        .unwrap()
+        .replace("commands =", "command =");
+    fs::write(&case.config, text).unwrap();
+    let output = fani(&["doctor", "--config", case.config.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unknown field `command`"));
+    assert!(!case.repo.join(".fani/fani.db").exists());
 }

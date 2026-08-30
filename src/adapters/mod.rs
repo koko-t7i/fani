@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod config;
 pub mod db;
+pub mod documentation;
 pub(crate) mod failpoint;
 pub mod github;
 pub mod gitout;

@@ -1,5 +1,7 @@
 # fani 0.3 native Markdown configuration.
 # Unknown fields are errors. Keep secrets out of this file.
+# Diagnostics are environment-controlled: FANI_LOG=info uses human stderr;
+# add FANI_LOG_FORMAT=json for newline-delimited JSON.
 
 [[repo]]
 path = "~/code/product-docs"
@@ -21,6 +23,14 @@ repair_budget = 2
 revision = true
 proofread = false
 
+# Each documentation check is an argv array, never a shell string. Commands run
+# without Agent/provider environment access in independent fixed-source staging.
+[repo.documentation]
+commands = [
+  ["mdbook", "build"],
+]
+timeout_s = 120
+
 [repo.publish]
 enabled = true
 source_ref = "origin/main"
@@ -38,6 +48,9 @@ required_checks = []
 # Agents read one prompt from stdin and return translated text on stdout.
 # Use {output_file} in argv for providers that write their final result to a file.
 [agents.primary]
+provider = "anthropic"
+model = "claude-configured-default"
+adapter = "command-json-v1"
 cmd = ["claude", "-p", "--output-format", "text"]
 concurrency = 4
 timeout_s = 300

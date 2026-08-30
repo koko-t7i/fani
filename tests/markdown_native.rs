@@ -202,7 +202,7 @@ fn representative_commonmark_gfm_corpus_is_byte_stable_and_protected() {
         assert!(
             units
                 .iter()
-                .all(|unit| &source[unit.range.clone()] == unit.source)
+                .all(|unit| source[unit.range.clone()] == unit.source)
         );
         assert!(
             units
@@ -355,7 +355,7 @@ fn prompts_make_the_native_engine_contract_explicit() {
         findings: Vec::new(),
         protected_tokens: vec!["@@FANI_PLACEHOLDER_0000_deadbeefdeadbeef@@".into()],
     });
-    assert!(rendered.starts_with("fani-native-markdown-prompt-v1"));
+    assert!(rendered.starts_with(prompts::PROMPT_VERSION));
     assert!(rendered.contains("Protected tokens:"));
 
     let prompt = prompts::translation_prompt(

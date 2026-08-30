@@ -1,0 +1,61 @@
+.TH FANI 1 "August 2026" "fani 0.3.0" "User Commands"
+.SH NAME
+fani \- continuous Markdown translation for Git and GitHub
+.SH SYNOPSIS
+.B fani
+.I COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+fani reads Markdown from an immutable Git revision, reuses trusted translation memory from SQLite, delegates unresolved units to an isolated command-line Agent, verifies assembled output, and can publish stable language branches and GitHub pull requests.
+.SH COMMANDS
+.TP
+.B sync
+Translate, verify, recover, materialize, and optionally publish pending work.
+.TP
+.B status
+Plan from an immutable Git revision without calling an Agent.
+.TP
+.B check
+Run the CI-friendly read-only planning and check path.
+.TP
+.B doctor
+Validate configuration and runtime prerequisites.
+.TP
+.B adopt
+Validate and adopt divergent human target files.
+.TP
+.B discard
+Restore canonical verified target files over divergent human edits.
+.SH OPTIONS
+.TP
+.BI --config " PATH"
+Use PATH as the configuration file. The default is fani.toml.
+.TP
+.BI --repo " NAME_OR_PATH"
+Select one configured repository.
+.TP
+.BI --lang " LANGUAGE"
+Select one configured language.
+.TP
+.BI --report-dir " PATH"
+Write sync reports under PATH.
+.TP
+.B --quiet
+Suppress sync progress and report-location output.
+.TP
+.BR -h , " --help"
+Print help.
+.TP
+.BR -V , " --version"
+Print the version.
+.SH EXIT STATUS
+0 means up to date or successfully completed; 1 means human action is required; 2 means an infrastructure or configuration error; 3 means a bounded batch completed with deferred work remaining.
+.SH FILES
+.TP
+.I fani.toml
+Configuration file.
+.TP
+.I <repo>/<data_dir>/fani.db
+Authoritative SQLite state for a configured repository.
+.SH SEE ALSO
+The annotated configuration example and systemd user units are included in the release archive.

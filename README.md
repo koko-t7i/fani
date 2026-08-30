@@ -11,6 +11,7 @@ The shipped binary is Rust. It has no Python, `uv`, external i18n skill, legacy 
 - **The Agent is untrusted:** it runs in an empty temporary directory with a temporary `HOME`, an environment allowlist, bounded I/O, an absolute timeout, and process-tree cleanup. It never receives a repository path or writes repository files.
 - **Markdown is assembled by byte range:** fenced code, inline code, links, HTML, and placeholders are protected by the native parser. Bytes outside translated ranges are preserved.
 - **Invalid output is blocked:** protected-token and Markdown-structure verification runs before canonical content is materialized or published.
+- **Project checks are deterministic:** configured documentation build/check argv arrays run after assembly and before publication in independent fixed-source staging containing the exact candidate target bytes. They have bounded time/output, process-tree cleanup, and no Agent/provider environment access.
 - **Publication is isolated:** a temporary Git index builds a candidate from the fixed source commit and a typed add/modify/delete allowlist. The checked-out branch, `HEAD`, real index, staged state, and unrelated worktree files remain unchanged.
 - **Trust is explicit:** only merged or explicitly adopted verified content is promoted to trusted translation memory.
 
@@ -24,20 +25,35 @@ The shipped binary is Rust. It has no Python, `uv`, external i18n skill, legacy 
 
 ## Install
 
+Source install:
+
 ```bash
 cargo install --path . --locked
 cp examples/fani.toml fani.toml
 fani doctor
 ```
 
+Tagged releases publish one `x86_64-unknown-linux-gnu` `.tar.xz` archive. The archive contains the `fani` binary, Bash/Zsh/Fish completions, the `fani(1)` man page, systemd user units, the annotated example configuration, and this README. Each archive has a SHA-256 sidecar; the release also contains a CycloneDX XML SBOM and GitHub artifact attestations for the final asset set.
+
+```bash
+sha256sum --check fani-x86_64-unknown-linux-gnu.tar.xz.sha256
+gh attestation verify fani-x86_64-unknown-linux-gnu.tar.xz --repo koko/fani
+```
+
+See [the release process and asset contract](docs/release.md) for verification, installation, and exact reproducibility scope. For the locked Rust 1.85.0, cargo-dist 0.32.0, cargo-cyclonedx 0.5.9, `x86_64-unknown-linux-gnu` contract, two isolated clean clones must produce byte-identical archives, checksums, and SBOMs, with matching binary hashes/build IDs, packaged asset bytes, and extracted metadata. Other targets, host/tool versions, source revisions, and lockfiles are outside this claim.
+
 Development checks:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --test reproducible_candidate
 cargo test --locked --all-targets
 cargo build --locked --release
+scripts/release/verify-reproducible-release.sh
 ```
+
+The `reproducible_candidate` end-to-end test creates a fixed local source repository and two independent clean clones with absent `.fani` databases and target caches. It invokes the built debug `fani` entry point in each environment with the same config and strict recorded JSON provider fixture, while inheriting the runner's `HOME`, Cargo/Rustup homes, XDG cache/config, and package state rather than redirecting them into test scratch space. The provider receives fani's isolated temporary `HOME` and an empty credential allowlist; sentinels fail the test if Python, `uv`, an external skill, or common network clients are invoked. The test verifies that SQLite is the only generated state authority, then requires equal candidate tree OIDs, raw tree bytes, target blob bytes, commit OIDs, and raw commit bytes.
 
 ## Commands
 
@@ -56,6 +72,17 @@ Common options:
 fani status --config ./fani.toml --repo product-docs --lang zh-CN
 fani sync --config ./fani.toml --report-dir ./reports --quiet
 ```
+
+## Diagnostics
+
+Structured diagnostics are written only to stderr and are opt-in with `FANI_LOG`. The default format is compact human-readable output; set `FANI_LOG_FORMAT=json` for newline-delimited JSON:
+
+```bash
+FANI_LOG=info fani sync --quiet
+FANI_LOG=info FANI_LOG_FORMAT=json fani sync --quiet
+```
+
+Diagnostics contain safe hashes/IDs, locale and stage names, durations, statuses, outbox IDs, and publication/provider metadata hashes. They never emit environment values, credentials, provider stderr, prompts, source Markdown, translations, protected tokens, or Agent request/response content. `--quiet` continues to suppress progress and report-location output; command errors and enabled diagnostics still use stderr. OpenTelemetry export is not included.
 
 ## Exit codes
 
@@ -78,7 +105,10 @@ A repository config defines:
 - target path pattern, languages, batch and repair bounds;
 - SQLite data directory;
 - optional bilingual revision and advisory proofread;
+- zero or more project-specific documentation build/check commands;
 - stable locale branch, remote push, and GitHub pull-request settings.
+
+Documentation checks are configured under `[repo.documentation]` as one or more argv arrays, for example `commands = [["mdbook", "build"], ["markdownlint", "docs/zh-CN"]]`. Shell strings are not accepted. Every command receives a fresh repository-independent staging tree checked out from the fixed source revision with the exact assembled candidate files overlaid. A nonzero exit or timeout is persisted and reported as a blocking finding, so publication does not start.
 
 An Agent config defines argv, concurrency, timeout, retries, enablement, and the exact environment variables copied into its isolated process. Secrets belong in the process environment, never in TOML.
 

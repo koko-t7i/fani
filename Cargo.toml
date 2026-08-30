@@ -1,3 +1,34 @@
+[workspace]
+resolver = "3"
+
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+allow-dirty = ["ci"]
+targets = ["x86_64-unknown-linux-gnu"]
+installers = []
+unix-archive = ".tar.xz"
+checksum = "sha256"
+source-tarball = false
+include = [
+    "release/completions/fani.bash",
+    "release/completions/_fani",
+    "release/completions/fani.fish",
+    "release/man/fani.1",
+    "systemd/fani.service",
+    "systemd/fani.timer",
+    "examples/fani.toml",
+]
+cargo-cyclonedx = true
+github-attestations = true
+github-attestations-phase = "host"
+
+[workspace.metadata.dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803"
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6"
+
 [package]
 name = "fani"
 version = "0.3.0"
@@ -5,6 +36,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Unattended documentation translation orchestrator"
 license = "MIT"
+repository = "https://github.com/koko/fani"
 
 [[bin]]
 name = "fani"
@@ -18,7 +50,7 @@ globset = "0.4"
 nix = { version = "0.30", features = ["fs", "process", "signal"] }
 pulldown-cmark = "0.13"
 regex = "1.11"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -26,6 +58,8 @@ strsim = "0.11"
 tempfile = "3.20"
 thiserror = "2.0"
 toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 wait-timeout = "0.2"
 
 [dev-dependencies]
@@ -36,3 +70,7 @@ predicates = "3.1"
 strip = true
 lto = "thin"
 codegen-units = 1
+
+[profile.dist]
+inherits = "release"
+lto = "thin"

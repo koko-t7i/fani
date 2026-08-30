@@ -159,7 +159,9 @@ pub fn discover(repo: &RepoConfig, source_revision: &str) -> Result<Vec<SourceDo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::settings::{GithubConfig, PublishConfig, QualityConfig};
+    use crate::application::settings::{
+        DocumentationConfig, GithubConfig, PublishConfig, QualityConfig,
+    };
     use std::fs;
     use tempfile::tempdir;
 
@@ -195,6 +197,7 @@ mod tests {
             max_tasks: 40,
             repair_budget: 2,
             quality: QualityConfig::default(),
+            documentation: DocumentationConfig::default(),
             publish: PublishConfig {
                 enabled: false,
                 branch: "i18n/{lang}".into(),

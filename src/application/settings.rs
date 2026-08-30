@@ -19,6 +19,24 @@ impl Default for QualityConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationConfig {
+    #[serde(default)]
+    pub commands: Vec<Vec<String>>,
+    #[serde(default = "default_documentation_timeout")]
+    pub timeout_s: f64,
+}
+
+impl Default for DocumentationConfig {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            timeout_s: default_documentation_timeout(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GithubConfig {
@@ -84,6 +102,8 @@ pub struct RepoConfig {
     #[serde(default)]
     pub quality: QualityConfig,
     #[serde(default)]
+    pub documentation: DocumentationConfig,
+    #[serde(default)]
     pub publish: PublishConfig,
 }
 
@@ -101,6 +121,9 @@ fn default_max_tasks() -> usize {
 }
 fn default_repair_budget() -> usize {
     2
+}
+fn default_documentation_timeout() -> f64 {
+    300.0
 }
 fn default_branch() -> String {
     "i18n/{lang}".into()

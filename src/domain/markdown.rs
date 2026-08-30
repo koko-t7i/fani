@@ -2,6 +2,7 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::OnceLock;
 use thiserror::Error;
@@ -515,8 +516,10 @@ fn short_hash(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     digest[..8]
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(16), |mut output, byte| {
+            write!(&mut output, "{byte:02x}").unwrap();
+            output
+        })
 }
 
 fn structure_signature(markdown: &str) -> Vec<String> {

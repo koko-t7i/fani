@@ -1,11 +1,54 @@
 use crate::application::settings::RepoConfig;
-use crate::domain::model::{AgentResult, AgentTask, Published, SourceDocument};
+use crate::domain::model::{
+    AgentResult, AgentTask, CanonicalTransition, Freshness, MemoryTier, PublicationState,
+    Published, ReviewState, SourceDocument, TranslationProvenance, ValidationState,
+};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+pub const AGENT_REQUEST_SCHEMA: &str = "fani.agent.request.v1";
+pub const AGENT_RESPONSE_SCHEMA: &str = "fani.agent.response.v1";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPrompt {
+    pub version: String,
+    pub resource: String,
+    pub hash: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPolicy {
+    pub fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRequestEnvelope {
+    pub schema: String,
+    pub task: AgentTask,
+    pub prompt: AgentPrompt,
+    pub policy: AgentPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResponseEnvelope {
+    pub schema: String,
+    pub task_id: String,
+    pub output: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentExecution {
     pub agent: String,
+    pub provider: String,
+    pub model: String,
+    pub adapter: String,
+    pub provider_fingerprint: String,
     pub results: Vec<AgentResult>,
 }
 
@@ -14,9 +57,47 @@ pub trait AgentExecutor: Send + Sync {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentationCheckFailure {
+    pub timed_out: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentationCheck {
+    pub failures: Vec<(usize, DocumentationCheckFailure)>,
+}
+
+pub trait DocumentationChecker {
+    fn check(
+        &self,
+        repo: &RepoConfig,
+        source_revision: &str,
+        files: &[PublicationFile],
+    ) -> Result<DocumentationCheck>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationFile {
     pub path: String,
     pub content: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicationManifestFile {
+    pub canonical_content_version_id: i64,
+    pub canonical_file_id: i64,
+    pub content_hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublicationManifestInput<'a> {
+    pub repository_id: i64,
+    pub run_id: &'a str,
+    pub locale: &'a str,
+    pub source_revision: &'a str,
+    pub candidate_commit: &'a str,
+    pub policy_fingerprint: &'a str,
+    pub files: &'a [PublicationManifestFile],
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +197,13 @@ pub struct AttemptInput<'a> {
     pub work_item_id: i64,
     pub dedupe_key: &'a str,
     pub agent: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub adapter: &'a str,
+    pub provider_fingerprint: &'a str,
+    pub prompt_version: &'a str,
+    pub prompt_hash: &'a str,
+    pub policy_fingerprint: &'a str,
     pub status: &'a str,
     pub request_json: &'a str,
     pub response_json: Option<&'a str>,
@@ -130,6 +218,8 @@ pub struct AttemptCandidateInput<'a> {
     pub candidate_key: &'a str,
     pub target_text: &'a str,
     pub score: Option<f64>,
+    pub policy_fingerprint: &'a str,
+    pub provenance: TranslationProvenance,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +237,7 @@ pub struct TrustTranslationInput<'a> {
     pub context_key: &'a str,
     pub target_text: &'a str,
     pub provenance: &'a str,
+    pub policy_fingerprint: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +266,12 @@ pub struct PullRequestStateInput<'a> {
 }
 
 #[derive(Clone, Debug)]
+pub struct CanonicalTranslationInput<'a> {
+    pub unit_id: i64,
+    pub target_text: &'a str,
+}
+
+#[derive(Clone, Debug)]
 pub struct CanonicalFileInput<'a> {
     pub repository_id: i64,
     pub locale: &'a str,
@@ -183,7 +280,13 @@ pub struct CanonicalFileInput<'a> {
     pub content: &'a [u8],
     pub content_hash: &'a str,
     pub materialized_hash: Option<&'a str>,
-    pub state: &'a str,
+    pub freshness: Freshness,
+    pub provenance: TranslationProvenance,
+    pub validation: ValidationState,
+    pub review: ReviewState,
+    pub publication: PublicationState,
+    pub trust_tier: MemoryTier,
+    pub policy_fingerprint: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,6 +306,7 @@ pub struct OutboxEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalFile {
     pub id: i64,
+    pub content_version_id: i64,
     pub source_revision: String,
     pub content: Vec<u8>,
     pub content_hash: String,
@@ -272,6 +376,7 @@ pub trait StateStore {
         invocation_key: &str,
         config_path: &Path,
         metadata_json: &str,
+        policy_fingerprint: &str,
     ) -> Result<String>;
     fn finish_run(&self, run_id: &str, status: &str) -> Result<bool>;
     fn enqueue_work_item(
@@ -289,6 +394,12 @@ pub trait StateStore {
         dedupe_key: &str,
     ) -> Result<Option<RecoveredAttempt>>;
     fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>>;
+    fn recoverable_candidate(
+        &self,
+        run_id: &str,
+        unit_id: i64,
+        locale: &str,
+    ) -> Result<Option<String>>;
     fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt>;
     fn record_attempt_candidate(&self, input: AttemptCandidateInput<'_>) -> Result<AttemptReceipt>;
     fn select_canonical_candidate(
@@ -308,10 +419,21 @@ pub trait StateStore {
         path: &str,
     ) -> Result<Option<CanonicalFile>>;
     fn upsert_canonical_file(&self, input: CanonicalFileInput<'_>) -> Result<i64>;
-    fn set_canonical_file_state(
+    fn persist_canonical_file(
+        &self,
+        input: CanonicalFileInput<'_>,
+        translations: &[CanonicalTranslationInput<'_>],
+    ) -> Result<CanonicalFile>;
+    fn record_canonical_file_translations(
+        &self,
+        canonical_file_id: i64,
+        translations: &[CanonicalTranslationInput<'_>],
+        locale: &str,
+    ) -> Result<usize>;
+    fn transition_canonical_file(
         &self,
         id: i64,
-        state: &str,
+        transition: CanonicalTransition,
         materialized_hash: Option<&str>,
     ) -> Result<()>;
     fn supersede_materializations(
@@ -372,10 +494,19 @@ pub trait StateStore {
         branch: &str,
     ) -> Result<Option<StoredPullRequest>>;
     fn record_pr_state(&self, input: PullRequestStateInput<'_>) -> Result<i64>;
-    fn promote_merged_locale(
+    fn record_publication_manifest(&self, input: PublicationManifestInput<'_>) -> Result<i64>;
+    fn transition_publication_manifest(
         &self,
         repository_id: i64,
         locale: &str,
+        candidate_commit: &str,
+        state: PublicationState,
+    ) -> Result<()>;
+    fn promote_merged_publication(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        candidate_commit: &str,
         provenance: &str,
     ) -> Result<usize>;
 }
