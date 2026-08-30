@@ -323,13 +323,15 @@ esac
         state = state.display(),
         log = log.display(),
     );
-    let mut file = fs::File::create(&executable).unwrap();
+    let staging = tmp.path().join("gh-fixture.sh.tmp");
+    let mut file = fs::File::create(&staging).unwrap();
     file.write_all(script.as_bytes()).unwrap();
     file.sync_all().unwrap();
     drop(file);
-    let mut permissions = fs::metadata(&executable).unwrap().permissions();
+    let mut permissions = fs::metadata(&staging).unwrap().permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&executable, permissions).unwrap();
+    fs::set_permissions(&staging, permissions).unwrap();
+    fs::rename(staging, &executable).unwrap();
 
     let branch = locale_branch("i18n/{lang}", "pt-BR").unwrap();
     assert_eq!(branch, "i18n/pt-BR");

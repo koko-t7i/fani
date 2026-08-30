@@ -7,249 +7,187 @@ use crate::application::ports::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+const APPLICATION_ID: i64 = 0x4641_4e49;
 const SCHEMA_VERSION: i64 = 1;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-const SCHEMA: &str = r#"
-CREATE TABLE state_schema (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    generation TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK (version > 0),
-    installed_at INTEGER NOT NULL
+#[derive(Clone, Copy)]
+struct Migration {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "0001_native_authority",
+    sql: include_str!("../../migrations/0001_native_authority.sql"),
+}];
+
+const MIGRATION_LEDGER_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY CHECK (version > 0),
+    name TEXT NOT NULL UNIQUE,
+    checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+    applied_at INTEGER NOT NULL
 ) STRICT;
-
-CREATE TABLE repositories (
-    id INTEGER PRIMARY KEY,
-    repository_key TEXT NOT NULL UNIQUE,
-    root_path TEXT NOT NULL UNIQUE,
-    default_branch TEXT,
-    remote_url TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-) STRICT;
-
-CREATE TABLE documents (
-    id INTEGER PRIMARY KEY,
-    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-    path TEXT NOT NULL,
-    source_revision TEXT,
-    content_hash TEXT NOT NULL,
-    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
-    deleted_at INTEGER,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE(repository_id, path)
-) STRICT;
-CREATE INDEX documents_repository ON documents(repository_id, deleted_at);
-
-CREATE TABLE units (
-    id INTEGER PRIMARY KEY,
-    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    unit_key TEXT NOT NULL,
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    source_text TEXT NOT NULL,
-    source_hash TEXT NOT NULL,
-    context_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(context_json)),
-    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE(document_id, unit_key)
-) STRICT;
-CREATE INDEX units_source_hash ON units(source_hash);
-
-CREATE TABLE trusted_translation_memory (
-    id INTEGER PRIMARY KEY,
-    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-    unit_id INTEGER REFERENCES units(id) ON DELETE SET NULL,
-    locale TEXT NOT NULL,
-    source_hash TEXT NOT NULL,
-    context_key TEXT NOT NULL DEFAULT '',
-    target_text TEXT NOT NULL,
-    provenance TEXT NOT NULL,
-    trusted_at INTEGER NOT NULL,
-    superseded_at INTEGER,
-    UNIQUE(repository_id, locale, source_hash, context_key)
-) STRICT;
-CREATE INDEX trusted_tm_lookup ON trusted_translation_memory(repository_id, locale, source_hash, superseded_at);
-
-CREATE TABLE runs (
-    id TEXT PRIMARY KEY,
-    repository_id INTEGER REFERENCES repositories(id) ON DELETE RESTRICT,
-    invocation_key TEXT UNIQUE,
-    config_path TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','ok','partial','needs_human','error','cancelled')),
-    started_at INTEGER NOT NULL,
-    heartbeat_at INTEGER NOT NULL,
-    finished_at INTEGER,
-    exit_code INTEGER,
-    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
-    CHECK ((finished_at IS NULL AND exit_code IS NULL) OR finished_at IS NOT NULL)
-) STRICT;
-CREATE INDEX runs_repository_status ON runs(repository_id, status, started_at);
-
-CREATE TABLE work_items (
-    id INTEGER PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE RESTRICT,
-    locale TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','succeeded','failed','cancelled')),
-    priority INTEGER NOT NULL DEFAULT 0,
-    input_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(input_json)),
-    result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE(run_id, unit_id, locale, kind)
-) STRICT;
-CREATE INDEX work_items_claim ON work_items(run_id, status, priority DESC, id);
-
-CREATE TABLE attempts (
-    id INTEGER PRIMARY KEY,
-    work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-    dedupe_key TEXT NOT NULL,
-    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
-    agent TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('started','succeeded','failed','timed_out','cancelled')),
-    request_json TEXT NOT NULL CHECK (json_valid(request_json)),
-    response_json TEXT CHECK (response_json IS NULL OR json_valid(response_json)),
-    error TEXT,
-    started_at INTEGER NOT NULL,
-    finished_at INTEGER,
-    UNIQUE(work_item_id, dedupe_key),
-    UNIQUE(work_item_id, attempt_no)
-) STRICT;
-CREATE INDEX attempts_work_item ON attempts(work_item_id, id);
-
-CREATE TABLE findings (
-    id INTEGER PRIMARY KEY,
-    work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-    attempt_id INTEGER REFERENCES attempts(id) ON DELETE CASCADE,
-    fingerprint TEXT NOT NULL,
-    severity TEXT NOT NULL CHECK (severity IN ('info','warning','error','blocking')),
-    code TEXT NOT NULL,
-    message TEXT NOT NULL,
-    details_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(details_json)),
-    resolved_at INTEGER,
-    created_at INTEGER NOT NULL,
-    UNIQUE(work_item_id, fingerprint)
-) STRICT;
-
-CREATE TABLE canonical_candidates (
-    id INTEGER PRIMARY KEY,
-    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    locale TEXT NOT NULL,
-    candidate_key TEXT NOT NULL,
-    target_text TEXT NOT NULL,
-    source_attempt_id INTEGER REFERENCES attempts(id) ON DELETE SET NULL,
-    score REAL,
-    selected INTEGER NOT NULL DEFAULT 0 CHECK (selected IN (0, 1)),
-    created_at INTEGER NOT NULL,
-    UNIQUE(unit_id, locale, candidate_key)
-) STRICT;
-CREATE UNIQUE INDEX one_selected_candidate ON canonical_candidates(unit_id, locale) WHERE selected = 1;
-
-CREATE TABLE canonical_files (
-    id INTEGER PRIMARY KEY,
-    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-    locale TEXT NOT NULL,
-    path TEXT NOT NULL,
-    source_revision TEXT NOT NULL,
-    content BLOB NOT NULL,
-    content_hash TEXT NOT NULL,
-    materialized_hash TEXT,
-    state TEXT NOT NULL DEFAULT 'candidate' CHECK (state IN ('candidate','materialized','human_edit','adopted','published','merged')),
-    updated_at INTEGER NOT NULL,
-    UNIQUE(repository_id, locale, path)
-) STRICT;
-CREATE INDEX canonical_files_state ON canonical_files(repository_id, locale, state);
-
-CREATE TABLE materialization_outbox (
-    id INTEGER PRIMARY KEY,
-    work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-    dedupe_key TEXT NOT NULL UNIQUE,
-    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
-    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','processing','done')),
-    available_at INTEGER NOT NULL,
-    owner TEXT,
-    lease_expires_at INTEGER,
-    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-    last_error TEXT,
-    created_at INTEGER NOT NULL,
-    completed_at INTEGER,
-    CHECK ((state = 'processing') = (owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
-    CHECK ((state = 'done') = (completed_at IS NOT NULL))
-) STRICT;
-CREATE INDEX materialization_ready ON materialization_outbox(state, available_at, id);
-
-CREATE TABLE publication_outbox (
-    id INTEGER PRIMARY KEY,
-    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-    run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
-    locale TEXT NOT NULL,
-    dedupe_key TEXT NOT NULL UNIQUE,
-    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
-    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','processing','done')),
-    available_at INTEGER NOT NULL,
-    owner TEXT,
-    lease_expires_at INTEGER,
-    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-    last_error TEXT,
-    created_at INTEGER NOT NULL,
-    completed_at INTEGER,
-    CHECK ((state = 'processing') = (owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
-    CHECK ((state = 'done') = (completed_at IS NOT NULL))
-) STRICT;
-CREATE INDEX publication_ready ON publication_outbox(state, available_at, id);
-
-CREATE TABLE pull_requests (
-    id INTEGER PRIMARY KEY,
-    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-    provider TEXT NOT NULL,
-    external_id TEXT NOT NULL,
-    number INTEGER,
-    branch TEXT NOT NULL,
-    url TEXT,
-    state TEXT NOT NULL CHECK (state IN ('draft','open','merged','closed')),
-    head_revision TEXT,
-    opened_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    closed_at INTEGER,
-    UNIQUE(repository_id, provider, external_id)
-) STRICT;
-
-CREATE TABLE pr_events (
-    id INTEGER PRIMARY KEY,
-    pull_request_id INTEGER NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
-    event_key TEXT NOT NULL,
-    from_state TEXT,
-    to_state TEXT NOT NULL CHECK (to_state IN ('draft','open','merged','closed')),
-    payload_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
-    occurred_at INTEGER NOT NULL,
-    UNIQUE(pull_request_id, event_key)
-) STRICT;
-
-CREATE TABLE leases (
-    resource_type TEXT NOT NULL,
-    resource_key TEXT NOT NULL,
-    owner TEXT NOT NULL,
-    fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
-    acquired_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    PRIMARY KEY(resource_type, resource_key),
-    CHECK (expires_at > acquired_at)
-) WITHOUT ROWID, STRICT;
-CREATE INDEX leases_expiry ON leases(expires_at);
-
-INSERT INTO state_schema(singleton, generation, version, installed_at)
-VALUES (1, 'native-authoritative', 1, unixepoch('subsec') * 1000);
-PRAGMA user_version = 1;
 "#;
+
+fn migration_checksum(sql: &str) -> String {
+    format!("{:x}", Sha256::digest(sql.as_bytes()))
+}
+
+fn configure_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "journal_mode", "DELETE")?;
+    Ok(())
+}
+
+fn open_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("cannot open SQLite database {}", path.display()))?;
+    configure_connection(&conn)?;
+    Ok(conn)
+}
+
+fn application_id(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA application_id", [], |row| row.get(0))?)
+}
+
+fn user_table_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn has_table(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
+fn validate_migration_list(migrations: &[Migration]) -> Result<()> {
+    for (index, migration) in migrations.iter().enumerate() {
+        let expected = index as i64 + 1;
+        if migration.version != expected {
+            bail!(
+                "migration {} has version {}; expected contiguous version {expected}",
+                migration.name,
+                migration.version
+            );
+        }
+        if !migration
+            .name
+            .starts_with(&format!("{:04}_", migration.version))
+        {
+            bail!(
+                "migration name {:?} must start with {:04}_",
+                migration.name,
+                migration.version
+            );
+        }
+    }
+    Ok(())
+}
+
+fn apply_migrations(conn: &mut Connection, migrations: &[Migration]) -> Result<()> {
+    validate_migration_list(migrations)?;
+    let app_id = application_id(conn)?;
+    let tables = user_table_count(conn)?;
+    if app_id == 0 {
+        if tables != 0 {
+            bail!(
+                "unsupported pre-native SQLite database; reset it explicitly to initialize the native schema"
+            );
+        }
+    } else if app_id != APPLICATION_ID {
+        bail!(
+            "SQLite application_id {app_id:#x} does not identify a fani database ({APPLICATION_ID:#x})"
+        );
+    } else if tables != 0 && !has_table(conn, "schema_migrations")? {
+        bail!("fani database is missing the schema_migrations ledger; reset it explicitly");
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if app_id == 0 {
+        tx.pragma_update(None, "application_id", APPLICATION_ID)?;
+    }
+    tx.execute_batch(MIGRATION_LEDGER_SQL)?;
+
+    let applied = {
+        let mut statement =
+            tx.prepare("SELECT version,name,checksum FROM schema_migrations ORDER BY version")?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (index, (version, name, checksum)) in applied.iter().enumerate() {
+        let expected_version = index as i64 + 1;
+        if *version != expected_version {
+            bail!(
+                "database migration history is not contiguous: found version {version}; expected {expected_version}"
+            );
+        }
+        let migration = migrations
+            .get(index)
+            .filter(|migration| migration.version == *version)
+            .ok_or_else(|| anyhow!("database contains unknown migration {version} ({name})"))?;
+        let expected_checksum = migration_checksum(migration.sql);
+        if name != migration.name || checksum != &expected_checksum {
+            bail!(
+                "migration {version} checksum/name mismatch: database has {name} {checksum}, binary expects {} {expected_checksum}",
+                migration.name
+            );
+        }
+    }
+
+    for (offset, migration) in migrations.iter().skip(applied.len()).enumerate() {
+        let expected_version = applied.len() as i64 + offset as i64 + 1;
+        if migration.version != expected_version {
+            bail!("database migration history is not contiguous at version {expected_version}");
+        }
+        tx.execute_batch(migration.sql)
+            .with_context(|| format!("migration {} failed", migration.name))?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES (?1,?2,?3,?4)",
+            params![
+                migration.version,
+                migration.name,
+                migration_checksum(migration.sql),
+                Utc::now().timestamp_millis()
+            ],
+        )?;
+        tx.pragma_update(None, "user_version", migration.version)?;
+    }
+
+    let latest = migrations.last().map_or(0, |migration| migration.version);
+    let user_version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version != latest {
+        bail!("SQLite user_version is {user_version}; expected migration version {latest}");
+    }
+    tx.commit()?;
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct Database {
@@ -283,12 +221,13 @@ impl Database {
     }
 
     pub fn connect(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.path)
-            .with_context(|| format!("cannot open SQLite database {}", self.path.display()))?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.pragma_update(None, "journal_mode", "DELETE")?;
+        let conn = open_connection(&self.path)?;
+        let actual = application_id(&conn)?;
+        if actual != APPLICATION_ID {
+            bail!(
+                "SQLite application_id {actual:#x} does not identify a fani database ({APPLICATION_ID:#x})"
+            );
+        }
         Ok(conn)
     }
 
@@ -304,6 +243,12 @@ impl Database {
         )
         .with_context(|| format!("cannot open SQLite database {} read-only", source.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        let actual = application_id(&conn)?;
+        if actual != APPLICATION_ID {
+            bail!(
+                "cannot snapshot SQLite application_id {actual:#x}; expected fani {APPLICATION_ID:#x}"
+            );
+        }
         conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
             .with_context(|| {
                 format!(
@@ -316,47 +261,53 @@ impl Database {
     }
 
     pub fn migrate(&self) -> Result<()> {
-        let mut conn = self.connect()?;
-        let initialized: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='state_schema')",
-            [],
-            |row| row.get(0),
-        )?;
-        if initialized {
-            let marker: Option<(String, i64)> = conn
-                .query_row(
-                    "SELECT generation, version FROM state_schema WHERE singleton=1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            match marker {
-                Some((generation, SCHEMA_VERSION)) if generation == "native-authoritative" => {
-                    return Ok(());
+        let mut conn = open_connection(&self.path)?;
+        apply_migrations(&mut conn, MIGRATIONS)?;
+        let marker: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT generation,version FROM state_schema WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match marker {
+            Some((generation, SCHEMA_VERSION)) if generation == "native-authoritative" => Ok(()),
+            Some((generation, version)) => bail!(
+                "unsupported database schema {generation} version {version}; reset it explicitly"
+            ),
+            None => bail!("database has an invalid state_schema marker"),
+        }
+    }
+
+    pub fn reset(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if path.exists() {
+            let conn = open_connection(&path)?;
+            let app_id = application_id(&conn)?;
+            let tables = user_table_count(&conn)?;
+            if app_id != APPLICATION_ID && !(app_id == 0 && tables == 0) {
+                bail!(
+                    "refusing to reset SQLite database with application_id {app_id:#x}; expected {APPLICATION_ID:#x}"
+                );
+            }
+            drop(conn);
+            for candidate in [
+                path.clone(),
+                PathBuf::from(format!("{}-wal", path.display())),
+                PathBuf::from(format!("{}-shm", path.display())),
+            ] {
+                match fs::remove_file(&candidate) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("cannot reset fani database {}", candidate.display())
+                        });
+                    }
                 }
-                Some((generation, version)) => {
-                    bail!(
-                        "unsupported database schema {generation} version {version}; remove the experimental database to initialize the native schema"
-                    )
-                }
-                None => bail!("database has an invalid state_schema marker"),
             }
         }
-        let existing_tables: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
-        )?;
-        if existing_tables != 0 {
-            bail!(
-                "unsupported pre-native SQLite database; remove it to initialize the native schema"
-            );
-        }
-
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(SCHEMA)?;
-        tx.commit()?;
-        Ok(())
+        Self::open(path)
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -1708,6 +1659,58 @@ impl StateStore for Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_migration_rolls_back_schema_ledger_and_header_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollback.db");
+        let mut conn = open_connection(&path).unwrap();
+        let migrations = [Migration {
+            version: 1,
+            name: "0001_invalid",
+            sql: "CREATE TABLE partially_applied(id INTEGER); INVALID SQL;",
+        }];
+
+        let error = apply_migrations(&mut conn, &migrations).unwrap_err();
+        assert!(error.to_string().contains("migration 0001_invalid failed"));
+        assert_eq!(application_id(&conn).unwrap(), 0);
+        assert_eq!(user_table_count(&conn).unwrap(), 0);
+        assert!(!has_table(&conn, "schema_migrations").unwrap());
+        assert!(!has_table(&conn, "partially_applied").unwrap());
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 0);
+    }
+
+    #[test]
+    fn migration_history_gaps_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gap.db");
+        let mut conn = open_connection(&path).unwrap();
+        let migrations = [
+            Migration {
+                version: 1,
+                name: "0001_first",
+                sql: "CREATE TABLE first(id INTEGER);",
+            },
+            Migration {
+                version: 2,
+                name: "0002_second",
+                sql: "CREATE TABLE second(id INTEGER);",
+            },
+        ];
+        apply_migrations(&mut conn, &migrations).unwrap();
+        conn.execute("DELETE FROM schema_migrations WHERE version=1", [])
+            .unwrap();
+
+        let error = apply_migrations(&mut conn, &migrations).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("database migration history is not contiguous")
+        );
+    }
 
     #[test]
     fn process_owners_detect_pid_reuse_by_start_time() {

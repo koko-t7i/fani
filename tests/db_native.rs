@@ -85,6 +85,108 @@ fn schema_enforces_pragmas_integrity_and_foreign_keys() {
 }
 
 #[test]
+fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
+    use sha2::{Digest, Sha256};
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fani.db");
+    let db = Database::open(&path).unwrap();
+    let conn = db.connect().unwrap();
+    let application_id: i64 = conn
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .unwrap();
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let migration: (i64, String, String) = conn
+        .query_row(
+            "SELECT version,name,checksum FROM schema_migrations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let expected = format!(
+        "{:x}",
+        Sha256::digest(include_str!("../migrations/0001_native_authority.sql").as_bytes())
+    );
+    assert_eq!(application_id, 0x4641_4e49);
+    assert_eq!(user_version, 1);
+    assert_eq!(migration, (1, "0001_native_authority".into(), expected));
+    drop(conn);
+    drop(db);
+
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 1);
+    let count: i64 = reopened
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn migration_checksum_tampering_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fani.db");
+    let db = Database::open(&path).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE schema_migrations SET checksum=?1 WHERE version=1",
+            ["0".repeat(64)],
+        )
+        .unwrap();
+    drop(db);
+
+    let error = Database::open(&path).unwrap_err();
+    assert!(
+        error.to_string().contains("checksum/name mismatch"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn reset_only_reinitializes_identified_fani_databases() {
+    let temp = tempfile::tempdir().unwrap();
+    let fani_path = temp.path().join("fani.db");
+    let db = Database::open(&fani_path).unwrap();
+    db.upsert_repository("docs", &temp.path().join("repo"), None, None)
+        .unwrap();
+    drop(db);
+
+    let reset = Database::reset(&fani_path).unwrap();
+    let repositories: i64 = reset
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(repositories, 0);
+
+    let unrelated_path = temp.path().join("unrelated.db");
+    let unrelated = rusqlite::Connection::open(&unrelated_path).unwrap();
+    unrelated
+        .execute("CREATE TABLE personal_data(value TEXT)", [])
+        .unwrap();
+    drop(unrelated);
+    assert!(
+        Database::open(&unrelated_path)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported pre-native")
+    );
+    assert!(
+        Database::reset(&unrelated_path)
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to reset")
+    );
+    assert!(unrelated_path.exists());
+}
+
+#[test]
 fn attempt_recording_is_idempotent_by_work_item_and_dedupe_key() {
     let fixture = fixture();
     let first = fixture
