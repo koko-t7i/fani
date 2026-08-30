@@ -154,7 +154,10 @@ fn cargo_dist_is_linux_gnu_only_and_pins_release_inputs() {
     for required in [
         "cargo-dist-version = \"0.32.0\"",
         "targets = [\"x86_64-unknown-linux-gnu\"]",
+        "installers = [\"shell\"]",
+        "install-path = \"~/.local/bin\"",
         "checksum = \"sha256\"",
+        "repository = \"https://github.com/koko-t7i/fani\"",
         "source-tarball = false",
         "cargo-cyclonedx = true",
         "github-attestations = true",
@@ -180,6 +183,18 @@ fn cargo_dist_is_linux_gnu_only_and_pins_release_inputs() {
 }
 
 #[test]
+fn readme_uses_a_human_facing_prebuilt_install_path() {
+    let readme = fs::read_to_string(root().join("README.md")).unwrap();
+    assert!(readme.contains("For Intel/AMD 64-bit Linux with glibc 2.31 or newer:"));
+    assert!(
+        readme.contains(
+            "https://github.com/koko-t7i/fani/releases/latest/download/fani-installer.sh"
+        )
+    );
+    assert!(!readme.contains("x86_64-unknown-linux-gnu"));
+}
+
+#[test]
 fn release_workflow_has_least_privilege_pinned_provenance_and_gates() {
     let workflows = root().join(".github/workflows");
     let release = fs::read_to_string(workflows.join("release.yml")).unwrap();
@@ -190,6 +205,7 @@ fn release_workflow_has_least_privilege_pinned_provenance_and_gates() {
         "\"id-token\": \"write\"",
         "subject-path: |\n            artifacts/*",
         "cargo install --locked cargo-cyclonedx@0.5.9",
+        "Install checksum-verified dist",
         "scripts/release/install-reproducible-dist.sh",
         "scripts/release/build-reproducible-release.sh local",
         "scripts/release/build-reproducible-release.sh global",
@@ -203,10 +219,14 @@ fn release_workflow_has_least_privilege_pinned_provenance_and_gates() {
     assert_eq!(release.matches("\"attestations\": \"write\"").count(), 1);
     assert!(!release.contains("ubuntu-latest"));
     assert!(!release.contains("actions/cache"));
+    assert!(!release.contains("cargo-dist-installer.sh"));
+    assert!(!release.contains("run: ${{ matrix.install_dist.run }}"));
+    assert_eq!(release.matches("GH_TOKEN:").count(), 2);
 
     for script in [
         "install-reproducible-dist.sh",
         "build-reproducible-release.sh",
+        "verify-installer.sh",
         "verify-reproducible-release.sh",
     ] {
         let source = fs::read_to_string(root().join("scripts/release").join(script)).unwrap();
@@ -226,10 +246,25 @@ fn release_workflow_has_least_privilege_pinned_provenance_and_gates() {
     ] {
         assert!(installer.contains(required), "missing {required}");
     }
+    let build =
+        fs::read_to_string(root().join("scripts/release/build-reproducible-release.sh")).unwrap();
+    assert!(build.contains("scripts/release/verify-installer.sh"));
+    let installer_verifier =
+        fs::read_to_string(root().join("scripts/release/verify-installer.sh")).unwrap();
+    for required in [
+        "_checksum_style=\"sha256\"",
+        "_checksum_value=",
+        "github.com/koko-t7i/fani/releases/download/",
+        "_install_dir=\"$INFERRED_HOME/.local/bin\"",
+    ] {
+        assert!(installer_verifier.contains(required), "missing {required}");
+    }
     let verifier =
         fs::read_to_string(root().join("scripts/release/verify-reproducible-release.sh")).unwrap();
     for required in [
         "git clone --quiet --local --no-hardlinks",
+        "fani-installer.sh",
+        "installer_sha256=",
         "fani-x86_64-unknown-linux-gnu.tar.xz",
         "fani.cdx.xml",
         "binary-sha256.txt",

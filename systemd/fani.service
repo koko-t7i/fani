@@ -10,7 +10,7 @@
 
 [Unit]
 Description=Translate documentation that is out of date
-Documentation=https://github.com/koko/fani
+Documentation=https://github.com/koko-t7i/fani
 # Built-in providers require the network; custom Agents may also require it.
 After=network-online.target
 
