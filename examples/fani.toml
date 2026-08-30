@@ -1,92 +1,53 @@
-# fani configuration. Copy this next to your repositories and edit the paths.
-#
-# Rule of thumb: this file decides *what* gets translated and *by whom*. It
-# never contains secrets — agent CLIs read their API keys from the environment.
-
-# The i18n skill directory: the one containing scripts/run.sh.
-skill = "~/.claude/skills/i18n"
-
-
-# --- repositories ------------------------------------------------------------
-# One [[repo]] block per repository. Everything except path and languages has a
-# working default.
+# fani 0.3 native Markdown configuration.
+# Unknown fields are errors. Keep secrets out of this file.
 
 [[repo]]
 path = "~/code/product-docs"
 languages = ["zh-CN", "ja"]
 
-# Which sources to consider. Empty means "every Markdown file the skill finds".
-paths = ["docs/**/*.md", "README.md"]
+# Git blob paths at the fixed source revision.
+include = ["docs/**/*.md", "README.md"]
 exclude = ["docs/archive/**", "CHANGELOG.md"]
 
-# Shared state directory, relative to the repository. The external skill keeps
-# translation memory JSON here; fani keeps local run history in fani.db.
-state_dir = ".claude/i18n"
+# fani.db is the sole fani-owned state authority.
+data_dir = ".fani"
 
-# Chunks per run. A run that hits this ceiling exits 3 (partial) and the next
-# run continues where it stopped; lower it to keep individual runs short.
+# Both tokens are required. {relpath} is the source path.
+target_pattern = "docs/{lang}/{relpath}"
 max_tasks = 40
-
-# How many times a failed structural check may be sent back to the agent
-# before the run stops and asks for a human.
 repair_budget = 2
 
-# Stop the run when a repository that already has translations suddenly needs
-# this many fresh chunks. That normally means the translation memory was lost,
-# and continuing would re-translate — and re-bill — everything.
-full_retranslate_guard = 30
+[repo.quality]
+revision = true
+proofread = false
 
-# Where translations are committed. The branch is reused across runs, so one
-# pull request per language accumulates the work instead of one per run.
+[repo.publish]
+enabled = true
+source_ref = "origin/main"
 branch = "i18n/{lang}"
-commit = true
 push = false
 remote = "origin"
 
-# Optional quality passes, off by default. revision reads source and
-# translation together and can block a run; proofread runs as advisory only.
-[repo.stages]
-revision = false
-proofread = false
+[repo.publish.github]
+enabled = false
+repository = "owner/product-docs"
+base = "main"
+draft = false
+required_checks = []
 
-
-[[repo]]
-path = "~/code/handbook"
-languages = ["zh-CN"]
-# A repository you only want translated, never committed to: fani writes the
-# files and leaves them in the working tree for you.
-commit = false
-
-
-# --- agents ------------------------------------------------------------------
-# Each agent is a headless CLI that reads a prompt on stdin and prints the
-# answer on stdout. If yours writes to a file instead, put {output_file} in the
-# command and fani will pass a temporary path and read it back.
-
-[agents.claude]
+# Agents read one prompt from stdin and return translated text on stdout.
+# Use {output_file} in argv for providers that write their final result to a file.
+[agents.primary]
 cmd = ["claude", "-p", "--output-format", "text"]
-stages = ["translate", "revision"]
-concurrency = 6
+concurrency = 4
 timeout_s = 300
 retries = 2
-
-[agents.codex]
-cmd = ["codex", "exec", "--output-last-message", "{output_file}", "-"]
-stages = ["translate"]
-concurrency = 4
-enabled = false
-
-[agents.grok]
-cmd = ["grok", "--no-tui", "--prompt-file", "-"]
-stages = ["proofread"]
-concurrency = 3
-enabled = false
-
-
-# --- routing -----------------------------------------------------------------
-# Which agent handles which stage. Omit a stage to let fani pick any enabled
-# agent that lists it.
+enabled = true
+# Only named variables are copied into the isolated Agent environment.
+env_allow = ["ANTHROPIC_API_KEY"]
 
 [routing]
-translate = "claude"
-revision = "claude"
+translate = "primary"
+repair = "primary"
+revision = "primary"
+proofread = "primary"

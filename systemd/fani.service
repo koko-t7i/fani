@@ -27,7 +27,7 @@ EnvironmentFile=-%h/.config/fani/env
 # should not hold the schedule forever.
 TimeoutStartSec=2h
 
-# Explicitly terminate every Agent/skill descendant when the service stops.
+# Explicitly terminate every Agent provider descendant when the service stops.
 KillMode=control-group
 
 # Exit codes are the interface: 0 nothing to do or done, 1 needs a human,

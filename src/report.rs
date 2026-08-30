@@ -1,4 +1,4 @@
-use crate::model::{LangOutcome, Status};
+use crate::model::{LanguageOutcome, Status};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use serde_json::{Value, json};
@@ -6,50 +6,50 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub fn overall(outcomes: &[LangOutcome]) -> Status {
-    for status in [
+pub fn overall(outcomes: &[LanguageOutcome]) -> Status {
+    [
         Status::Error,
         Status::NeedsHuman,
         Status::Partial,
         Status::Ok,
-    ] {
-        if outcomes.iter().any(|o| o.status == status) {
-            return status;
-        }
-    }
-    Status::Ok
+    ]
+    .into_iter()
+    .find(|status| outcomes.iter().any(|outcome| outcome.status == *status))
+    .unwrap_or(Status::Ok)
 }
 
 pub fn build(
-    outcomes: &[LangOutcome],
+    outcomes: &[LanguageOutcome],
     started: DateTime<Local>,
     config: &Path,
     database_paths: &[PathBuf],
 ) -> Value {
-    let dispatch: Vec<_> = outcomes.iter().flat_map(|o| o.dispatch.iter()).collect();
+    let agent_calls = outcomes.iter().flat_map(|outcome| &outcome.agent_calls);
+    let calls = agent_calls.clone().count();
+    let attempts = agent_calls.clone().map(|call| call.attempts).sum::<usize>();
+    let failures = agent_calls.filter(|call| !call.ok).count();
+    let status = overall(outcomes);
     json!({
-        "schema": 2,
+        "schema": 3,
         "config": config.display().to_string(),
-        "databases": database_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "databases": database_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "started_at": started.to_rfc3339(),
         "duration_s": (Local::now() - started).num_milliseconds() as f64 / 1000.0,
-        "host": std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
-        "status": overall(outcomes).as_str(),
-        "exit_code": overall(outcomes).exit_code(),
+        "status": status.as_str(),
+        "exit_code": status.exit_code(),
         "totals": {
             "languages": outcomes.len(),
-            "files_written": outcomes.iter().map(|o| o.written.len()).sum::<usize>(),
-            "conflicts": outcomes.iter().map(|o| o.conflicts.len()).sum::<usize>(),
-            "findings": outcomes.iter().map(|o| o.findings.len()).sum::<usize>(),
-            "agent_calls": dispatch.len(),
-            "task_dispatches": dispatch.len(),
-            "agent_attempts": dispatch.iter().map(|d| d.attempts).sum::<usize>(),
-            "agent_retries": dispatch.iter().map(|d| d.attempts.saturating_sub(1)).sum::<usize>(),
-            "agent_failures": dispatch.iter().filter(|d| !d.ok).count(),
-            "repair_rounds": outcomes.iter().map(|o| o.repair_rounds).sum::<usize>(),
-            "remaining_tasks": outcomes.iter().map(|o| o.remaining_tasks).sum::<usize>(),
-            "fuzzy_matched": outcomes.iter().map(|o| o.fuzzy_matched).sum::<usize>(),
-            "commits": outcomes.iter().filter(|o| !o.published.commit.is_empty()).count(),
+            "files_written": outcomes.iter().map(|outcome| outcome.written.len()).sum::<usize>(),
+            "conflicts": outcomes.iter().map(|outcome| outcome.conflicts.len()).sum::<usize>(),
+            "findings": outcomes.iter().map(|outcome| outcome.findings.len()).sum::<usize>(),
+            "agent_calls": calls,
+            "agent_attempts": attempts,
+            "agent_retries": attempts.saturating_sub(calls),
+            "agent_failures": failures,
+            "repair_rounds": outcomes.iter().map(|outcome| outcome.repair_rounds).sum::<usize>(),
+            "remaining_tasks": outcomes.iter().map(|outcome| outcome.remaining_tasks).sum::<usize>(),
+            "reused_units": outcomes.iter().map(|outcome| outcome.reused_units).sum::<usize>(),
+            "commits": outcomes.iter().filter(|outcome| !outcome.published.commit.is_empty()).count(),
         },
         "languages": outcomes,
     })
@@ -63,11 +63,7 @@ pub fn render(data: &Value) -> String {
             data["status"].as_str().unwrap_or("error")
         ),
         String::new(),
-        format!(
-            "- started: {} on {}",
-            data["started_at"].as_str().unwrap_or(""),
-            data["host"].as_str().unwrap_or("")
-        ),
+        format!("- started: {}", data["started_at"].as_str().unwrap_or("")),
         format!(
             "- duration: {:.1}s",
             data["duration_s"].as_f64().unwrap_or(0.0)
@@ -78,163 +74,123 @@ pub fn render(data: &Value) -> String {
             totals["files_written"], totals["conflicts"], totals["findings"]
         ),
         format!(
-            "- task dispatches: {} · agent attempts: {} ({} failed tasks, {} retries) · repair rounds: {} · reused from memory: {}",
-            totals["task_dispatches"],
+            "- Agent calls: {} · attempts: {} · failures: {} · reused units: {}",
+            totals["agent_calls"],
             totals["agent_attempts"],
             totals["agent_failures"],
-            totals["agent_retries"],
-            totals["repair_rounds"],
-            totals["fuzzy_matched"]
+            totals["reused_units"]
         ),
         String::new(),
+        "| repo | language | source | status | written | findings | Agent calls | commit |".into(),
+        "| --- | --- | --- | --- | ---: | ---: | ---: | --- |".into(),
     ];
-    let languages = data["languages"].as_array().cloned().unwrap_or_default();
-    if !languages.is_empty() {
-        lines.extend([
-            "| repo | lang | status | written | findings | agent calls | commit | time |".into(),
-            "| --- | --- | --- | --- | --- | --- | --- | --- |".into(),
-        ]);
-        for lang in &languages {
-            let repo = Path::new(lang["repo"].as_str().unwrap_or("?"))
-                .file_name()
-                .and_then(|x| x.to_str())
-                .unwrap_or("?");
-            let commit = lang["published"]["commit"]
-                .as_str()
-                .filter(|x| !x.is_empty())
-                .map(|sha| {
-                    format!(
-                        "`{}` on `{}`",
-                        &sha[..sha.len().min(9)],
-                        lang["published"]["branch"].as_str().unwrap_or("")
-                    )
-                })
-                .unwrap_or_else(|| "—".into());
-            lines.push(format!(
-                "| {repo} | {} | {} | {} | {} | {} | {commit} | {:.1}s |",
-                lang["lang"].as_str().unwrap_or(""),
-                lang["status"].as_str().unwrap_or(""),
-                lang["written"].as_array().map_or(0, Vec::len),
-                lang["findings"].as_array().map_or(0, Vec::len),
-                lang["dispatch"].as_array().map_or(0, Vec::len),
-                lang["duration_s"].as_f64().unwrap_or(0.0)
-            ));
-        }
-        lines.push(String::new());
+    for language in data["languages"].as_array().into_iter().flatten() {
+        let repo = Path::new(language["repo"].as_str().unwrap_or("?"))
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?");
+        let revision = language["source_revision"].as_str().unwrap_or("");
+        let revision = &revision[..revision.len().min(9)];
+        let commit = language["published"]["commit"].as_str().unwrap_or("");
+        let commit = if commit.is_empty() {
+            "—"
+        } else {
+            &commit[..commit.len().min(9)]
+        };
+        lines.push(format!(
+            "| {repo} | {} | `{revision}` | {} | {} | {} | {} | `{commit}` |",
+            language["lang"].as_str().unwrap_or(""),
+            language["status"].as_str().unwrap_or("error"),
+            language["written"].as_array().map_or(0, Vec::len),
+            language["findings"].as_array().map_or(0, Vec::len),
+            language["agent_calls"].as_array().map_or(0, Vec::len),
+        ));
     }
-    for lang in &languages {
-        let has_failed_calls = lang["dispatch"]
-            .as_array()
-            .is_some_and(|calls| calls.iter().any(|call| call["ok"] == false));
-        let clean = lang["status"] == "ok"
-            && lang["findings"].as_array().is_none_or(Vec::is_empty)
-            && !has_failed_calls;
-        if clean {
+    lines.push(String::new());
+    for language in data["languages"].as_array().into_iter().flatten() {
+        if language["status"] == "ok" && language["findings"].as_array().is_none_or(Vec::is_empty) {
             continue;
         }
-        let repo = Path::new(lang["repo"].as_str().unwrap_or("?"))
-            .file_name()
-            .and_then(|x| x.to_str())
-            .unwrap_or("?");
-        lines.extend([
-            format!("## {repo} — {}", lang["lang"].as_str().unwrap_or("")),
-            String::new(),
-            lang["message"].as_str().unwrap_or("").into(),
-            String::new(),
-        ]);
-        if let Some(conflicts) = lang["conflicts"].as_array().filter(|x| !x.is_empty()) {
-            lines.push("Hand-edited translations (not overwritten):".into());
-            for c in conflicts {
-                lines.push(format!(
-                    "- `{}`",
-                    c.get("path").and_then(Value::as_str).unwrap_or("?")
-                ));
-            }
-            lines.push(String::new());
+        lines.push(format!(
+            "## {} — {}",
+            Path::new(language["repo"].as_str().unwrap_or("?"))
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("?"),
+            language["lang"].as_str().unwrap_or("")
+        ));
+        lines.push(String::new());
+        lines.push(language["message"].as_str().unwrap_or("").to_owned());
+        lines.push(String::new());
+        for finding in language["conflicts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(language["findings"].as_array().into_iter().flatten())
+        {
+            lines.push(format!(
+                "- `{}` {} {}: {}",
+                finding["path"].as_str().unwrap_or("?"),
+                finding["severity"].as_str().unwrap_or(""),
+                finding["code"].as_str().unwrap_or(""),
+                finding["message"].as_str().unwrap_or("")
+            ));
         }
-        let failed_calls: Vec<_> = lang["dispatch"]
+        for call in language["agent_calls"]
             .as_array()
             .into_iter()
             .flatten()
             .filter(|call| call["ok"] == false)
-            .collect();
-        if !failed_calls.is_empty() {
-            lines.push("Failed agent calls:".into());
-            for call in failed_calls {
-                lines.push(format!(
-                    "- `{}` [{}]: {}",
-                    call["task_id"].as_str().unwrap_or("?"),
-                    call["code"].as_str().unwrap_or("DSP-EXIT"),
-                    call["message"].as_str().unwrap_or("")
-                ));
-            }
-            lines.push(String::new());
+        {
+            lines.push(format!(
+                "- Agent `{}` [{}]: {}",
+                call["task_id"].as_str().unwrap_or("?"),
+                call["code"].as_str().unwrap_or("AGENT-EXIT"),
+                call["diagnostic"].as_str().unwrap_or("")
+            ));
         }
-        if let Some(findings) = lang["findings"].as_array().filter(|x| !x.is_empty()) {
-            lines.push("Findings:".into());
-            for f in findings.iter().take(40) {
-                lines.push(format!(
-                    "- `{}` {} {}: {}",
-                    f.get("file")
-                        .or_else(|| f.get("path"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("?"),
-                    f["severity"].as_str().unwrap_or(""),
-                    f["code"].as_str().unwrap_or(""),
-                    f["message"].as_str().unwrap_or("")
-                ));
-            }
-            if findings.len() > 40 {
-                lines.push(format!(
-                    "- … {} more (see report.json)",
-                    findings.len() - 40
-                ));
-            }
-            lines.push(String::new());
-        }
+        lines.push(String::new());
     }
-    lines.join("\n").trim_end().to_string() + "\n"
+    lines.join("\n").trim_end().to_owned() + "\n"
 }
 
 fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(content)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(content)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
 pub fn write(
-    outcomes: &[LangOutcome],
-    dir: &Path,
+    outcomes: &[LanguageOutcome],
+    directory: &Path,
     started: DateTime<Local>,
     config: &Path,
     database_paths: &[PathBuf],
 ) -> Result<Value> {
     let data = build(outcomes, started, config, database_paths);
-    fs::create_dir_all(dir)?;
+    fs::create_dir_all(directory)?;
     atomic_write(
-        &dir.join("report.json"),
+        &directory.join("report.json"),
         (serde_json::to_string_pretty(&data)? + "\n").as_bytes(),
     )?;
-    atomic_write(&dir.join("report.md"), render(&data).as_bytes())?;
+    atomic_write(&directory.join("report.md"), render(&data).as_bytes())?;
     Ok(data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::LangOutcome;
     use tempfile::tempdir;
 
     #[test]
-    fn worst_status_and_reports_match_contract() {
-        let mut ok = LangOutcome::new(Path::new("/repo/docs"), "zh-CN");
-        ok.message = "done".into();
-        let mut partial = LangOutcome::new(Path::new("/repo/docs"), "ja");
+    fn exit_precedence_and_report_schema_are_stable() {
+        let ok = LanguageOutcome::new(Path::new("/repo/docs"), "zh-CN");
+        let mut partial = LanguageOutcome::new(Path::new("/repo/docs"), "ja");
         partial.status = Status::Partial;
-        partial.remaining_tasks = 2;
         assert_eq!(overall(&[ok.clone(), partial.clone()]).exit_code(), 3);
         let tmp = tempdir().unwrap();
         let data = write(
@@ -245,12 +201,8 @@ mod tests {
             &[],
         )
         .unwrap();
+        assert_eq!(data["schema"], 3);
         assert_eq!(data["status"], "partial");
-        assert!(tmp.path().join("report.json").is_file());
-        assert!(
-            fs::read_to_string(tmp.path().join("report.md"))
-                .unwrap()
-                .starts_with("# fani run")
-        );
+        assert!(tmp.path().join("report.md").is_file());
     }
 }

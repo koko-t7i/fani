@@ -9,47 +9,39 @@ on:
 permissions:
   contents: read
 
-jobs:
-  rust-quality:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install stable Rust with components
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Run repository-independent tests
-        run: cargo test --lib --test flow --test process_wrapper
-
-      - name: Install supply-chain checks
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
-      - name: Audit dependencies
-        run: cargo audit
-      - name: Check dependency policy
-        run: cargo deny check
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run native unit, integration, and CLI tests
+        run: cargo test --locked --all-targets
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --locked --release
+      - name: Smoke-test release entry point
+        run: target/release/fani --version
 
-  real-skill-e2e:
-    if: ${{ vars.FANI_I18N_SKILL_REPOSITORY != '' }}
+  msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Check out the external i18n skill
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ vars.FANI_I18N_SKILL_REPOSITORY }}
-          path: .i18n-skill
-      - uses: astral-sh/setup-uv@v5
-      - name: Run real-skill end-to-end tests
-        env:
-          FANI_TEST_SKILL: ${{ github.workspace }}/.i18n-skill
-        run: cargo test --test e2e_real_skill -- --nocapture
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install declared minimum Rust
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+      - name: Check minimum supported Rust version
+        run: cargo check --locked --all-targets

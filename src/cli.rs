@@ -1,20 +1,18 @@
 use crate::VERSION;
+use crate::agent::executable_on_path;
 use crate::config::{Config, RepoConfig};
 use crate::db::Database;
 use crate::lock::RepoLock;
-use crate::model::{LangOutcome, Status};
-use crate::orchestrator::Orchestrator;
+use crate::model::{LanguageOutcome, Status};
+use crate::orchestrator::{Orchestrator, adopt_human_edit, discard_human_edit};
 use crate::report;
-use crate::skill::Skill;
 use anyhow::{Result, anyhow};
 use chrono::Local;
 use clap::{Args, Parser, Subcommand};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
-#[command(name = "fani", version = VERSION, about = "Scheduled documentation translation using the i18n skill.")]
+#[command(name = "fani", version = VERSION, about = "Native continuous Markdown translation for Git and GitHub")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -22,12 +20,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Translate everything that is out of date.
+    /// Translate, verify, recover, materialize, and optionally publish pending work.
     Sync(SyncArgs),
-    /// Show what a sync would do; calls no agent.
+    /// Plan from an immutable Git revision without calling an Agent.
     Status(CommonArgs),
-    /// Check config, skill, uv and agent binaries.
+    /// CI-friendly alias for the read-only planning/check path.
+    Check(CommonArgs),
+    /// Validate configuration and runtime prerequisites.
     Doctor(DoctorArgs),
+    /// Validate and adopt divergent human target files.
+    Adopt(CommonArgs),
+    /// Restore canonical verified target files over divergent human edits.
+    Discard(CommonArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -59,9 +63,9 @@ struct DoctorArgs {
 pub fn run() -> i32 {
     match run_inner(Cli::parse()) {
         Ok(code) => code,
-        Err(err) => {
-            eprintln!("fani: {err}");
-            2
+        Err(error) => {
+            eprintln!("fani: {error:#}");
+            Status::Error.exit_code()
         }
     }
 }
@@ -69,32 +73,27 @@ pub fn run() -> i32 {
 fn run_inner(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Sync(args) => sync(args),
-        Command::Status(args) => status(args),
+        Command::Status(args) | Command::Check(args) => status(args),
         Command::Doctor(args) => doctor(args),
+        Command::Adopt(args) => reconcile(args, true),
+        Command::Discard(args) => reconcile(args, false),
     }
 }
 
-fn selected<'a>(cfg: &'a Config, filter: Option<&str>) -> Result<Vec<&'a RepoConfig>> {
+fn selected<'a>(config: &'a Config, filter: Option<&str>) -> Result<Vec<&'a RepoConfig>> {
     let Some(filter) = filter else {
-        return Ok(cfg.repos.iter().collect());
+        return Ok(config.repos.iter().collect());
     };
-    let selected: Vec<_> = cfg
+    let selected: Vec<_> = config
         .repos
         .iter()
         .filter(|repo| {
-            repo.path.file_name().and_then(|x| x.to_str()) == Some(filter)
-                || repo.path.display().to_string() == filter
+            repo.path.file_name().and_then(|name| name.to_str()) == Some(filter)
+                || repo.path.to_string_lossy() == filter
         })
         .collect();
     if selected.is_empty() {
-        return Err(anyhow!(
-            "no repo matches {filter:?} (configured: {})",
-            cfg.repos
-                .iter()
-                .filter_map(|r| r.path.file_name()?.to_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        return Err(anyhow!("no configured repository matches {filter:?}"));
     }
     Ok(selected)
 }
@@ -103,266 +102,234 @@ fn languages(repo: &RepoConfig, filter: Option<&str>) -> Result<Vec<String>> {
     let Some(filter) = filter else {
         return Ok(repo.languages.clone());
     };
-    if repo.languages.iter().any(|x| x == filter) {
-        return Ok(vec![filter.into()]);
-    }
-    Err(anyhow!(
-        "{} is not configured for {filter:?} (configured: {})",
-        repo.path
-            .file_name()
-            .and_then(|x| x.to_str())
-            .unwrap_or("repo"),
-        repo.languages.join(", ")
-    ))
-}
-
-fn database(repo: &RepoConfig) -> Result<Database> {
-    Database::open(repo.path.join(&repo.state_dir).join("fani.db"))
-}
-
-fn import_legacy(db: &Database, repo: &RepoConfig) -> Result<()> {
-    db.import_legacy_json(
-        &repo.path.join(&repo.state_dir).join("state.json"),
-        "external-skill-state",
-    )?;
-    let work = repo.path.join(&repo.state_dir).join("work");
-    if let Ok(runs) = fs::read_dir(work) {
-        for run in runs.flatten() {
-            db.import_legacy_jsonl(&run.path().join("dispatch.jsonl"), "python-dispatch-record")?;
-            db.import_legacy_json(&run.path().join("verify.json"), "python-verify-result")?;
-        }
-    }
-    Ok(())
-}
-
-fn sync(args: SyncArgs) -> Result<i32> {
-    let started = Local::now();
-    let cfg = Config::load(&args.common.config)?;
-    cfg.check_environment()?;
-    let repos = selected(&cfg, args.common.repo.as_deref())?;
-    let report_dir = args
-        .report_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(".fani"));
-    let report_dir = if report_dir.is_absolute() {
-        report_dir
+    if repo.languages.iter().any(|language| language == filter) {
+        Ok(vec![filter.into()])
     } else {
-        std::env::current_dir()?.join(report_dir)
-    };
-    let mut outcomes = Vec::new();
-    let mut db_paths = Vec::new();
+        Err(anyhow!(
+            "{} does not configure language {filter:?}",
+            repo.path.display()
+        ))
+    }
+}
 
-    for repo in repos {
-        let langs = languages(repo, args.common.lang.as_deref())?;
-        let db = database(repo)?;
-        import_legacy(&db, repo)?;
-        db_paths.push(db.path().to_path_buf());
-        let db_run = db.start_run(&args.common.config)?;
-        let lock = RepoLock::acquire(db.clone(), &repo.path);
-        let mut lock = match lock {
-            Ok(lock) => lock,
-            Err(err) => {
-                let mut out = LangOutcome::new(&repo.path, &langs.join(","));
-                out.status = Status::Error;
-                out.message = err.to_string();
-                out.transitions.push("error:lock_busy".into());
-                db.record_language(&db_run, &out)?;
-                db.finish_run(&db_run, out.status.as_str(), out.status.exit_code())?;
-                outcomes.push(out);
-                continue;
-            }
-        };
-        db.recover_incomplete_runs(&db_run)?;
-        let before = outcomes.len();
-        let orch = Orchestrator::new(&cfg, repo, &db, &db_run, args.quiet);
-        for lang in langs {
-            let out = orch.run_language(&lang);
-            if !args.quiet {
-                eprintln!(
-                    "  {} [{lang}] {}: {}",
-                    repo.path
-                        .file_name()
-                        .and_then(|x| x.to_str())
-                        .unwrap_or("repo"),
-                    out.status.as_str(),
-                    out.message
-                );
-            }
-            db.record_language(&db_run, &out)?;
-            outcomes.push(out);
-        }
-        lock.release()?;
-        let repo_status = report::overall(&outcomes[before..]);
-        db.finish_run(&db_run, repo_status.as_str(), repo_status.exit_code())?;
-    }
+fn database_path(repo: &RepoConfig) -> PathBuf {
+    repo.path.join(&repo.data_dir).join("fani.db")
+}
 
-    for repo in &cfg.repos {
-        if report_dir.starts_with(&repo.path) && !args.quiet {
-            eprintln!(
-                "warning: reports are written inside {} ({}); move --report-dir outside the repository or exclude it",
-                repo.path.display(),
-                report_dir.display()
-            );
-        }
-    }
-    let data = report::write(
-        &outcomes,
-        &report_dir,
-        started,
-        &args.common.config,
-        &db_paths,
-    )?;
-    if !args.quiet {
-        eprintln!("report: {}", report_dir.join("report.md").display());
-        println!("{}", data["status"].as_str().unwrap_or("error"));
-    }
-    Ok(report::overall(&outcomes).exit_code())
+fn open_database(repo: &RepoConfig) -> Result<Database> {
+    Database::open(database_path(repo))
 }
 
 fn status(args: CommonArgs) -> Result<i32> {
-    let cfg = Config::load(&args.config)?;
-    cfg.check_environment()?;
+    let config = Config::load(&args.config)?;
+    config.check_environment()?;
     let mut worst = Status::Ok;
-    for repo in selected(&cfg, args.repo.as_deref())? {
-        let skill = Skill::new(&cfg.skill, &repo.path, &repo.state_dir);
-        for lang in languages(repo, args.lang.as_deref())? {
-            let plan = skill
-                .plan(&lang, &repo.paths, &repo.exclude, repo.max_tasks, None)?
-                .data;
-            let conflicts = plan.conflicts.len();
-            if conflicts > 0 {
-                worst = Status::NeedsHuman;
+    for repo in selected(&config, args.repo.as_deref())? {
+        let snapshot_dir = tempfile::tempdir()?;
+        let snapshot_path = snapshot_dir.path().join("fani.db");
+        let authoritative_path = database_path(repo);
+        if authoritative_path.exists() {
+            Database::snapshot(&authoritative_path, &snapshot_path)?;
+        }
+        let database = Database::open(&snapshot_path)?;
+        let orchestrator = Orchestrator::new(&config, repo, &database, &args.config, true);
+        for language in languages(repo, args.lang.as_deref())? {
+            let plan = orchestrator.plan_language(&language)?;
+            let status = if plan.conflicts > 0 {
+                Status::NeedsHuman
+            } else if plan.deferred_units > 0 {
+                Status::Partial
+            } else {
+                Status::Ok
+            };
+            if report::overall(&[outcome_for_status(worst), outcome_for_status(status)]) == status {
+                worst = status;
             }
             println!(
-                "{} [{lang}] tasks={} files={} conflicts={} reused={} deferred={}",
+                "{} [{}] source={} documents={} pending={} reused={} conflicts={} deferred={}",
                 repo.path
                     .file_name()
-                    .and_then(|x| x.to_str())
+                    .and_then(|name| name.to_str())
                     .unwrap_or("repo"),
-                plan.task_count,
-                plan.files.len(),
-                conflicts,
-                plan.fuzzy_matched,
-                plan.truncated_tasks
+                language,
+                &plan.source_revision[..plan.source_revision.len().min(12)],
+                plan.documents,
+                plan.pending_units,
+                plan.reused_units,
+                plan.conflicts,
+                plan.deferred_units,
             );
         }
     }
     Ok(worst.exit_code())
 }
 
+fn outcome_for_status(status: Status) -> LanguageOutcome {
+    let mut outcome = LanguageOutcome::new(Path::new("."), "");
+    outcome.status = status;
+    outcome
+}
+
+fn sync(args: SyncArgs) -> Result<i32> {
+    let started = Local::now();
+    let config = Config::load(&args.common.config)?;
+    config.check_environment()?;
+    let repositories = selected(&config, args.common.repo.as_deref())?;
+    let report_dir = args
+        .report_dir
+        .unwrap_or_else(|| PathBuf::from(".fani-report"));
+    let mut outcomes = Vec::new();
+    let mut database_paths = Vec::new();
+
+    for repo in repositories {
+        let database = open_database(repo)?;
+        database_paths.push(database.path().to_owned());
+        let mut lock = match RepoLock::acquire(database.clone(), &repo.path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                for language in languages(repo, args.common.lang.as_deref())? {
+                    let mut outcome = LanguageOutcome::new(&repo.path, &language);
+                    outcome.status = Status::Error;
+                    outcome.message = error.to_string();
+                    outcome.transitions.push("error:lock_busy".into());
+                    outcomes.push(outcome);
+                }
+                continue;
+            }
+        };
+        let orchestrator =
+            Orchestrator::new(&config, repo, &database, &args.common.config, args.quiet);
+        for language in languages(repo, args.common.lang.as_deref())? {
+            let outcome = orchestrator.run_language(&language);
+            if !args.quiet {
+                eprintln!(
+                    "  {} [{}] {}: {}",
+                    repo.path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("repo"),
+                    language,
+                    outcome.status.as_str(),
+                    outcome.message
+                );
+            }
+            outcomes.push(outcome);
+        }
+        lock.release()?;
+    }
+
+    let data = report::write(
+        &outcomes,
+        &report_dir,
+        started,
+        &args.common.config,
+        &database_paths,
+    )?;
+    if !args.quiet {
+        println!("{}", data["status"].as_str().unwrap_or("error"));
+        eprintln!("report: {}", report_dir.join("report.md").display());
+    }
+    Ok(report::overall(&outcomes).exit_code())
+}
+
 fn doctor(args: DoctorArgs) -> Result<i32> {
-    let cfg = match Config::load(&args.config) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            println!("FAIL config: {err}");
-            return Ok(2);
+    let config = match Config::load(&args.config) {
+        Ok(config) => config,
+        Err(error) => {
+            println!("FAIL config: {error}");
+            return Ok(Status::Error.exit_code());
         }
     };
     println!("ok   config: {}", args.config.display());
     let mut problems = 0;
-    if let Err(err) = cfg.check_environment() {
+    if let Err(error) = config.check_environment() {
         problems += 1;
-        println!("FAIL environment: {err}");
-    } else {
-        println!("ok   skill: {}", cfg.skill.join("scripts/run.sh").display());
+        println!("FAIL environment: {error}");
     }
-    if find_binary("uv").is_none() {
+    if executable_on_path("git").is_none() {
         problems += 1;
-        println!("FAIL uv: not on PATH");
+        println!("FAIL git: executable not found");
     } else {
-        println!("ok   uv: on PATH");
+        println!("ok   git: executable found");
     }
-    for (name, agent) in &cfg.agents {
-        let found = find_binary(&agent.cmd[0]);
-        if found.is_none() && agent.enabled {
+    for (name, agent) in &config.agents {
+        if agent.enabled && executable_on_path(&agent.cmd[0]).is_none() {
             problems += 1;
-            println!("FAIL agent {name}: {} not on PATH", agent.cmd[0]);
+            println!("FAIL Agent {name}: {} not found", agent.cmd[0]);
         } else {
+            println!("ok   Agent {name}: {}", agent.cmd[0]);
+        }
+    }
+    for stage in ["translate", "repair", "revision", "proofread"] {
+        let required = stage == "translate"
+            || stage == "repair"
+            || (stage == "revision" && config.repos.iter().any(|repo| repo.quality.revision))
+            || (stage == "proofread" && config.repos.iter().any(|repo| repo.quality.proofread));
+        match config.agent_for(stage) {
+            Ok(agent) => println!("ok   stage {stage} -> {}", agent.name),
+            Err(error) if required => {
+                problems += 1;
+                println!("FAIL stage {stage}: {error}");
+            }
+            Err(error) => println!("note stage {stage}: {error}"),
+        }
+    }
+    for repo in &config.repos {
+        if repo.publish.github.enabled && executable_on_path("gh").is_none() {
+            problems += 1;
             println!(
-                "ok   agent {name} ({}): {}",
-                if agent.enabled { "enabled" } else { "disabled" },
-                found
-                    .unwrap_or_else(|| PathBuf::from(&agent.cmd[0]))
-                    .display()
+                "FAIL GitHub {}: gh executable not found",
+                repo.path.display()
             );
         }
-    }
-    for stage in ["translate", "revision", "proofread"] {
-        let wanted = cfg.repos.iter().any(|r| {
-            stage == "translate"
-                || (stage == "revision" && r.stages.revision)
-                || (stage == "proofread" && r.stages.proofread)
-        });
-        match cfg.agent_for(stage) {
-            Ok(agent) => println!("ok   stage {stage} -> {}", agent.name),
-            Err(err) if wanted => {
-                problems += 1;
-                println!("FAIL stage {stage}: {err}");
-            }
-            Err(err) => println!("note stage {stage}: {err}"),
-        }
-    }
-    for repo in &cfg.repos {
-        match database(repo) {
-            Ok(db) => {
-                let sqlite = db.sqlite_version()?;
-                if !sqlite_at_least(&sqlite, (3, 51, 3)) {
+        match open_database(repo) {
+            Ok(database) => {
+                if let Err(error) = database.integrity_check() {
                     problems += 1;
-                    println!(
-                        "FAIL repo {}: SQLite {sqlite} is older than required 3.51.3",
-                        repo.path.display()
-                    );
+                    println!("FAIL database {}: {error}", database.path().display());
                 } else {
                     println!(
-                        "ok   repo {}: {} (SQLite {sqlite}, schema {})",
-                        repo.path
-                            .file_name()
-                            .and_then(|x| x.to_str())
-                            .unwrap_or("repo"),
-                        repo.languages.join(", "),
-                        db.schema_version()?
+                        "ok   repository {}: SQLite {}, native schema {}",
+                        repo.path.display(),
+                        database.sqlite_version()?,
+                        database.schema_version()?
                     );
                 }
             }
-            Err(err) => {
+            Err(error) => {
                 problems += 1;
-                println!("FAIL repo {}: {err}", repo.path.display());
+                println!("FAIL database {}: {error}", database_path(repo).display());
             }
         }
     }
-    if problems > 0 {
-        println!("\n{problems} problem(s) must be fixed before a run.");
-        Ok(2)
-    } else {
+    if problems == 0 {
         println!("\nready");
-        Ok(0)
+        Ok(Status::Ok.exit_code())
+    } else {
+        println!("\n{problems} problem(s) must be fixed before sync");
+        Ok(Status::Error.exit_code())
     }
 }
 
-fn sqlite_at_least(version: &str, minimum: (u64, u64, u64)) -> bool {
-    let mut parts = version
-        .split('.')
-        .map(|part| part.parse::<u64>().unwrap_or(0));
-    let actual = (
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
+fn reconcile(args: CommonArgs, adopt: bool) -> Result<i32> {
+    let config = Config::load(&args.config)?;
+    config.check_environment()?;
+    let mut count = 0;
+    for repo in selected(&config, args.repo.as_deref())? {
+        let database = open_database(repo)?;
+        let mut lock = RepoLock::acquire(database.clone(), &repo.path)?;
+        for language in languages(repo, args.lang.as_deref())? {
+            count += if adopt {
+                adopt_human_edit(repo, &database, &language)?
+            } else {
+                discard_human_edit(repo, &database, &language)?
+            };
+        }
+        lock.release()?;
+    }
+    println!(
+        "{} {count} target file(s)",
+        if adopt { "adopted" } else { "discarded" }
     );
-    actual >= minimum
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-fn find_binary(name: &str) -> Option<PathBuf> {
-    let path = Path::new(name);
-    if path.components().count() > 1 {
-        return is_executable_file(path).then(|| path.to_path_buf());
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|path| path.join(name))
-        .find(|path| is_executable_file(path))
+    Ok(Status::Ok.exit_code())
 }

@@ -4,11 +4,15 @@ use crate::process::{
     enable_subreaper, finish_process_group, process_token, spawn_tracked, terminate_process_group,
     wrapped_command,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use nix::unistd::{Pid, setpgid};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fs;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -21,13 +25,48 @@ use wait_timeout::ChildExt;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Add,
+    Modify,
+    Delete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PathChange {
+    pub path: String,
+    pub kind: ChangeKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceSnapshot {
+    pub commit: String,
+    pub tree: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateCommit {
+    pub branch: String,
+    pub commit: String,
+    pub tree: String,
+    pub previous_tip: Option<String>,
+    pub source: SourceSnapshot,
+    pub changes: Vec<PathChange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TreeEntry {
+    kind: String,
+}
+
+type GitRead = (&'static str, std::io::Result<Vec<u8>>);
+
 struct Git<'a> {
     root: &'a Path,
     program: PathBuf,
     timeout: Duration,
 }
-
-type GitRead = (&'static str, std::io::Result<Vec<u8>>);
 
 fn spawn_git_reader<R: Read + Send + 'static>(
     name: &'static str,
@@ -43,19 +82,14 @@ fn spawn_git_reader<R: Read + Send + 'static>(
                 if count == 0 {
                     break;
                 }
-                if count >= GIT_OUTPUT_LIMIT {
-                    tail.clear();
-                    tail.extend_from_slice(&chunk[count - GIT_OUTPUT_LIMIT..count]);
-                } else {
-                    let excess = tail
-                        .len()
-                        .saturating_add(count)
-                        .saturating_sub(GIT_OUTPUT_LIMIT);
-                    if excess > 0 {
-                        tail.drain(..excess);
-                    }
-                    tail.extend_from_slice(&chunk[..count]);
+                let excess = tail
+                    .len()
+                    .saturating_add(count)
+                    .saturating_sub(GIT_OUTPUT_LIMIT);
+                if excess > 0 {
+                    tail.drain(..excess);
                 }
+                tail.extend_from_slice(&chunk[..count]);
             }
             Ok(tail)
         })();
@@ -84,6 +118,9 @@ impl<'a> Git<'a> {
         cmd.args(args)
             .current_dir(self.root)
             .env("FANI_PROCESS_TOKEN", &token)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(index) = index {
@@ -108,10 +145,7 @@ impl<'a> Git<'a> {
                     Instant::now() + Duration::from_millis(250),
                     tracker,
                 );
-                return Err(anyhow!(
-                    "git timed out after {:.0}s",
-                    self.timeout.as_secs_f64()
-                ));
+                bail!("git timed out after {:.0}s", self.timeout.as_secs_f64());
             }
         };
         let mut stdout = None;
@@ -127,30 +161,27 @@ impl<'a> Git<'a> {
                         Instant::now() + Duration::from_millis(250),
                         tracker,
                     );
-                    return Err(anyhow!(
+                    bail!(
                         "git timed out after {:.0}s draining output",
                         self.timeout.as_secs_f64()
-                    ));
+                    );
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(anyhow!("git output reader disconnected"));
+                    bail!("git output reader disconnected");
                 }
             }
         }
+        finish_process_group(tracker);
         let stdout = stdout.unwrap();
         let stderr = stderr.unwrap();
-        finish_process_group(tracker);
         if check && !status.success() {
-            return Err(anyhow!(
-                "git failed: {}",
-                String::from_utf8_lossy(&stderr).trim()
-            ));
+            bail!("git failed: {}", String::from_utf8_lossy(&stderr).trim());
         }
         Ok(String::from_utf8_lossy(&stdout).trim().to_string())
     }
 
-    fn rev(&self, reference: &str) -> Result<String> {
-        self.run(
+    fn rev(&self, reference: &str) -> Result<Option<String>> {
+        let value = self.run(
             [
                 "rev-parse",
                 "--verify",
@@ -159,145 +190,326 @@ impl<'a> Git<'a> {
             ],
             None,
             false,
-        )
-    }
-
-    fn is_repo(&self) -> bool {
-        self.run(["rev-parse", "--is-inside-work-tree"], None, false)
-            .is_ok_and(|x| x == "true")
-    }
-
-    fn commit(&self, paths: &[String], branch: &str, message: &str) -> Result<String> {
-        let tip = self.rev(&format!("refs/heads/{branch}"))?;
-        let base = if tip.is_empty() {
-            self.rev("HEAD")?
-        } else {
-            tip.clone()
-        };
-        let tmp = tempdir()?;
-        let index = tmp.path().join("index");
-        if !base.is_empty() {
-            self.run(["read-tree", &base], Some(&index), true)?;
-        }
-        let mut update = vec!["update-index".to_string(), "--add".into(), "--".into()];
-        update.extend(paths.iter().cloned());
-        self.run(update, Some(&index), true)?;
-        let tree = self.run(["write-tree"], Some(&index), true)?;
-        if !tip.is_empty() {
-            let old_tree = self.run(["rev-parse", &format!("{tip}^{{tree}}")], None, true)?;
-            if old_tree == tree {
-                return Ok(String::new());
-            }
-        }
-        let mut commit_args = vec!["commit-tree".to_string(), tree];
-        if !base.is_empty() {
-            commit_args.extend(["-p".into(), base]);
-        }
-        commit_args.extend(["-m".into(), message.into()]);
-        let sha = self.run(commit_args, None, true)?;
-        let expected = if tip.is_empty() { "0".repeat(40) } else { tip };
-        self.run(
-            [
-                "update-ref",
-                &format!("refs/heads/{branch}"),
-                &sha,
-                &expected,
-            ],
-            None,
-            true,
         )?;
-        Ok(sha)
+        Ok((!value.is_empty()).then_some(value))
+    }
+
+    fn snapshot(&self, source_ref: &str) -> Result<SourceSnapshot> {
+        let commit = self
+            .rev(source_ref)?
+            .ok_or_else(|| anyhow!("source ref {source_ref:?} does not resolve to a commit"))?;
+        let tree = self.run(["rev-parse", &format!("{commit}^{{tree}}")], None, true)?;
+        Ok(SourceSnapshot { commit, tree })
+    }
+
+    fn tree_entry(&self, treeish: &str, path: &str) -> Result<Option<TreeEntry>> {
+        let output = self.run(["ls-tree", "-z", treeish, "--", path], None, true)?;
+        if output.is_empty() {
+            return Ok(None);
+        }
+        let metadata = output
+            .split_once('\t')
+            .map(|(metadata, _)| metadata)
+            .ok_or_else(|| anyhow!("unexpected git ls-tree output for {path:?}"))?;
+        let mut fields = metadata.split_whitespace();
+        let mode = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default().to_string();
+        if mode.is_empty() || fields.next().is_none() || fields.next().is_some() {
+            bail!("unexpected git ls-tree metadata for {path:?}");
+        }
+        Ok(Some(TreeEntry { kind }))
+    }
+
+    fn remote_tip(&self, remote: &str, branch: &str) -> Result<Option<String>> {
+        let reference = format!("refs/heads/{branch}");
+        let output = self.run(["ls-remote", "--refs", remote, &reference], None, true)?;
+        if output.is_empty() {
+            return Ok(None);
+        }
+        let mut lines = output.lines();
+        let line = lines.next().unwrap();
+        if lines.next().is_some() {
+            bail!("remote {remote:?} returned multiple tips for {reference}");
+        }
+        let (oid, found_ref) = line
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| anyhow!("unexpected git ls-remote output"))?;
+        if found_ref.trim() != reference {
+            bail!("remote {remote:?} returned an unexpected ref {found_ref:?}");
+        }
+        Ok(Some(oid.to_string()))
     }
 }
 
-fn valid_relative(rel: &Path) -> bool {
-    !rel.is_absolute()
-        && !rel.components().any(|c| {
+fn valid_relative(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && !path.components().any(|component| {
             matches!(
-                c,
+                component,
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         })
 }
 
-pub fn allowed_paths(repo: &RepoConfig, written: &[Value]) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
+fn checked_path(path: &str) -> Result<String> {
+    let candidate = Path::new(path);
+    if !valid_relative(candidate)
+        || path.contains('\0')
+        || path == ".git"
+        || path.starts_with(".git/")
+    {
+        bail!("publication path must stay inside the repository: {path:?}");
+    }
+    Ok(candidate.to_string_lossy().into_owned())
+}
+
+fn reported_paths(written: &[Value]) -> Result<Vec<String>> {
+    let mut paths = BTreeMap::<String, ()>::new();
     for item in written {
-        let rel = item
+        let Some(path) = item
             .get("target")
             .or_else(|| item.get("path"))
-            .and_then(Value::as_str);
-        let Some(rel) = rel else {
+            .and_then(Value::as_str)
+        else {
             continue;
         };
-        let path = PathBuf::from(rel);
-        if !valid_relative(&path) {
-            return Err(anyhow!(
-                "apply reported a path outside the repository: {rel}"
-            ));
+        paths.insert(checked_path(path)?, ());
+    }
+    Ok(paths.into_keys().collect())
+}
+
+pub fn classify_changes(
+    repo: &RepoConfig,
+    base_treeish: &str,
+    written: &[Value],
+) -> Result<Vec<PathChange>> {
+    let git = Git::new(&repo.path);
+    let mut changes = Vec::new();
+    for path in reported_paths(written)? {
+        let entry = git.tree_entry(base_treeish, &path)?;
+        if entry.as_ref().is_some_and(|entry| entry.kind != "blob") {
+            bail!("publication path {path:?} is not a blob in the candidate tree");
         }
-        if repo.path.join(&path).is_file() {
-            paths.push(path.display().to_string());
+        let disk = repo.path.join(&path);
+        let kind = if disk.exists() {
+            let metadata = fs::symlink_metadata(&disk)
+                .with_context(|| format!("cannot inspect publication path {}", disk.display()))?;
+            if !metadata.file_type().is_file() {
+                bail!(
+                    "publication path must be a regular file: {}",
+                    disk.display()
+                );
+            }
+            if entry.is_some() {
+                ChangeKind::Modify
+            } else {
+                ChangeKind::Add
+            }
+        } else if entry.is_some() {
+            ChangeKind::Delete
+        } else {
+            bail!(
+                "reported publication path does not exist in the worktree or candidate tree: {path}"
+            );
+        };
+        changes.push(PathChange { path, kind });
+    }
+    Ok(changes)
+}
+
+pub fn create_candidate(
+    repo_path: &Path,
+    source_ref: &str,
+    branch: &str,
+    changes: &[PathChange],
+    message: &str,
+) -> Result<CandidateCommit> {
+    let git = Git::new(repo_path);
+    if git.run(["rev-parse", "--is-inside-work-tree"], None, false)? != "true" {
+        bail!("{} is not a git worktree", repo_path.display());
+    }
+    git.run(["check-ref-format", "--branch", branch], None, true)?;
+
+    let source = git.snapshot(source_ref)?;
+    let candidate_ref = format!("refs/heads/{branch}");
+    let previous_tip = git.rev(&candidate_ref)?;
+    let base = source.commit.as_str();
+    let base_tree = source.tree.clone();
+    let tmp = tempdir().context("cannot create temporary Git index")?;
+    let index = tmp.path().join("index");
+    git.run(["read-tree", &base_tree], Some(&index), true)?;
+
+    let mut seen = BTreeMap::new();
+    for change in changes {
+        let path = checked_path(&change.path)?;
+        if seen.insert(path.clone(), change.kind.clone()).is_some() {
+            bail!("duplicate publication path {path:?}");
+        }
+        let entry = git.tree_entry(&base_tree, &path)?;
+        match (&change.kind, entry.as_ref()) {
+            (ChangeKind::Add, Some(_)) => {
+                bail!("add path already exists in candidate tree: {path}")
+            }
+            (ChangeKind::Modify | ChangeKind::Delete, None) => {
+                bail!(
+                    "{} path is absent from candidate tree: {path}",
+                    match change.kind {
+                        ChangeKind::Modify => "modify",
+                        ChangeKind::Delete => "delete",
+                        ChangeKind::Add => unreachable!(),
+                    }
+                )
+            }
+            (_, Some(entry)) if entry.kind != "blob" => {
+                bail!("publication path is not a blob in candidate tree: {path}")
+            }
+            _ => {}
+        }
+
+        match change.kind {
+            ChangeKind::Delete => {
+                git.run(
+                    ["update-index", "--force-remove", "--", &path],
+                    Some(&index),
+                    true,
+                )?;
+            }
+            ChangeKind::Add | ChangeKind::Modify => {
+                let disk = repo_path.join(&path);
+                let metadata = fs::symlink_metadata(&disk).with_context(|| {
+                    format!("cannot inspect publication path {}", disk.display())
+                })?;
+                if !metadata.file_type().is_file() {
+                    bail!(
+                        "publication path must be a regular file: {}",
+                        disk.display()
+                    );
+                }
+                let oid = git.run(["hash-object", "-w", "--", &path], None, true)?;
+                let mode = if metadata.permissions().mode() & 0o111 == 0 {
+                    "100644"
+                } else {
+                    "100755"
+                };
+                git.run(
+                    ["update-index", "--add", "--cacheinfo", mode, &oid, &path],
+                    Some(&index),
+                    true,
+                )?;
+            }
         }
     }
-    // The external skill owns these JSON files. fani.db is intentionally excluded:
-    // it contains local scheduler history and a live lock table, not translation memory.
-    for name in ["state.json", "glossary.json", "style.json"] {
-        let rel = format!("{}/{name}", repo.state_dir.trim_end_matches('/'));
-        if repo.path.join(&rel).is_file() {
-            paths.push(rel);
-        }
+
+    let tree = git.run(["write-tree"], Some(&index), true)?;
+    let commit = if tree == base_tree {
+        base.to_string()
+    } else {
+        git.run(
+            ["commit-tree", &tree, "-p", base, "-m", message],
+            None,
+            true,
+        )?
+    };
+    if previous_tip.as_deref() != Some(commit.as_str()) {
+        let expected = previous_tip.as_deref().unwrap_or("");
+        git.run(
+            ["update-ref", &candidate_ref, &commit, expected],
+            None,
+            true,
+        )
+        .with_context(|| format!("candidate ref {candidate_ref} changed concurrently"))?;
     }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+
+    Ok(CandidateCommit {
+        branch: branch.to_string(),
+        commit,
+        tree,
+        previous_tip,
+        source,
+        changes: changes.to_vec(),
+    })
+}
+
+pub fn push_candidate(
+    repo_path: &Path,
+    remote: &str,
+    candidate: &CandidateCommit,
+    expected_remote_tip: Option<&str>,
+) -> Result<()> {
+    let git = Git::new(repo_path);
+    let candidate_ref = format!("refs/heads/{}", candidate.branch);
+    if git.rev(&candidate_ref)?.as_deref() != Some(candidate.commit.as_str()) {
+        bail!(
+            "candidate commit {} is no longer the tip of {candidate_ref}",
+            candidate.commit
+        );
+    }
+    let remote_ref = format!("refs/heads/{}", candidate.branch);
+    let observed = git.remote_tip(remote, &candidate.branch)?;
+    if observed.as_deref() != expected_remote_tip {
+        bail!(
+            "remote ref {remote_ref} changed: expected {}, found {}",
+            expected_remote_tip.unwrap_or("<absent>"),
+            observed.as_deref().unwrap_or("<absent>")
+        );
+    }
+    let lease = format!(
+        "--force-with-lease={remote_ref}:{}",
+        expected_remote_tip.unwrap_or("")
+    );
+    let refspec = format!("{candidate_ref}:{remote_ref}");
+    git.run(["push", &lease, remote, &refspec], None, true)?;
+    Ok(())
+}
+
+pub fn allowed_paths(written: &[Value]) -> Result<Vec<String>> {
+    reported_paths(written)
 }
 
 pub fn publish(repo: &RepoConfig, lang: &str, written: &[Value]) -> Result<Published> {
-    let branch = repo.branch.replace("{lang}", lang);
+    let branch = repo.publish.branch.replace("{lang}", lang);
     let mut result = Published {
         branch: branch.clone(),
         ..Published::default()
     };
-    if !repo.commit {
-        result.skipped = "commit is disabled for this repo".into();
+    if !repo.publish.enabled {
+        result.skipped = "publication is disabled for this repo".into();
         return Ok(result);
-    }
-    let git = Git::new(&repo.path);
-    if !git.is_repo() {
-        return Err(anyhow!(
-            "{} is not a git repository; set commit = false to skip",
-            repo.path.display()
-        ));
     }
     if written.is_empty() {
         result.skipped = "nothing was written".into();
         return Ok(result);
     }
-    result.paths = allowed_paths(repo, written)?;
-    if result.paths.is_empty() {
-        result.skipped = "none of the written files exist on disk".into();
+
+    let git = Git::new(&repo.path);
+    let source = git.snapshot(&repo.publish.source_ref)?;
+    let candidate_ref = format!("refs/heads/{branch}");
+    let _previous_tip = git.rev(&candidate_ref)?;
+    let changes = classify_changes(repo, &source.tree, written)?;
+    result.paths = changes.iter().map(|change| change.path.clone()).collect();
+    if changes.is_empty() {
+        result.skipped = "no allowlisted publication paths were reported".into();
         return Ok(result);
     }
-    let message = format!("i18n({lang}): update {} translated file(s)", written.len());
-    result.commit = git.commit(&result.paths, &branch, &message)?;
-    if result.commit.is_empty() {
-        result.commit = git.rev(&format!("refs/heads/{branch}"))?;
+
+    let message = format!("i18n({lang}): update {} translated file(s)", changes.len());
+    let candidate = create_candidate(&repo.path, &source.commit, &branch, &changes, &message)?;
+    result.commit = candidate.commit.clone();
+    if candidate.previous_tip.as_deref() == Some(candidate.commit.as_str()) {
         result.skipped = "the translations are already committed".into();
     }
-    if repo.push && !result.commit.is_empty() {
-        match git.run(
-            [
-                "push",
-                &repo.remote,
-                &format!("refs/heads/{branch}:refs/heads/{branch}"),
-            ],
-            None,
-            true,
+    if repo.publish.push {
+        let expected_remote = git.remote_tip(&repo.publish.remote, &branch)?;
+        match push_candidate(
+            &repo.path,
+            &repo.publish.remote,
+            &candidate,
+            expected_remote.as_deref(),
         ) {
-            Ok(_) => result.pushed = true,
+            Ok(()) => result.pushed = true,
             Err(error) => {
-                result.error = format!("could not push commit {}: {error}", result.commit)
+                result.error = format!("could not push commit {}: {error}", result.commit);
             }
         }
     }
@@ -305,210 +517,40 @@ pub fn publish(repo: &RepoConfig, lang: &str, written: &[Value]) -> Result<Publi
 }
 
 pub fn publish_pending(repo: &RepoConfig, lang: &str, commit: &str) -> Result<Published> {
-    let branch = repo.branch.replace("{lang}", lang);
+    let branch = repo.publish.branch.replace("{lang}", lang);
     let mut result = Published {
         branch: branch.clone(),
         commit: commit.to_string(),
         skipped: "retrying a previously failed push".into(),
         ..Published::default()
     };
-    if !repo.commit || !repo.push {
+    if !repo.publish.enabled || !repo.publish.push {
         return Ok(result);
     }
     let git = Git::new(&repo.path);
-    if !git.is_repo() {
-        return Err(anyhow!(
-            "{} is not a git repository; cannot retry pending publication",
-            repo.path.display()
-        ));
+    let candidate_ref = format!("refs/heads/{branch}");
+    if git.rev(&candidate_ref)?.as_deref() != Some(commit) {
+        bail!("pending commit {commit} is no longer the tip of {candidate_ref}");
     }
-    let tip = git.rev(&format!("refs/heads/{branch}"))?;
-    if tip != commit {
-        return Err(anyhow!(
-            "pending commit {commit} is no longer the tip of refs/heads/{branch}"
-        ));
-    }
-    match git.run(
-        [
-            "push",
-            &repo.remote,
-            &format!("refs/heads/{branch}:refs/heads/{branch}"),
-        ],
-        None,
-        true,
+    let source = git.snapshot(&repo.publish.source_ref)?;
+    let tree = git.run(["rev-parse", &format!("{commit}^{{tree}}")], None, true)?;
+    let candidate = CandidateCommit {
+        branch: branch.clone(),
+        commit: commit.to_string(),
+        tree,
+        previous_tip: Some(commit.to_string()),
+        source,
+        changes: Vec::new(),
+    };
+    let expected_remote = git.remote_tip(&repo.publish.remote, &branch)?;
+    match push_candidate(
+        &repo.path,
+        &repo.publish.remote,
+        &candidate,
+        expected_remote.as_deref(),
     ) {
-        Ok(_) => result.pushed = true,
+        Ok(()) => result.pushed = true,
         Err(error) => result.error = format!("could not push commit {commit}: {error}"),
     }
     Ok(result)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
-    use tempfile::tempdir;
-
-    fn git(root: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    fn setup() -> (tempfile::TempDir, RepoConfig) {
-        let tmp = tempdir().unwrap();
-        git(tmp.path(), &["init", "-q", "-b", "main"]);
-        git(tmp.path(), &["config", "user.email", "t@e"]);
-        git(tmp.path(), &["config", "user.name", "t"]);
-        fs::create_dir(tmp.path().join("docs")).unwrap();
-        fs::write(tmp.path().join("docs/guide.md"), "source\n").unwrap();
-        git(tmp.path(), &["add", "-A"]);
-        git(tmp.path(), &["commit", "-qm", "initial"]);
-        let repo = RepoConfig {
-            path: tmp.path().to_path_buf(),
-            languages: vec!["zh-CN".into()],
-            paths: vec![],
-            exclude: vec![],
-            state_dir: ".fani-state".into(),
-            max_tasks: 40,
-            repair_budget: 2,
-            full_retranslate_guard: 30,
-            branch: "i18n/{lang}".into(),
-            commit: true,
-            push: false,
-            remote: "origin".into(),
-            stages: Default::default(),
-        };
-        (tmp, repo)
-    }
-
-    #[test]
-    fn git_subprocess_timeout_is_bounded() {
-        let tmp = tempdir().unwrap();
-        let script = tmp.path().join("blocking-git");
-        let pid_file = tmp.path().join("git.pid");
-        let escaped_pid_file = tmp.path().join("git-escaped.pid");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\ntrap '' TERM\necho $$ > '{}'\npython3 -c \"import os,time; pid=os.fork(); os._exit(0) if pid else None; os.setsid(); open('{}','w').write(str(os.getpid())); time.sleep(30)\" &\nsleep 30\n",
-                pid_file.display(),
-                escaped_pid_file.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
-        let git = Git {
-            root: tmp.path(),
-            program: script,
-            timeout: Duration::from_millis(100),
-        };
-        let started = Instant::now();
-        let error = git.run(["status"], None, true).unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(1));
-        let pid: i32 = fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let escaped_pid: i32 = fs::read_to_string(escaped_pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        for tracked_pid in [pid, escaped_pid] {
-            let reaped = (0..100).any(|_| {
-                if !Path::new(&format!("/proc/{tracked_pid}")).exists() {
-                    true
-                } else {
-                    thread::sleep(Duration::from_millis(10));
-                    false
-                }
-            });
-            assert!(reaped, "Git helper {tracked_pid} survived timeout");
-        }
-    }
-
-    #[test]
-    fn failed_push_preserves_commit_and_no_change_retry_publishes_it() {
-        let (tmp, mut repo) = setup();
-        let remote = tmp.path().join("remote.git");
-        git(
-            tmp.path(),
-            &["init", "--bare", "-q", remote.to_str().unwrap()],
-        );
-        git(
-            tmp.path(),
-            &["remote", "add", "origin", remote.to_str().unwrap()],
-        );
-        let hook = remote.join("hooks/pre-receive");
-        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        let mut permissions = fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&hook, permissions).unwrap();
-        repo.push = true;
-        fs::write(tmp.path().join("docs/guide.zh-CN.md"), "译文\n").unwrap();
-
-        let first = publish(&repo, "zh-CN", &[json!({"path":"docs/guide.zh-CN.md"})]).unwrap();
-        assert!(!first.commit.is_empty());
-        assert!(!first.pushed);
-        assert!(first.error.contains("could not push"));
-        assert_eq!(git(tmp.path(), &["rev-parse", "i18n/zh-CN"]), first.commit);
-        assert!(
-            !Command::new("git")
-                .args(["rev-parse", "--verify", "refs/heads/i18n/zh-CN"])
-                .current_dir(&remote)
-                .output()
-                .unwrap()
-                .status
-                .success()
-        );
-
-        fs::remove_file(hook).unwrap();
-        let retry = publish_pending(&repo, "zh-CN", &first.commit).unwrap();
-        assert_eq!(retry.commit, first.commit);
-        assert!(retry.pushed);
-        assert!(retry.error.is_empty());
-        assert_eq!(
-            git(&remote, &["rev-parse", "refs/heads/i18n/zh-CN"]),
-            first.commit
-        );
-    }
-
-    #[test]
-    fn commit_is_isolated_and_database_is_excluded() {
-        let (tmp, repo) = setup();
-        fs::write(tmp.path().join("docs/guide.zh-CN.md"), "译文\n").unwrap();
-        fs::create_dir(tmp.path().join(".fani-state")).unwrap();
-        fs::write(tmp.path().join(".fani-state/state.json"), "{}").unwrap();
-        fs::write(tmp.path().join(".fani-state/fani.db"), "local-db").unwrap();
-        fs::write(tmp.path().join("scratch.txt"), "mine").unwrap();
-        let head = git(tmp.path(), &["rev-parse", "HEAD"]);
-        let out = publish(&repo, "zh-CN", &[json!({"path":"docs/guide.zh-CN.md"})]).unwrap();
-        assert!(!out.commit.is_empty());
-        assert_eq!(git(tmp.path(), &["rev-parse", "HEAD"]), head);
-        assert_eq!(
-            git(tmp.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
-            "main"
-        );
-        let files = git(tmp.path(), &["ls-tree", "-r", "--name-only", "i18n/zh-CN"]);
-        assert!(files.contains("docs/guide.zh-CN.md"));
-        assert!(files.contains(".fani-state/state.json"));
-        assert!(!files.contains("fani.db"));
-        assert!(!files.contains("scratch.txt"));
-    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "fani"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Unattended documentation translation orchestrator"
@@ -14,11 +14,15 @@ path = "src/main.rs"
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
+globset = "0.4"
 nix = { version = "0.30", features = ["fs", "process", "signal"] }
+pulldown-cmark = "0.13"
+regex = "1.11"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+strsim = "0.11"
 tempfile = "3.20"
 thiserror = "2.0"
 toml = "0.9"

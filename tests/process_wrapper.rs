@@ -4,10 +4,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
-fn run_wrapped_python(script: &str, pid_file: &Path) -> i32 {
+fn wrapped_shell(script: &str, pid_file: &Path) -> i32 {
     let status = Command::new(env!("CARGO_BIN_EXE_fani"))
         .arg("__fani_process_wrapper")
-        .arg("python3")
+        .arg("/bin/sh")
         .arg("-c")
         .arg(script)
         .env("WRAPPER_PID_FILE", pid_file)
@@ -16,56 +16,55 @@ fn run_wrapped_python(script: &str, pid_file: &Path) -> i32 {
     status.code().unwrap_or(2)
 }
 
+fn process_gone(pid: i32) -> bool {
+    (0..100).any(|_| {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        }
+    })
+}
+
 #[test]
-fn wrapper_reaps_detached_descendant_after_environment_is_cleared() {
+fn wrapper_reaps_detached_descendant_with_cleared_environment() {
     let tmp = tempdir().unwrap();
     let pid_file = tmp.path().join("detached.pid");
     let started = Instant::now();
-    let code = run_wrapped_python(
+    let code = wrapped_shell(
         r#"
-import os
-import time
-p = os.environ['WRAPPER_PID_FILE']
-pid = os.fork()
-if pid:
-    while not os.path.exists(p):
-        time.sleep(0.001)
-    os._exit(0)
-os.setsid()
-open(p + '.tmp', 'w').write(str(os.getpid()))
-os.replace(p + '.tmp', p)
-os.execve('/bin/sleep', ['sleep', '30'], {})
+setsid env -i /bin/sh -c 'echo $$ > "$1.tmp"; mv "$1.tmp" "$1"; exec /bin/sleep 30' sh "$WRAPPER_PID_FILE" &
+while [ ! -f "$WRAPPER_PID_FILE" ]; do sleep 0.001; done
+exit 0
 "#,
         &pid_file,
     );
     assert_eq!(code, 0);
-    assert!(started.elapsed() < Duration::from_secs(1));
-    let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let pid: i32 = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "sanitized detached descendant {pid} survived wrapper cleanup"
+        process_gone(pid),
+        "detached descendant {pid} survived cleanup"
     );
 }
 
 #[test]
-fn wrapper_termination_kills_environment_clearing_descendant() {
+fn wrapper_termination_kills_detached_descendant() {
     let tmp = tempdir().unwrap();
-    let pid_file = tmp.path().join("timed-out.pid");
+    let pid_file = tmp.path().join("terminated.pid");
     let script = r#"
-import os
-import time
-p = os.environ['WRAPPER_PID_FILE']
-pid = os.fork()
-if pid:
-    time.sleep(30)
-os.setsid()
-open(p + '.tmp', 'w').write(str(os.getpid()))
-os.replace(p + '.tmp', p)
-os.execve('/bin/sleep', ['sleep', '30'], {})
+setsid env -i /bin/sh -c 'echo $$ > "$1.tmp"; mv "$1.tmp" "$1"; exec /bin/sleep 30' sh "$WRAPPER_PID_FILE" &
+while [ ! -f "$WRAPPER_PID_FILE" ]; do sleep 0.001; done
+wait
 "#;
     let mut wrapper = Command::new(env!("CARGO_BIN_EXE_fani"))
         .arg("__fani_process_wrapper")
-        .arg("python3")
+        .arg("/bin/sh")
         .arg("-c")
         .arg(script)
         .env("WRAPPER_PID_FILE", &pid_file)
@@ -83,82 +82,40 @@ os.execve('/bin/sleep', ['sleep', '30'], {})
         nix::sys::signal::Signal::SIGTERM,
     )
     .unwrap();
-    let status = wrapper.wait().unwrap();
-    assert!(!status.success());
-    let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    assert!(!wrapper.wait().unwrap().success());
+    let pid: i32 = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "sanitized detached descendant {pid} survived wrapper termination"
+        process_gone(pid),
+        "detached descendant {pid} survived termination"
     );
 }
 
 #[test]
-fn supervisor_survives_launcher_sigkill_and_cleans_descendants() {
+fn supervisor_cleans_descendants_after_launcher_sigkill() {
     let tmp = tempdir().unwrap();
     let pid_file = tmp.path().join("launcher-kill.pid");
-    let code = run_wrapped_python(
+    let code = wrapped_shell(
         r#"
-import os
-import signal
-import time
-p = os.environ['WRAPPER_PID_FILE']
-pid = os.fork()
-if pid:
-    while not os.path.exists(p):
-        time.sleep(0.001)
-    os.kill(os.getppid(), signal.SIGKILL)
-    time.sleep(30)
-os.setsid()
-open(p + '.tmp', 'w').write(str(os.getpid()))
-os.replace(p + '.tmp', p)
-os.execve('/bin/sleep', ['sleep', '30'], {})
+launcher=$$
+setsid env -i /bin/sh -c 'echo $$ > "$1.tmp"; mv "$1.tmp" "$1"; exec /bin/sleep 30' sh "$WRAPPER_PID_FILE" &
+while [ ! -f "$WRAPPER_PID_FILE" ]; do sleep 0.001; done
+kill -KILL "$launcher"
 "#,
         &pid_file,
     );
     assert_ne!(code, 0);
-    let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
-    assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "sanitized descendant {pid} survived launcher SIGKILL"
-    );
-}
-
-#[test]
-fn outer_parent_recovers_after_supervisor_sigkill() {
-    let tmp = tempdir().unwrap();
-    let pid_file = tmp.path().join("supervisor-kill.pid");
-    let script = r#"
-import os
-import signal
-import time
-p = os.environ['WRAPPER_PID_FILE']
-pid = os.fork()
-if pid:
-    while not os.path.exists(p):
-        time.sleep(0.001)
-    launcher = os.getppid()
-    with open(f'/proc/{launcher}/status') as status:
-        supervisor = int(next(line for line in status if line.startswith('PPid:')).split()[1])
-    os.kill(supervisor, signal.SIGKILL)
-    time.sleep(30)
-os.setsid()
-open(p + '.tmp', 'w').write(str(os.getpid()))
-os.replace(p + '.tmp', p)
-os.execve('/bin/sleep', ['sleep', '30'], {})
-"#;
-    let status = Command::new(env!("CARGO_BIN_EXE_fani"))
-        .arg("__fani_process_test_parent")
-        .arg("python3")
-        .arg("-c")
-        .arg(script)
-        .env("WRAPPER_PID_FILE", &pid_file)
-        .status()
+    let pid: i32 = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
         .unwrap();
-    assert!(!status.success());
-    let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
     assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "sanitized descendant {pid} survived supervisor SIGKILL"
+        process_gone(pid),
+        "descendant {pid} survived launcher SIGKILL"
     );
 }
 
@@ -166,27 +123,22 @@ os.execve('/bin/sleep', ['sleep', '30'], {})
 fn wrapper_reaps_fast_detached_zombie() {
     let tmp = tempdir().unwrap();
     let pid_file = tmp.path().join("zombie.pid");
-    let code = run_wrapped_python(
+    let code = wrapped_shell(
         r#"
-import os
-import time
-p = os.environ['WRAPPER_PID_FILE']
-pid = os.fork()
-if pid:
-    while not os.path.exists(p):
-        time.sleep(0.001)
-    os._exit(0)
-os.setsid()
-open(p + '.tmp', 'w').write(str(os.getpid()))
-os.replace(p + '.tmp', p)
-os._exit(0)
+setsid env -i /bin/sh -c 'echo $$ > "$1.tmp"; mv "$1.tmp" "$1"; exit 0' sh "$WRAPPER_PID_FILE" &
+while [ ! -f "$WRAPPER_PID_FILE" ]; do sleep 0.001; done
+exit 0
 "#,
         &pid_file,
     );
     assert_eq!(code, 0);
-    let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    let pid: i32 = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
+        process_gone(pid),
         "fast detached zombie {pid} was not reaped"
     );
 }

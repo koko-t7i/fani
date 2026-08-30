@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use std::ops::Range;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -7,21 +7,21 @@ use std::path::PathBuf;
 pub enum Status {
     Ok,
     NeedsHuman,
-    Partial,
     Error,
+    Partial,
 }
 
 impl Status {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::NeedsHuman => "needs_human",
-            Self::Partial => "partial",
             Self::Error => "error",
+            Self::Partial => "partial",
         }
     }
 
-    pub fn exit_code(self) -> i32 {
+    pub const fn exit_code(self) -> i32 {
         match self {
             Self::Ok => 0,
             Self::NeedsHuman => 1,
@@ -31,134 +31,208 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING-KEBAB-CASE")]
+pub enum DecisionCode {
+    ConfigInvalid,
+    LockBusy,
+    SourceChanged,
+    HumanEdit,
+    AmbiguousMatch,
+    AgentExit,
+    AgentTimeout,
+    AgentInvalid,
+    VerificationFailed,
+    PublicationConflict,
+    PublicationRetry,
+}
+
+impl DecisionCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigInvalid => "CFG-INVALID",
+            Self::LockBusy => "LOCK-BUSY",
+            Self::SourceChanged => "SRC-CHANGED",
+            Self::HumanEdit => "HUMAN-EDIT",
+            Self::AmbiguousMatch => "MATCH-AMBIGUOUS",
+            Self::AgentExit => "AGENT-EXIT",
+            Self::AgentTimeout => "AGENT-TIMEOUT",
+            Self::AgentInvalid => "AGENT-INVALID",
+            Self::VerificationFailed => "VERIFY-FAILED",
+            Self::PublicationConflict => "PUBLISH-CONFLICT",
+            Self::PublicationRetry => "PUBLISH-RETRY",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceDocument {
+    pub repository: String,
+    pub source_revision: String,
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub content_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TranslationUnit {
+    pub id: String,
+    pub document_id: String,
+    pub ordinal: usize,
+    pub kind: String,
+    pub range: Range<usize>,
+    pub source: String,
+    pub source_hash: String,
+    pub context_hash: String,
+    pub protected_tokens: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UnitTranslation {
+    pub unit_id: String,
+    pub translated: String,
+    pub source_hash: String,
+    pub context_hash: String,
+    pub trusted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Finding {
+    pub severity: FindingSeverity,
+    pub code: String,
+    pub path: String,
+    pub unit_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub content_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FileChange {
+    Add { path: String, bytes: Vec<u8> },
+    Modify { path: String, bytes: Vec<u8> },
+    Delete { path: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentStage {
+    Translate,
+    Repair,
+    Revision,
+    Proofread,
+}
+
+impl AgentStage {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Translate => "translate",
+            Self::Repair => "repair",
+            Self::Revision => "revision",
+            Self::Proofread => "proofread",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentTask {
+    pub id: String,
+    pub stage: AgentStage,
+    pub source_language: String,
+    pub target_language: String,
+    pub source: String,
+    pub previous_source: Option<String>,
+    pub previous_translation: Option<String>,
+    pub findings: Vec<Finding>,
+    pub protected_tokens: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentResult {
+    pub task_id: String,
+    pub ok: bool,
+    pub output: String,
+    pub code: Option<String>,
+    pub attempts: usize,
+    pub duration_s: f64,
+    pub diagnostic: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Published {
     pub branch: String,
     pub commit: String,
     pub paths: Vec<String>,
     pub pushed: bool,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
     pub skipped: String,
-    #[serde(default)]
     pub error: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TaskOutcome {
-    pub task_id: String,
-    pub ok: bool,
-    pub code: Option<String>,
-    pub attempts: usize,
-    pub duration_s: f64,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LangOutcome {
+pub struct LanguageOutcome {
     pub repo: String,
     pub lang: String,
+    pub source_revision: String,
     pub status: Status,
     pub run_id: String,
     pub message: String,
-    pub written: Vec<Value>,
-    pub conflicts: Vec<Value>,
-    pub findings: Vec<Value>,
-    pub dispatch: Vec<TaskOutcome>,
+    pub written: Vec<String>,
+    pub conflicts: Vec<Finding>,
+    pub findings: Vec<Finding>,
+    pub agent_calls: Vec<AgentResult>,
     pub published: Published,
     pub repair_rounds: usize,
     pub remaining_tasks: usize,
-    pub fuzzy_matched: usize,
+    pub reused_units: usize,
     pub duration_s: f64,
     #[serde(skip)]
     pub transitions: Vec<String>,
 }
 
-impl LangOutcome {
+impl LanguageOutcome {
     pub fn new(repo: &std::path::Path, lang: &str) -> Self {
         Self {
             repo: repo.display().to_string(),
             lang: lang.to_string(),
+            source_revision: String::new(),
             status: Status::Ok,
             run_id: String::new(),
             message: String::new(),
-            written: vec![],
-            conflicts: vec![],
-            findings: vec![],
-            dispatch: vec![],
+            written: Vec::new(),
+            conflicts: Vec::new(),
+            findings: Vec::new(),
+            agent_calls: Vec::new(),
             published: Published::default(),
             repair_rounds: 0,
             remaining_tasks: 0,
-            fuzzy_matched: 0,
+            reused_units: 0,
             duration_s: 0.0,
             transitions: vec!["planning".into()],
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct PlanResult {
-    #[serde(default)]
-    pub run_id: String,
-    #[serde(default)]
-    pub task_count: usize,
-    #[serde(default)]
-    pub conflicts: Vec<Value>,
-    #[serde(default)]
-    pub files: Vec<Value>,
-    #[serde(default)]
-    pub fuzzy_matched: usize,
-    #[serde(default)]
-    pub truncated_tasks: usize,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct ApplyResult {
-    #[serde(default)]
-    pub written: Vec<Value>,
-    #[serde(default)]
-    pub rejected: Vec<Value>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct VerifyResult {
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub findings: Vec<Value>,
-    #[serde(default)]
-    pub retry_files: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct ReviewPlanResult {
-    #[serde(default)]
-    pub run_id: String,
-    #[serde(default)]
-    pub task_count: usize,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct ReviewCollectResult {
-    #[serde(default)]
-    pub findings: Vec<Value>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Task {
-    #[serde(default)]
-    pub task_id: String,
-    #[serde(default)]
-    pub chunk_id: String,
-    #[serde(default)]
-    pub prompt: String,
-    #[serde(default)]
-    pub source: String,
-    pub result_path: PathBuf,
-    #[serde(default)]
-    pub mode: String,
-    #[serde(default)]
-    pub previous_source: String,
-    #[serde(default)]
-    pub previous_translation: String,
-    #[serde(default)]
-    pub match_ratio: Value,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanSummary {
+    pub repository: PathBuf,
+    pub language: String,
+    pub source_revision: String,
+    pub documents: usize,
+    pub pending_units: usize,
+    pub reused_units: usize,
+    pub conflicts: usize,
+    pub deferred_units: usize,
 }

@@ -1,162 +1,124 @@
 # fani
 
-fani keeps translated documentation synchronized with its source. It watches configured repositories, asks a headless Agent CLI to translate only changed chunks, validates the result through the i18n skill, and publishes verified translations to per-language Git branches.
+fani is a Linux-first continuous documentation translation CLI. It reads Markdown from an immutable Git revision, reuses trusted translation memory from SQLite, sends only unresolved units to an isolated command-line Agent, verifies and assembles candidates natively, and can publish one stable branch and GitHub pull request per language.
 
-The shipped `fani` executable is implemented in Rust. fani-owned durable run state, Agent call history, migrations, and repository locks are stored in SQLite. The external i18n skill continues to own its translation-memory JSON protocol.
+The shipped binary is Rust. It has no Python, `uv`, external i18n skill, legacy JSON state, or compatibility migration dependency.
 
 ## Safety model
 
-The model is used as a text function, not as an operator. Each Agent invocation receives one prompt on stdin and returns one text result through stdout or a configured output file. fani—not the Agent—reads tasks, writes result JSON, decides whether output is acceptable, modifies files, and publishes Git commits.
-
-A normal successful run is:
-
-```text
-plan → dispatch → apply → verify → publish
-```
-
-Repair and review are conditional branches only:
-
-```text
-assembly rejected → one targeted assembly retry
-verify failed      → bounded repair loop
-revision enabled   → blocking bilingual review
-proofread enabled  → advisory review
-```
-
-Exhausted Agent retries stop before apply, avoiding the previous redundant apply/redispatch failure path.
+- **Git source is fixed:** planning reads blobs from one resolved commit SHA, not the mutable worktree.
+- **SQLite is the sole state authority:** translation memory, attempts, findings, canonical target bytes, recovery, outboxes, leases, and pull-request metadata live in `<repo>/<data_dir>/fani.db`.
+- **The Agent is untrusted:** it runs in an empty temporary directory with a temporary `HOME`, an environment allowlist, bounded I/O, an absolute timeout, and process-tree cleanup. It never receives a repository path or writes repository files.
+- **Markdown is assembled by byte range:** fenced code, inline code, links, HTML, and placeholders are protected by the native parser. Bytes outside translated ranges are preserved.
+- **Invalid output is blocked:** protected-token and Markdown-structure verification runs before canonical content is materialized or published.
+- **Publication is isolated:** a temporary Git index builds a candidate from the fixed source commit and a typed add/modify/delete allowlist. The checked-out branch, `HEAD`, real index, staged state, and unrelated worktree files remain unchanged.
+- **Trust is explicit:** only merged or explicitly adopted verified content is promoted to trusted translation memory.
 
 ## Requirements
 
 - Rust 1.85 or newer to build;
+- Linux;
 - Git;
-- [`uv`](https://docs.astral.sh/uv/) and the external i18n skill;
-- at least one headless Agent CLI, such as Claude Code, Codex, or Grok.
-
-The installed fani binary has no Python runtime dependency of its own. The current external i18n skill still uses `uv` and Python behind `scripts/run.sh`.
+- at least one headless command-line Agent provider;
+- `gh` only when GitHub pull-request publication is enabled.
 
 ## Install
 
 ```bash
-cargo install --path .
+cargo install --path . --locked
 cp examples/fani.toml fani.toml
 fani doctor
 ```
 
-For development:
+Development checks:
 
 ```bash
-cargo build
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --check
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets
+cargo build --locked --release
 ```
 
 ## Commands
 
 ```bash
-fani doctor    # validate config, skill, uv, Agent binaries, repositories and SQLite
-fani status    # plan only; no Agent calls and no translation cost
-fani sync      # translate, validate, record, report and optionally publish
+fani doctor                         # validate configuration and runtime prerequisites
+fani status                         # immutable-source plan; no Agent calls
+fani check                          # CI-friendly alias for status/check semantics
+fani sync                           # resume/translate/verify/materialize/publish
+fani adopt --repo NAME --lang LANG  # validate and adopt a divergent human target
+fani discard --repo NAME --lang LANG # restore canonical verified target bytes
 ```
 
-Common filters:
+Common options:
 
 ```bash
-fani status --repo product-docs --lang zh-CN
+fani status --config ./fani.toml --repo product-docs --lang zh-CN
 fani sync --config ./fani.toml --report-dir ./reports --quiet
 ```
 
 ## Exit codes
 
-| Exit | Meaning | Scheduler action |
+| Exit | Result | Meaning |
 | ---: | --- | --- |
-| 0 | Up to date, or translated and verified | Nothing |
-| 1 | A human decision is required | Read `report.md` |
-| 2 | Configuration, environment, lock, skill, or infrastructure error | Fix the environment |
-| 3 | This bounded batch succeeded; deferred chunks remain | Run again sooner |
+| 0 | `ok` | Up to date, or completed and verified. |
+| 1 | `needs_human` | A conflict, invalid candidate, review finding, or publication decision requires a person. |
+| 2 | `error` | Configuration, environment, lock, database, process, Git, or GitHub infrastructure failed. |
+| 3 | `partial` | The bounded batch succeeded and deferred units remain. |
 
-For multiple repositories/languages, severity is `error > needs_human > partial > ok`.
+For multiple repositories/languages, precedence is `error > needs_human > partial > ok`.
 
 ## Configuration
 
-`examples/fani.toml` is the annotated reference. It defines:
+[`examples/fani.toml`](examples/fani.toml) is the annotated reference. Configuration tables reject unknown fields. Parsing and semantic validation finish before fani opens a database, runs Git, starts an Agent, or contacts GitHub.
 
-- repositories, languages, paths and safety limits;
-- Agent argv, stages, concurrency, timeout and retries;
-- stage-to-Agent routing;
-- Git branch, commit and push behavior.
+A repository config defines:
 
-Secrets never belong in TOML. Agent CLIs inherit credentials from the execution environment or the systemd `EnvironmentFile`.
+- immutable source ref and Markdown include/exclude globs;
+- target path pattern, languages, batch and repair bounds;
+- SQLite data directory;
+- optional bilingual revision and advisory proofread;
+- stable locale branch, remote push, and GitHub pull-request settings.
 
-## Persistent state
+An Agent config defines argv, concurrency, timeout, retries, enablement, and the exact environment variables copied into its isolated process. Secrets belong in the process environment, never in TOML.
 
-Each configured repository stores fani's database at:
+## Persistent state and recovery
+
+Each configured repository uses:
 
 ```text
-<repo>/<state_dir>/fani.db
+<repo>/<data_dir>/fani.db
 ```
 
-SQLite contains:
+The fresh 0.3 schema is intentionally incompatible with experimental versions. fani does not import old `state.json`, JSONL, task files, review files, or SQLite schemas.
 
-- repeatable schema migration history;
-- CLI run and per-language outcomes;
-- state-machine transitions;
-- Agent task outcomes and attempt counts;
-- repository lock ownership;
-- idempotent snapshots imported from old JSON/JSONL records.
+SQLite uses foreign keys, rollback journal mode, `synchronous=FULL`, and a bounded busy timeout. External Agent, filesystem, Git, and GitHub work is bracketed by durable intent/completion transactions. Reopening resumes completed attempts, pending materialization, and pending publication idempotently.
 
-SQLite is authoritative for locking. While the previous Python release remains a possible rollout or rollback peer, Rust also holds a transient `<state_dir>/fani.lock` marker with the predecessor's PID/time format. This prevents old and new executables from concurrently mutating the external skill's `state.json`; the marker is removed on release and is not durable history.
-
-Connection policy is `foreign_keys=ON`, rollback journal, `synchronous=FULL`, and a bounded busy timeout. Long Agent, skill, and Git calls never hold a database transaction.
-
-JSON remains only at intentional boundaries:
-
-- `state.json`, task/result JSON and review JSON owned by the external i18n skill;
-- `report.json` as a latest-run machine snapshot;
-- `report.md` as the human report.
-
-On first and later runs, legacy external state and old Python dispatch/verify records are imported idempotently by path and SHA-256 digest. They are not deleted. This allows rollback to the old executable while making SQLite the only write source for fani-owned durable history.
+If a materialized target differs from its recorded canonical hash, fani reports `HUMAN-EDIT` and requires `adopt` or `discard`; sync never silently overwrites the edit.
 
 ## Reports
 
-`fani sync` writes:
+`fani sync` writes replaceable latest-run views to the selected report directory:
 
 ```text
-<report-dir>/report.json
-<report-dir>/report.md
+report.json
+report.md
 ```
 
-The report includes status, exit code, database paths, files written, conflicts, findings, task outcomes, retries, repair rounds, deferred tasks, and Git publication details. SQLite is authoritative for historical runs; reports are replaceable latest-run views.
+Reports include the fixed source revision, status/exit code, reused units, Agent attempts, findings, canonical materialization, and publication results. Reports are not authoritative and are never included in locale commits.
 
-Keep reports outside translated repositories, or explicitly exclude the report directory.
+## GitHub publication
 
-## Git publication
+When enabled, fani records a durable publication intent, builds a candidate commit from the fixed source revision, updates the stable locale branch with compare-and-swap/force-with-lease, and ensures one open pull request through bounded `gh` commands. An uncertain push or pull-request operation is reconciled before retry, preventing duplicate pull requests.
 
-Verified translations are committed to a stable branch per language, `i18n/{lang}` by default. fani uses a temporary Git index and plumbing commands:
-
-```text
-read-tree → update-index → write-tree → commit-tree → update-ref
-```
-
-This guarantees that publication does not switch the checked-out branch, move HEAD, modify the real index, or include unrelated worktree changes. Only apply-reported translated files and the external skill's `state.json`, `glossary.json`, and `style.json` are eligible.
-
-`fani.db`, SQLite journals, work directories, and locks are intentionally local and are never committed to translation branches.
+The database, prompts, Agent input/output, reports, and temporary work are excluded from candidate changes.
 
 ## Scheduling
 
-Install the user service and timer:
+User-level systemd assets are under [`systemd/`](systemd/). Exit codes 0, 1, and 3 are completed scheduler outcomes; exit 2 is an infrastructure failure. `KillMode=control-group` complements fani's process-tree cleanup.
 
-```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/fani.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now fani.timer
-```
+## Architecture
 
-The service treats exits 0, 1 and 3 as completed scheduler outcomes. Exit 2 is an infrastructure failure. `KillMode=control-group` ensures that stopping the service also terminates descendant Agent processes.
-
-## Architecture and research
-
-- [Rust + SQLite rewrite design](docs/architecture/rust-sqlite-rewrite.md)
-- [Compatibility baseline](docs/architecture/compatibility-baseline.md)
+- [Native i18n architecture and contracts](docs/architecture/native-i18n.md)
 - [2026 Rust CLI technology research](docs/research/2026-rust-cli-stack.md)
+- [Superseded compatibility baseline](docs/architecture/compatibility-baseline.md)
