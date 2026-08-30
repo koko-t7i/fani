@@ -37,15 +37,23 @@ grep -q '<bom ' "$sbom"
 grep -q 'name="fani"\|<name>fani</name>' "$sbom"
 grep -q '<hash alg=' "$sbom"
 
-archive_dir=$(CDPATH= cd -- "$(dirname -- "$archive")" && pwd)
 archive_name=$(basename -- "$archive")
-(
-    cd "$archive_dir"
-    sha256sum --check --strict "${archive_name}.sha256"
-)
-
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+
+grep -Ev '^[[:space:]]*$' "$checksum" > "$tmp/checksum" || true
+checksum_lines=$(wc -l < "$tmp/checksum" | tr -d ' ')
+if [ "$checksum_lines" -ne 1 ]; then
+    echo "checksum sidecar must contain exactly one non-empty record" >&2
+    exit 1
+fi
+archive_sha256=$(sha256sum "$archive" | awk '{print $1}')
+checksum_record=$(cat "$tmp/checksum")
+if [ "$checksum_record" != "$archive_sha256 *$archive_name" ] &&
+    [ "$checksum_record" != "$archive_sha256  $archive_name" ]; then
+    echo "archive checksum does not match its sidecar" >&2
+    exit 1
+fi
 
 tar -xJf "$archive" -C "$tmp"
 root_count=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
