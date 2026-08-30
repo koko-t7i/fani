@@ -1,7 +1,8 @@
 # Native i18n architecture
 
 Date: 2026-08-30  
-Status: implementation contract for fani 0.3
+Status: implementation contract for fani 0.3  
+Decision record: [`ADR-0001`](adr-0001-native-single-authority.md)
 
 ## Product boundary
 
@@ -25,7 +26,7 @@ No runtime path invokes an external i18n skill, Python, or `uv`. No old JSON, JS
 | `fani status` | Read-only with respect to repositories and Agents | Plan from the immutable source revision and report pending/reused/conflicting work. |
 | `fani check` | Read-only with respect to repositories and Agents | Alias of the deterministic planning/check path for CI readability. |
 | `fani sync` | Durable SQLite work, bounded Agent calls, verified materialization/publication | Resume or perform translation work. |
-| `fani adopt` | Durable reconciliation after deterministic validation | Adopt a human-edited target as canonical candidate; trust still requires merge/approval policy. |
+| `fani adopt` | Durable reconciliation after deterministic validation | Adopt a verified human-edited target as canonical content and trusted translation memory. |
 | `fani discard` | Durable reconciliation | Discard a divergent human edit and restore the canonical verified target. |
 
 Stable process outcomes are `0 ok`, `1 needs_human`, `2 error`, and `3 partial`. Configuration uses `serde(deny_unknown_fields)` at every table and is fully parsed and validated before database, repository, Agent, Git, or GitHub side effects.

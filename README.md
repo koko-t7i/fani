@@ -46,8 +46,8 @@ fani doctor                         # validate configuration and runtime prerequ
 fani status                         # immutable-source plan; no Agent calls
 fani check                          # CI-friendly alias for status/check semantics
 fani sync                           # resume/translate/verify/materialize/publish
-fani adopt --repo NAME --lang LANG  # validate and adopt a divergent human target
-fani discard --repo NAME --lang LANG # restore canonical verified target bytes
+fani adopt --repo PATH_OR_BASENAME --lang LANG  # validate and adopt a divergent human target
+fani discard --repo PATH_OR_BASENAME --lang LANG # restore canonical verified target bytes
 ```
 
 Common options:
@@ -119,6 +119,8 @@ User-level systemd assets are under [`systemd/`](systemd/). Exit codes 0, 1, and
 
 ## Architecture
 
+- [ADR-0001: native Rust engine and single SQLite authority](docs/architecture/adr-0001-native-single-authority.md)
 - [Native i18n architecture and contracts](docs/architecture/native-i18n.md)
 - [2026 Rust CLI technology research](docs/research/2026-rust-cli-stack.md)
 - [Superseded compatibility baseline](docs/architecture/compatibility-baseline.md)
+- [Superseded Rust + SQLite rewrite design](docs/architecture/rust-sqlite-rewrite.md)

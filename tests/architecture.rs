@@ -184,6 +184,48 @@ fn adapters_do_not_depend_on_cli() {
 }
 
 #[test]
+fn accepted_decision_supersedes_compatibility_documents() {
+    assert_contains_all(
+        "docs/architecture/adr-0001-native-single-authority.md",
+        &[
+            "**Status:** Accepted",
+            "One fani-identified SQLite database is the sole fani-owned authority",
+            "StateStore",
+            "AgentExecutor",
+            "Materializer",
+            "GitPublisher",
+            "CodeHost",
+            "No runtime path imports old JSON/JSONL state",
+        ],
+    );
+    for historical in [
+        "docs/architecture/compatibility-baseline.md",
+        "docs/architecture/rust-sqlite-rewrite.md",
+    ] {
+        assert_contains_all(
+            historical,
+            &[
+                "superseded",
+                "historical context",
+                "adr-0001-native-single-authority.md",
+            ],
+        );
+    }
+    assert_contains_all(
+        "README.md",
+        &[
+            "ADR-0001",
+            "adr-0001-native-single-authority.md",
+            "--repo PATH_OR_BASENAME",
+        ],
+    );
+    assert_contains_all(
+        "docs/architecture/native-i18n.md",
+        &["trusted translation memory", "Decision record: [`ADR-0001`"],
+    );
+}
+
+#[test]
 fn library_surface_keeps_implementation_layers_private() {
     let source = fs::read_to_string("src/lib.rs").unwrap();
     for private_module in ["adapters", "cli", "composition"] {
