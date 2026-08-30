@@ -7,4 +7,6 @@ venv/
 uv.lock
 dist/
 target/
+.fani/
+.fani-report/
 .DS_Store

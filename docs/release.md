@@ -2,7 +2,7 @@
 
 fani releases are Linux-first and currently target only `x86_64-unknown-linux-gnu`. Pushing a SemVer tag runs the cargo-dist 0.32.0 workflow in [`.github/workflows/release.yml`](../.github/workflows/release.yml). The workflow builds the release binary, creates a `.tar.xz` archive and SHA-256 sidecar, generates a CycloneDX XML SBOM with cargo-cyclonedx 0.5.9, validates the archive, attests the final release assets through GitHub artifact attestations, and then creates the GitHub release.
 
-The release workflow uses job-level permissions. Build jobs have read-only repository access. Only the host job receives `contents: write`, `attestations: write`, and `id-token: write`, because that job publishes and attests the final asset set. Every `uses:` reference is pinned to a full commit SHA. cargo-dist, cargo-cyclonedx, cargo-audit, and cargo-deny versions are pinned in configuration or workflows.
+The release workflow uses job-level permissions. Artifact build jobs have read-only repository access. The cargo-dist planning job and final host job receive `contents: write`; only the host job receives `attestations: write` and `id-token: write` to publish and attest the final asset set. Every `uses:` reference is pinned to a full commit SHA. cargo-dist, cargo-cyclonedx, cargo-audit, and cargo-deny versions are pinned in configuration or workflows.
 
 ## Archive contents
 
@@ -29,12 +29,18 @@ Download the archive, its `.sha256` sidecar, and the `.cdx.xml` SBOM from the sa
 ```bash
 sha256sum --check fani-x86_64-unknown-linux-gnu.tar.xz.sha256
 gh attestation verify fani-x86_64-unknown-linux-gnu.tar.xz --repo koko/fani
-scripts/release/verify-archive.sh \
-  fani-x86_64-unknown-linux-gnu.tar.xz \
-  fani.cdx.xml
+gh attestation verify fani.cdx.xml --repo koko/fani
 ```
 
-The GitHub attestation establishes workflow provenance for the published asset.
+The checksum verifies the downloaded archive bytes, and the GitHub attestations establish workflow provenance for the published archive and SBOM. Maintainers or auditors with a source checkout at the exact release tag can additionally run the repository's verifier:
+
+```bash
+scripts/release/verify-archive.sh \
+  /path/to/fani-x86_64-unknown-linux-gnu.tar.xz \
+  /path/to/fani.cdx.xml
+```
+
+The verifier script is a source-tree tool and is not included in the release archive.
 
 ## Reproducibility scope
 
@@ -44,15 +50,17 @@ cargo-dist 0.32.0 otherwise copies build-time ownership and timestamps into tar 
 
 cargo-cyclonedx includes the checkout's absolute path unless Cargo sees a stable workspace path. [`scripts/release/build-reproducible-release.sh`](../scripts/release/build-reproducible-release.sh) bind-mounts each clean checkout at `/workspace` only while generating the SBOM and sets `SOURCE_DATE_EPOCH` to the source commit time. It inherits `HOME`, `CARGO_HOME`, `RUSTUP_HOME`, XDG directories, caches, configuration, credentials, and installed package state. The build wrapper also fixes `umask` to `022` before invoking cargo-dist.
 
-[`scripts/release/verify-reproducible-release.sh`](../scripts/release/verify-reproducible-release.sh) creates two separate clean clones with separate target directories, runs the cargo-dist local/global release path in each, and requires byte-identical archives, checksum files, and SBOMs. It also compares the extracted binary SHA-256 and ELF build ID, all completion/man/systemd/example/README bytes, and extracted type, mode, owner, group, size, timestamp, and link metadata. The verified 2026-08-30 run produced archive SHA-256 `30c24e226e9903b8056a69a6b5799e24df0a556552cab73d130a358c9a862c76`, binary SHA-256 `ff5b503e4af8c78041688dd938ed8b2a78d7341d36eee3d80d33391c578411ad`, ELF build ID `72a0c8fdb2c9f2be27b1b10c1380546f97b7e8b3`, and SBOM SHA-256 `9fc69141f3e51c669060a8a4a32f9086d21fa6302fdd23fe7789e67193511a10` for the verification snapshot.
+[`scripts/release/verify-reproducible-release.sh`](../scripts/release/verify-reproducible-release.sh) creates two separate clean clones with separate target directories, runs the cargo-dist local/global release path in each, and requires byte-identical archives, checksum files, and SBOMs. It also compares the extracted binary SHA-256 and ELF build ID, all completion/man/systemd/example/README bytes, and extracted type, mode, owner, group, size, timestamp, and link metadata. The harness prints the hashes for the exact source revision under test; published release checksums remain the authoritative values for downloaded assets.
 
-This claim does not cover other targets, architectures, libc families, host distributions, kernel/tool versions, source revisions, or dependency lockfiles. A release candidate must pass the two-clone harness again; recorded hashes are evidence for the stated snapshot, not universal expected values.
+This claim does not cover other targets, architectures, libc families, host distributions, kernel/tool versions, source revisions, or dependency lockfiles. Every release candidate must pass the two-clone harness again.
 
 ## Install archive assets
 
-After verification and extraction:
+After verification, extract the archive and enter its single top-level directory:
 
 ```bash
+tar -xJf fani-x86_64-unknown-linux-gnu.tar.xz
+cd fani-x86_64-unknown-linux-gnu
 install -Dm755 fani "$HOME/.local/bin/fani"
 install -Dm644 fani.1 "$HOME/.local/share/man/man1/fani.1"
 install -Dm644 fani.bash "$HOME/.local/share/bash-completion/completions/fani"
@@ -61,27 +69,30 @@ install -Dm644 fani.fish "$HOME/.config/fish/completions/fani.fish"
 install -Dm644 fani.toml "$HOME/.config/fani/fani.toml"
 install -Dm644 fani.service "$HOME/.config/systemd/user/fani.service"
 install -Dm644 fani.timer "$HOME/.config/systemd/user/fani.timer"
+install -d -m 0700 "$HOME/.local/state/fani"
 systemctl --user daemon-reload
 ```
 
-Adjust the example configuration and unit paths before enabling the timer.
+The packaged service uses `$HOME/.local/bin/fani`, `$HOME/.config/fani/fani.toml`, and `$HOME/.local/state/fani/reports`, matching the commands above. Before enabling the timer, replace the annotated example values, create `$HOME/.config/fani/env` with mode `0600`, and add every configured repository parent to the service's `ReadWritePaths`. Run the exact `ExecStart` command manually first.
 
 ## Maintainer checks
 
 Run the locked quality and supply-chain gates before tagging:
 
 ```bash
+rustup toolchain install 1.85.0 --profile minimal
+rustup toolchain install 1.98.0 --profile minimal
+cargo +1.98.0 install --locked cargo-audit@0.22.2 cargo-deny@0.20.2 cargo-cyclonedx@0.5.9
+scripts/release/install-reproducible-dist.sh
+
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked --release
 cargo +1.85.0 check --locked --all-targets
-cargo audit
-cargo deny check
+cargo +1.98.0 audit
+cargo +1.98.0 deny check
 dist generate --check
-rustup toolchain install 1.98.0 --profile minimal
-scripts/release/install-reproducible-dist.sh
-cargo install --locked cargo-cyclonedx@0.5.9
 sudo install -d -m 0755 /workspace
 scripts/release/verify-reproducible-release.sh
 ```

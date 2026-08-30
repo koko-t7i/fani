@@ -5,7 +5,6 @@
 
 [Unit]
 Description=Hourly documentation translation
-Requires=fani.service
 
 [Timer]
 OnCalendar=hourly
@@ -16,8 +15,8 @@ RandomizedDelaySec=10m
 # Catch up after a laptop was asleep or the machine was off.
 Persistent=true
 
-# The per-repository lock already refuses a second concurrent run; this keeps
-# the timer from queueing them up in the first place.
+# Let systemd coalesce wakeups within one minute. The service and fani's own
+# repository lease prevent overlapping work; AccuracySec is not a lock.
 AccuracySec=1m
 
 [Install]

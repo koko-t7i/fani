@@ -22,7 +22,8 @@ No runtime path invokes an external i18n skill, Python, or `uv`. No old JSON, JS
 
 | Command | Side effects | Meaning |
 | --- | --- | --- |
-| `fani doctor` | May create/open the configured SQLite database only after strict config validation | Validate config, Git repositories, Agent executables, SQLite, and optional GitHub prerequisites. |
+| `fani init` | Atomically creates a validated configuration; refuses overwrite unless `--force` is given | Create a conservative local-only starter configuration for a built-in provider. |
+| `fani doctor` | May create/open the configured SQLite database only after strict config validation | Validate config, Git repositories, built-in provider credentials or custom Agent commands, SQLite, and optional GitHub prerequisites. |
 | `fani status` | Read-only with respect to repositories and Agents | Plan from the immutable source revision and report pending/reused/conflicting work. |
 | `fani check` | Read-only with respect to repositories and Agents | Alias of the deterministic planning/check path for CI readability. |
 | `fani sync` | Durable SQLite work, bounded Agent calls, verified materialization/publication | Resume or perform translation work. |

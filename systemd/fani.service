@@ -16,11 +16,11 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/fani
-ExecStart=%h/.cargo/bin/fani sync --config %h/fani/fani.toml --report-dir %h/fani/reports
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/fani sync --config %h/.config/fani/fani.toml --report-dir %h/.local/state/fani/reports
 
-# Built-in providers and custom Agents read credentials from here. Keep the file
-# mode 600; systemd reads it as root before dropping to the user.
+# Built-in providers and custom Agents read credentials from here. Keep this
+# user-owned file outside the repository with mode 600.
 EnvironmentFile=-%h/.config/fani/env
 
 # A run is bounded by max_tasks, but an agent that hangs past its own timeout
@@ -35,13 +35,13 @@ KillMode=control-group
 # alerting on; 1 and 3 are normal outcomes that the report explains.
 SuccessExitStatus=0 1 3
 
-# fani writes only inside the repositories it is configured for and its report
-# directory, so it does not need the rest of the filesystem.
+# Add every configured repository and report/state parent here. Prefixing a
+# path with "-" allows installation before that directory has been created.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=%h/fani %h/code
+ReadWritePaths=-%h/.local/state/fani -%h/code
 
 [Install]
 WantedBy=default.target

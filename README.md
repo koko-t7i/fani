@@ -1,183 +1,143 @@
 # fani
 
-fani is a Linux-first continuous documentation translation CLI. It reads Markdown from an immutable Git revision, reuses trusted translation memory from SQLite, sends only unresolved units to a built-in model provider or an isolated custom Agent command, verifies and assembles candidates natively, and can publish one stable branch and GitHub pull request per language.
+fani is a Linux-first CLI for continuously translating Markdown documentation. It reads source files from a fixed Git commit, reuses trusted translations from SQLite, sends only unresolved units to a built-in model provider or a strict custom Agent, verifies the result, and can publish one stable branch and GitHub pull request per language.
 
-The shipped binary is Rust. It has no Python, `uv`, external i18n skill, legacy JSON state, or compatibility migration dependency.
-
-## Safety model
-
-- **Git source is fixed:** planning reads blobs from one resolved commit SHA, not the mutable worktree.
-- **SQLite is the sole state authority:** translation memory, attempts, findings, canonical target bytes, recovery, outboxes, leases, and pull-request metadata live in `<repo>/<data_dir>/fani.db`.
-- **The Agent is untrusted:** it runs in an empty temporary directory with a temporary `HOME`, an environment allowlist, bounded I/O, an absolute timeout, and process-tree cleanup. It never receives a repository path or writes repository files.
-- **Markdown is assembled by byte range:** fenced code, inline code, links, HTML, and placeholders are protected by the native parser. Bytes outside translated ranges are preserved.
-- **Invalid output is blocked:** protected-token and Markdown-structure verification runs before canonical content is materialized or published.
-- **Project checks are deterministic:** configured documentation build/check argv arrays run after assembly and before publication in independent fixed-source staging containing the exact candidate target bytes. They have bounded time/output, process-tree cleanup, and no Agent/provider environment access.
-- **Publication is isolated:** a temporary Git index builds a candidate from the fixed source commit and a typed add/modify/delete allowlist. The checked-out branch, `HEAD`, real index, staged state, and unrelated worktree files remain unchanged.
-- **Trust is explicit:** only merged or explicitly adopted verified content is promoted to trusted translation memory.
+The shipped binary is fully native Rust. Running fani does not require Python, `uv`, an external i18n skill, or a provider adapter script.
 
 ## Requirements
 
-- Rust 1.85 or newer to build;
 - Linux;
 - Git;
-- an API key for a built-in provider: Anthropic, OpenAI, xAI, or DeepSeek;
-- `gh` only when GitHub pull-request publication is enabled.
-
-A custom command implementing fani's strict JSON protocol remains available for private or self-hosted providers.
+- either an API key for Anthropic, OpenAI, xAI, or DeepSeek, or a command implementing the custom Agent protocol;
+- `gh` only when GitHub pull-request publication is enabled;
+- Rust 1.85 or newer only when building from source.
 
 ## Install
 
-Source install:
+Download the `x86_64-unknown-linux-gnu` archive from [GitHub Releases](https://github.com/koko/fani/releases), verify it, and install the included `fani` binary. The archive also contains shell completions, the `fani(1)` man page, systemd user units, and an annotated configuration example.
+
+See [Release process and asset contract](docs/release.md) for checksum, attestation, archive installation, and reproducibility instructions.
+
+To install from a local source checkout:
 
 ```bash
 cargo install --path . --locked
 ```
 
-## Quick start
+## Five-minute start
 
-No provider script or provider CLI is required. Set one API key, generate a safe local-only configuration, then synchronize:
+No provider script or provider CLI is required.
+
+Commit the source Markdown you want to translate, then run:
 
 ```bash
 export ANTHROPIC_API_KEY='...'
 fani init --lang zh-CN --provider anthropic --model claude-sonnet-4-5
 fani doctor
+fani status
 fani sync
 ```
 
-`fani init` uses the current directory, scans Markdown, writes translations under `i18n/<language>/`, disables revision and publication for the first run, and refuses to overwrite an existing `fani.toml` unless `--force` is given.
+`fani init` creates a safe local-only `fani.toml` for the current repository. The generated globs discover Markdown during later planning, targets go under `i18n/<language>/`, each run is limited to ten tasks, and revision and publication remain disabled. It refuses to overwrite an existing configuration unless `--force` is given.
 
-Other built-in providers use the same flow:
+`fani status` previews the fixed Git revision and planned work without a model call. Uncommitted source edits are not part of that revision. The first `sync` materializes targets, stores authoritative state in `.fani/fani.db`, and writes `.fani-report/report.md` plus `.fani-report/report.json`; it does not push or open a pull request. Exit code 3 means the bounded run succeeded and another `fani sync` should continue the remaining work.
 
-| Provider | `--provider` | Credential environment variable | Default API |
-| --- | --- | --- | --- |
-| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Messages API |
-| OpenAI | `openai` | `OPENAI_API_KEY` | Chat Completions API |
-| xAI | `xai` | `XAI_API_KEY` | Chat Completions API |
-| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | Chat Completions API |
+Add `.fani/` and `.fani-report/` to `.gitignore`. Inspect generated translations and `report.md` before enabling more expensive quality stages, remote pushes, GitHub pull requests, or unattended scheduling.
 
-For an OpenAI-compatible endpoint, set `provider = "openai-compatible"`, `endpoint`, and `api_key_env` in `fani.toml`. Official provider endpoints and credential-variable names are fixed so a repository configuration cannot redirect a standard API key. Built-in requests do not follow redirects or inherit proxy environment variables.
+### Built-in providers
 
-Tagged releases publish one `x86_64-unknown-linux-gnu` `.tar.xz` archive. The archive contains the `fani` binary, Bash/Zsh/Fish completions, the `fani(1)` man page, systemd user units, the annotated example configuration, and this README. Each archive has a SHA-256 sidecar; the release also contains a CycloneDX XML SBOM and GitHub artifact attestations for the final asset set.
+| Provider | `--provider` | Credential environment variable |
+| --- | --- | --- |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` |
+| OpenAI | `openai` | `OPENAI_API_KEY` |
+| xAI | `xai` | `XAI_API_KEY` |
+| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` |
 
-```bash
-sha256sum --check fani-x86_64-unknown-linux-gnu.tar.xz.sha256
-gh attestation verify fani-x86_64-unknown-linux-gnu.tar.xz --repo koko/fani
-```
+For a custom OpenAI-compatible service, use `provider = "openai-compatible"` with an explicit HTTPS `endpoint` and a dedicated `api_key_env`. Advanced private integrations can use the strict `command-json-v1` subprocess protocol. Keep every credential in the environment or a secret store, never in `fani.toml`.
 
-See [the release process and asset contract](docs/release.md) for verification, installation, and exact reproducibility scope. For the locked Rust 1.85.0, cargo-dist 0.32.0, cargo-cyclonedx 0.5.9, `x86_64-unknown-linux-gnu` contract, two isolated clean clones must produce byte-identical archives, checksums, and SBOMs, with matching binary hashes/build IDs, packaged asset bytes, and extracted metadata. Other targets, host/tool versions, source revisions, and lockfiles are outside this claim.
+See [Best practices](docs/best-practices.md#providers-and-credentials) and the [annotated configuration](examples/fani.toml) for both paths.
 
-Development checks:
+## Core workflow
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --test reproducible_candidate
-cargo test --locked --all-targets
-cargo build --locked --release
-scripts/release/verify-reproducible-release.sh
+fani doctor
+fani status
+fani sync
 ```
 
-The `reproducible_candidate` end-to-end test creates a fixed local source repository and two independent clean clones with absent `.fani` databases and target caches. It invokes the built debug `fani` entry point in each environment with the same config and strict recorded JSON provider fixture, while inheriting the runner's `HOME`, Cargo/Rustup homes, XDG cache/config, and package state rather than redirecting them into test scratch space. The provider receives fani's isolated temporary `HOME` and an empty credential allowlist; sentinels fail the test if Python, `uv`, an external skill, or common network clients are invoked. The test verifies that SQLite is the only generated state authority, then requires equal candidate tree OIDs, raw tree bytes, target blob bytes, commit OIDs, and raw commit bytes.
+| Command | Purpose |
+| --- | --- |
+| `fani init` | Create a conservative starter configuration for one built-in provider. |
+| `fani doctor` | Validate configuration, repositories, provider credentials or custom commands, SQLite, and optional GitHub prerequisites. |
+| `fani status` | Plan from the fixed source revision without model calls. |
+| `fani check` | Run the same read-only planning path with a CI-oriented name. |
+| `fani sync` | Resume or perform translation, verification, materialization, and optional publication. |
+| `fani adopt` | Validate a human-edited target and make it canonical trusted content. |
+| `fani discard` | Replace a divergent human edit with the last canonical verified target. |
 
-## Commands
-
-```bash
-fani init --lang zh-CN --provider anthropic --model MODEL  # create starter config
-fani doctor                         # validate configuration and runtime prerequisites
-fani status                         # immutable-source plan; no Agent calls
-fani check                          # CI-friendly alias for status/check semantics
-fani sync                           # resume/translate/verify/materialize/publish
-fani adopt --repo PATH_OR_BASENAME --lang LANG  # validate and adopt a divergent human target
-fani discard --repo PATH_OR_BASENAME --lang LANG # restore canonical verified target bytes
-```
-
-Common options:
+Select one configured repository or language when needed:
 
 ```bash
 fani status --config ./fani.toml --repo product-docs --lang zh-CN
 fani sync --config ./fani.toml --report-dir ./reports --quiet
+fani adopt --repo PATH_OR_BASENAME --lang zh-CN
 ```
+
+`fani sync` writes replaceable `report.json` and `report.md` views to the selected report directory. SQLite at `<repo>/<data_dir>/fani.db` remains the sole fani-owned state authority.
+
+### Exit codes
+
+| Exit | Result | Meaning |
+| ---: | --- | --- |
+| 0 | `ok` | Up to date, or completed and verified. |
+| 1 | `needs_human` | A conflict, invalid candidate, review finding, or publication decision needs a person. |
+| 2 | `error` | Configuration or infrastructure failed. |
+| 3 | `partial` | The bounded batch succeeded and more units remain for a later run. |
+
+For multiple repositories or languages, precedence is `error > needs_human > partial > ok`.
+
+## Safety model
+
+- **Fixed source:** discovery and planning read blobs from one resolved Git commit, never mutable source files in the worktree.
+- **Single state authority:** translation memory, findings, canonical target bytes, recovery, and publication state live in SQLite.
+- **Untrusted model output:** fani protects Markdown syntax, bounds provider I/O, and verifies candidates before materialization or publication.
+- **Explicit human reconciliation:** a changed target is never silently overwritten; choose `adopt` or `discard`.
+- **Isolated publication:** candidate commits use a temporary Git index and do not disturb the checked-out branch, `HEAD`, real index, or unrelated files.
+- **Secrets stay outside configuration:** official providers use fixed endpoints and fixed credential-variable names; built-in requests do not follow redirects or inherit proxy environment variables.
+
+## Configuration
+
+[`examples/fani.toml`](examples/fani.toml) is the complete annotated reference. Unknown fields are rejected, and semantic validation finishes before fani contacts a provider or GitHub.
+
+Important rules:
+
+- `publish.source_ref` selects the fixed source revision for planning and synchronization even when publication is disabled;
+- exclude generated translation directories so they are not translated recursively;
+- keep `{lang}` and `{relpath}` in `target_pattern`—for example, `i18n/{lang}/{relpath}` maps `docs/start.md` to `i18n/zh-CN/docs/start.md`;
+- configure documentation checks as argv arrays, not shell strings;
+- begin with low `max_tasks`, `concurrency = 1`, revision disabled, and publication disabled;
+- use one stable publication branch per language when publication is enabled.
+
+The staged rollout and operating guidance are in [Best practices](docs/best-practices.md).
 
 ## Diagnostics
 
-Structured diagnostics are written only to stderr and are opt-in with `FANI_LOG`. The default format is compact human-readable output; set `FANI_LOG_FORMAT=json` for newline-delimited JSON:
+Diagnostics are opt-in and go only to stderr:
 
 ```bash
 FANI_LOG=info fani sync --quiet
 FANI_LOG=info FANI_LOG_FORMAT=json fani sync --quiet
 ```
 
-Diagnostics contain safe hashes/IDs, locale and stage names, durations, statuses, outbox IDs, and publication/provider metadata hashes. They never emit environment values, credentials, provider stderr, prompts, source Markdown, translations, protected tokens, or Agent request/response content. `--quiet` continues to suppress progress and report-location output; command errors and enabled diagnostics still use stderr. OpenTelemetry export is not included.
+They include safe identifiers, durations, statuses, and provider/publication metadata hashes. They exclude credentials, environment values, prompts, source Markdown, translations, protected tokens, and provider request/response bodies.
 
-## Exit codes
+## Documentation
 
-| Exit | Result | Meaning |
-| ---: | --- | --- |
-| 0 | `ok` | Up to date, or completed and verified. |
-| 1 | `needs_human` | A conflict, invalid candidate, review finding, or publication decision requires a person. |
-| 2 | `error` | Configuration, environment, lock, database, process, Git, or GitHub infrastructure failed. |
-| 3 | `partial` | The bounded batch succeeded and deferred units remain. |
+- [Documentation map](docs/README.md) — which document to use and which contracts are current.
+- [Best practices](docs/best-practices.md) — providers, credentials, repository layout, daily operation, human edits, publication, scheduling, and CI.
+- [Annotated configuration](examples/fani.toml) — complete configuration fields and examples.
+- [Release process and asset contract](docs/release.md) — installation verification, release assets, reproducibility, and maintainer gates.
+- [Native architecture contract](docs/architecture/native-i18n.md) — active behavior and authority boundaries.
+- [ADR-0001](docs/architecture/adr-0001-native-single-authority.md) — why fani uses native Rust and one SQLite authority.
 
-For multiple repositories/languages, precedence is `error > needs_human > partial > ok`.
-
-## Configuration
-
-[`examples/fani.toml`](examples/fani.toml) is the annotated reference. Configuration tables reject unknown fields. Parsing and semantic validation finish before fani opens a database, runs Git, starts an Agent, or contacts GitHub.
-
-A repository config defines:
-
-- immutable source ref and Markdown include/exclude globs;
-- target path pattern, languages, batch and repair bounds;
-- SQLite data directory;
-- optional bilingual revision and advisory proofread;
-- zero or more project-specific documentation build/check commands;
-- stable locale branch, remote push, and GitHub pull-request settings.
-
-Documentation checks are configured under `[repo.documentation]` as one or more argv arrays, for example `commands = [["mdbook", "build"], ["markdownlint", "docs/zh-CN"]]`. Shell strings are not accepted. Every command receives a fresh repository-independent staging tree checked out from the fixed source revision with the exact assembled candidate files overlaid. A nonzero exit or timeout is persisted and reported as a blocking finding, so publication does not start.
-
-A built-in Agent config only needs `provider` and `model`; `adapter` defaults to `native-http-v1`, the standard credential variable is selected automatically, and secrets remain in the process environment rather than TOML. Optional fields include `endpoint`, `api_key_env`, `max_output_tokens`, concurrency, timeout, retries, and enablement.
-
-Advanced integrations can select `adapter = "command-json-v1"`, provide `cmd`, and explicitly list `env_allow`. fani writes a strict `fani.agent.request.v1` JSON envelope to stdin and accepts only a matching `fani.agent.response.v1` JSON envelope from stdout or `{output_file}`. This custom command path preserves the same bounded I/O, timeout, process-tree cleanup, and diagnostic redaction guarantees.
-
-## Persistent state and recovery
-
-Each configured repository uses:
-
-```text
-<repo>/<data_dir>/fani.db
-```
-
-The fresh 0.3 schema is intentionally incompatible with experimental versions. fani does not import old `state.json`, JSONL, task files, review files, or SQLite schemas.
-
-SQLite uses foreign keys, rollback journal mode, `synchronous=FULL`, and a bounded busy timeout. External Agent, filesystem, Git, and GitHub work is bracketed by durable intent/completion transactions. Reopening resumes completed attempts, pending materialization, and pending publication idempotently.
-
-If a materialized target differs from its recorded canonical hash, fani reports `HUMAN-EDIT` and requires `adopt` or `discard`; sync never silently overwrites the edit.
-
-## Reports
-
-`fani sync` writes replaceable latest-run views to the selected report directory:
-
-```text
-report.json
-report.md
-```
-
-Reports include the fixed source revision, status/exit code, reused units, Agent attempts, findings, canonical materialization, and publication results. Reports are not authoritative and are never included in locale commits.
-
-## GitHub publication
-
-When enabled, fani records a durable publication intent, builds a candidate commit from the fixed source revision, updates the stable locale branch with compare-and-swap/force-with-lease, and ensures one open pull request through bounded `gh` commands. An uncertain push or pull-request operation is reconciled before retry, preventing duplicate pull requests.
-
-The database, prompts, Agent input/output, reports, and temporary work are excluded from candidate changes.
-
-## Scheduling
-
-User-level systemd assets are under [`systemd/`](systemd/). Exit codes 0, 1, and 3 are completed scheduler outcomes; exit 2 is an infrastructure failure. `KillMode=control-group` complements fani's process-tree cleanup.
-
-## Architecture
-
-- [ADR-0001: native Rust engine and single SQLite authority](docs/architecture/adr-0001-native-single-authority.md)
-- [Native i18n architecture and contracts](docs/architecture/native-i18n.md)
-- [2026 Rust CLI technology research](docs/research/2026-rust-cli-stack.md)
-- [Superseded compatibility baseline](docs/architecture/compatibility-baseline.md)
-- [Superseded Rust + SQLite rewrite design](docs/architecture/rust-sqlite-rewrite.md)
+Historical design documents are labeled as superseded in the [documentation map](docs/README.md#historical-records) and are not usage guides.

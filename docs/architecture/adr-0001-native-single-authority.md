@@ -38,7 +38,7 @@ Numbered SQL migrations and versioned prompts are embedded into the binary. Expe
 
 ### Positive
 
-- Clean-clone builds and CI need only the declared Rust toolchain, lockfile, Git, SQLite support bundled by `rusqlite`, and configured external provider/GitHub executables.
+- Clean-clone builds and CI need only the declared Rust toolchain, lockfile, Git, SQLite support bundled by `rusqlite`, provider credentials or a configured custom Agent command, and `gh` when GitHub publication is enabled.
 - Durable state transitions and outboxes support idempotent recovery without repeating completed Agent work.
 - Pure native Markdown behavior can be tested independently from SQLite, Git, processes, and GitHub.
 - Fixed-source planning and publication prevent mutable-worktree races and preserve unrelated checkout state.
@@ -46,7 +46,7 @@ Numbered SQL migrations and versioned prompts are embedded into the binary. Expe
 ### Costs and constraints
 
 - Existing experimental state must be discarded through the explicit reset path.
-- The initial product remains Linux-first, Markdown/CommonMark/GFM-only, GitHub-only, and command-line-provider-only.
+- The initial product remains Linux-first, Markdown/CommonMark/GFM-only, GitHub-only, and CLI-only.
 - Schema migrations and prompt resources are append-only/versioned release inputs and must be reviewed like code.
 - SQLite remains deployment-local authority; hosted persistence requires a separately protected state-ref protocol rather than a cache.
 
