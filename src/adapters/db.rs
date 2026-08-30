@@ -808,8 +808,11 @@ impl Database {
         } else {
             None
         };
-        let _ = attempt_id;
-        Ok(Some(FailedAttemptContext { output, error }))
+        Ok(Some(FailedAttemptContext {
+            attempt_id,
+            output,
+            error,
+        }))
     }
 
     pub fn successful_attempt(

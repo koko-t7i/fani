@@ -636,7 +636,11 @@ fn repair_receives_rejected_output_and_exact_validation_findings() {
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
     fs::create_dir_all(repo.join("docs")).unwrap();
-    fs::write(repo.join("docs/guide.md"), "**Label:** text.\n").unwrap();
+    fs::write(
+        repo.join("docs/guide.md"),
+        "See [label](https://example.com).\n",
+    )
+    .unwrap();
     run(&repo, &["init", "-q", "-b", "main"]);
     run(&repo, &["config", "user.email", "test@example.invalid"]);
     run(&repo, &["config", "user.name", "Test"]);
@@ -648,7 +652,7 @@ fn repair_receives_rejected_output_and_exact_validation_findings() {
     fs::write(
         &provider,
         format!(
-            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\nif [ \"$count\" -eq 1 ]; then\n  jq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:\"**标签：**文本。\"}}'\nelse\n  jq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(if .task.previous_translation == \"**标签：**文本。\" and .task.findings[0].code == \"MD-STRUCTURE\" then \"**标签：** 文本。\" else \"still invalid\" end)}}'\nfi\n",
+            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\nif [ \"$count\" -eq 1 ]; then\n  jq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:\"See label.\"}}'\nelse\n  jq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(if .task.previous_translation == \"See label.\" and any(.task.findings[]; .code == \"MD-PROTECTED\") then .task.source else \"still invalid\" end)}}'\nfi\n",
             counter = counter.display()
         ),
     )
@@ -714,6 +718,89 @@ repair = "fixture"
     assert_eq!(report["totals"]["agent_calls"], 2);
     assert_eq!(report["totals"]["repair_rounds"], 1);
     assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+    assert_eq!(
+        fs::read_to_string(repo.join("translations/zh-CN/docs/guide.md")).unwrap(),
+        "See [label](https://example.com).\n"
+    );
+}
+
+#[test]
+fn missing_separator_after_leading_strong_is_repaired_deterministically() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("docs/guide.md"), "**Label:** text.\n").unwrap();
+    run(&repo, &["init", "-q", "-b", "main"]);
+    run(&repo, &["config", "user.email", "test@example.invalid"]);
+    run(&repo, &["config", "user.name", "Test"]);
+    run(&repo, &["add", "."]);
+    run(&repo, &["commit", "-qm", "source"]);
+
+    let counter = tmp.path().join("counter");
+    let provider = tmp.path().join("provider.sh");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nset -eu\nprintf 1 > '{counter}'\njq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:\"**标签：**文本。\"}}'\n",
+            counter = counter.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&provider).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&provider, permissions).unwrap();
+
+    let config = tmp.path().join("fani.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[repo]]
+path = "{}"
+languages = ["zh-CN"]
+include = ["docs/**/*.md"]
+data_dir = ".fani"
+target_pattern = "translations/{{lang}}/{{relpath}}"
+max_tasks = 1
+repair_budget = 0
+[repo.quality]
+revision = false
+proofread = false
+[repo.publish]
+enabled = false
+source_ref = "HEAD"
+[agents.fixture]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
+cmd = ["{}"]
+concurrency = 1
+timeout_s = 5
+retries = 0
+[routing]
+translate = "fixture"
+repair = "fixture"
+"#,
+            repo.display(),
+            provider.display()
+        ),
+    )
+    .unwrap();
+    let reports = tmp.path().join("reports");
+
+    let output = fani(&[
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--report-dir",
+        reports.to_str().unwrap(),
+        "--quiet",
+    ]);
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(report["totals"]["agent_calls"], 1);
+    assert_eq!(report["totals"]["repair_rounds"], 0);
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
     assert_eq!(
         fs::read_to_string(repo.join("translations/zh-CN/docs/guide.md")).unwrap(),
         "**标签：** 文本。\n"

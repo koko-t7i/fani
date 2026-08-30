@@ -230,6 +230,7 @@ pub struct RecoveredAttempt {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FailedAttemptContext {
+    pub attempt_id: i64,
     pub output: Option<String>,
     pub error: Option<String>,
 }

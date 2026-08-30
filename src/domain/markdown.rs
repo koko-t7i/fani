@@ -221,6 +221,32 @@ fn is_inline_event(event: &Event<'_>) -> bool {
     )
 }
 
+pub fn repair_leading_strong_separator(unit: &MarkdownUnit, translated: &str) -> Option<String> {
+    fn closing_strong_end(value: &str) -> Option<usize> {
+        value
+            .strip_prefix("**")?
+            .find("**")
+            .map(|offset| offset + 4)
+    }
+
+    let source_end = closing_strong_end(&unit.protected_source)?;
+    if !unit.protected_source[source_end..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
+    let translated_end = closing_strong_end(translated)?;
+    let next = translated[translated_end..].chars().next()?;
+    if next.is_whitespace() {
+        return None;
+    }
+    let mut repaired = translated.to_owned();
+    repaired.insert(translated_end, ' ');
+    Some(repaired)
+}
+
 pub fn validate_translation(
     unit: &MarkdownUnit,
     translated: &str,

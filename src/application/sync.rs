@@ -8,7 +8,8 @@ use crate::application::ports::{
 };
 use crate::application::settings::RepoConfig;
 use crate::domain::markdown::{
-    MarkdownUnit, UnitTranslation, apply_translations, extract_units, validate_translation,
+    MarkdownUnit, UnitTranslation, apply_translations, extract_units,
+    repair_leading_strong_separator, validate_translation,
 };
 use crate::domain::matching::{MatchKind, PreviousUnit, match_units_with_stable_ids};
 use crate::domain::model::{
@@ -26,7 +27,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
-const REPAIR_CONTEXT_VERSION: &str = "v2";
+const REPAIR_CONTEXT_VERSION: &str = "v3";
+const LEADING_STRONG_SEPARATOR_VERSION: &str = "fani-leading-strong-separator-v1";
 
 fn hash(parts: &[&[u8]]) -> String {
     let mut digest = Sha256::new();
@@ -744,6 +746,94 @@ impl<'a> Orchestrator<'a> {
         documents: &mut [PlannedDocument],
         all_results: &mut Vec<AgentResult>,
     ) -> Result<usize> {
+        for document in documents.iter_mut() {
+            for unit in &mut document.units {
+                let Some(work_item_id) = unit.work_item_id.filter(|_| unit.translation.is_none())
+                else {
+                    continue;
+                };
+                let Some(failed) = self.database.failed_attempt_context(work_item_id)? else {
+                    continue;
+                };
+                let Some(rejected) = failed.output.as_deref() else {
+                    continue;
+                };
+                let Some(repaired) = repair_leading_strong_separator(&unit.markdown, rejected)
+                    .filter(|output| validate_translation(&unit.markdown, output).is_ok())
+                else {
+                    continue;
+                };
+                let deterministic_key = format!(
+                    "{}:repair:{REPAIR_CONTEXT_VERSION}:leading-strong-separator",
+                    unit.stable_id
+                );
+                if let Some(recovered) = self
+                    .database
+                    .successful_attempt(work_item_id, &deterministic_key)?
+                {
+                    self.database.select_canonical_candidate(
+                        unit.database_id,
+                        language,
+                        &format!("attempt:{}", recovered.id),
+                        &recovered.output,
+                        Some(recovered.id),
+                        Some(1.0),
+                    )?;
+                    unit.translation = Some(recovered.output);
+                    continue;
+                }
+                if self
+                    .database
+                    .attempt_status(work_item_id, &deterministic_key)?
+                    .is_some()
+                {
+                    continue;
+                }
+                let rejected_hash = hash(&[rejected.as_bytes()]);
+                let request_json = serde_json::to_string(&json!({
+                    "schema": "fani.deterministic.repair.request.v1",
+                    "task_id": unit.stable_id,
+                    "operation": LEADING_STRONG_SEPARATOR_VERSION,
+                    "source_attempt_id": failed.attempt_id,
+                    "source_output_hash": rejected_hash,
+                }))?;
+                let response_json = serde_json::to_string(&json!({
+                    "schema": "fani.agent.response.v1",
+                    "task_id": unit.stable_id,
+                    "output": repaired,
+                }))?;
+                let algorithm_hash = hash(&[LEADING_STRONG_SEPARATOR_VERSION.as_bytes()]);
+                self.database
+                    .record_attempt_candidate(AttemptCandidateInput {
+                        attempt: AttemptInput {
+                            work_item_id,
+                            dedupe_key: &deterministic_key,
+                            agent: "fani",
+                            provider: "deterministic",
+                            model: LEADING_STRONG_SEPARATOR_VERSION,
+                            adapter: "native",
+                            provider_fingerprint: &algorithm_hash,
+                            prompt_version: LEADING_STRONG_SEPARATOR_VERSION,
+                            prompt_hash: &algorithm_hash,
+                            policy_fingerprint: &prompts::policy_fingerprint(),
+                            status: "succeeded",
+                            request_json: &request_json,
+                            response_json: Some(&response_json),
+                            error: None,
+                        },
+                        unit_id: unit.database_id,
+                        locale: language,
+                        candidate_key: &format!("attempt:{deterministic_key}"),
+                        target_text: &repaired,
+                        score: Some(1.0),
+                        policy_fingerprint: &prompts::policy_fingerprint(),
+                        provenance: TranslationProvenance::RepairedAi,
+                    })?;
+                (self.failpoint)("repair_candidate_committed");
+                unit.translation = Some(repaired);
+            }
+        }
+
         let mut rounds = 0;
         for round in 0..self.repo.repair_budget {
             let mut tasks = Vec::new();
