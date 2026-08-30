@@ -2105,6 +2105,33 @@ impl Database {
         ).optional()?)
     }
 
+    pub fn candidate_translation(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        source_hash: &str,
+        context_key: &str,
+        policy_fingerprint: &str,
+    ) -> Result<Option<String>> {
+        require_fingerprint(policy_fingerprint, "translation policy")?;
+        Ok(self
+            .connect()?
+            .query_row(
+                r#"SELECT target_text FROM translation_memory_entries
+               WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4
+                 AND tier='candidate' AND policy_fingerprint=?5 AND superseded_at IS NULL"#,
+                params![
+                    repository_id,
+                    locale,
+                    source_hash,
+                    context_key,
+                    policy_fingerprint
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn selected_candidate(&self, unit_id: i64, locale: &str) -> Result<Option<String>> {
         Ok(self.connect()?.query_row(
             "SELECT target_text FROM canonical_candidates WHERE unit_id=?1 AND locale=?2 AND selected=1",
@@ -2365,6 +2392,24 @@ impl StateStore for Database {
         context_key: &str,
     ) -> Result<Option<String>> {
         Database::trusted_translation(self, repository_id, locale, source_hash, context_key)
+    }
+
+    fn candidate_translation(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        source_hash: &str,
+        context_key: &str,
+        policy_fingerprint: &str,
+    ) -> Result<Option<String>> {
+        Database::candidate_translation(
+            self,
+            repository_id,
+            locale,
+            source_hash,
+            context_key,
+            policy_fingerprint,
+        )
     }
 
     fn trust_translation(&self, input: TrustTranslationInput<'_>) -> Result<i64> {

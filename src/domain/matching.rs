@@ -35,10 +35,39 @@ fn normalized(text: &str) -> String {
 }
 
 pub fn match_units(previous: &[PreviousUnit], current: &[MarkdownUnit]) -> Vec<UnitMatch> {
+    match_units_with_stable_ids(previous, current, &[])
+}
+
+pub fn match_units_with_stable_ids(
+    previous: &[PreviousUnit],
+    current: &[MarkdownUnit],
+    stable_ids: &[String],
+) -> Vec<UnitMatch> {
     let mut used = vec![false; previous.len()];
     let mut matches = Vec::with_capacity(current.len());
 
     for (ordinal, unit) in current.iter().enumerate() {
+        if let Some(stable_id) = stable_ids.get(ordinal) {
+            if let Some((index, candidate)) =
+                previous.iter().enumerate().find(|(index, candidate)| {
+                    !used[*index]
+                        && candidate.stable_id == *stable_id
+                        && candidate.kind == unit.kind
+                        && normalized(&candidate.source) == normalized(&unit.source)
+                })
+            {
+                used[index] = true;
+                matches.push(UnitMatch {
+                    current_id: unit.id.clone(),
+                    stable_id: Some(candidate.stable_id.clone()),
+                    previous_source: Some(candidate.source.clone()),
+                    previous_translation: Some(candidate.translation.clone()),
+                    trusted_reuse: candidate.trusted,
+                    kind: MatchKind::Exact,
+                });
+                continue;
+            }
+        }
         let exact: Vec<_> = previous
             .iter()
             .enumerate()
@@ -177,5 +206,22 @@ mod tests {
             &current,
         );
         assert_eq!(result[0].kind, MatchKind::Ambiguous);
+    }
+
+    #[test]
+    fn stable_identity_disambiguates_unchanged_duplicate_text() {
+        let current = extract_units("Repeated.\n\nRepeated.\n");
+        let result = match_units_with_stable_ids(
+            &[
+                previous("stable-a", 0, "Repeated.\n"),
+                previous("stable-b", 1, "Repeated.\n"),
+            ],
+            &current,
+            &["stable-a".into(), "stable-b".into()],
+        );
+        assert_eq!(result[0].stable_id.as_deref(), Some("stable-a"));
+        assert_eq!(result[1].stable_id.as_deref(), Some("stable-b"));
+        assert_eq!(result[0].kind, MatchKind::Exact);
+        assert_eq!(result[1].kind, MatchKind::Exact);
     }
 }

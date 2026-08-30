@@ -369,6 +369,14 @@ pub trait StateStore {
         source_hash: &str,
         context_key: &str,
     ) -> Result<Option<String>>;
+    fn candidate_translation(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        source_hash: &str,
+        context_key: &str,
+        policy_fingerprint: &str,
+    ) -> Result<Option<String>>;
     fn trust_translation(&self, input: TrustTranslationInput<'_>) -> Result<i64>;
     fn begin_run(
         &self,

@@ -355,6 +355,156 @@ repair = "fixture"
 }
 
 #[test]
+fn bounded_sync_resumes_candidates_without_false_duplicate_ambiguity() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(
+        repo.join("docs/guide.md"),
+        "# Alpha\n\nRepeated.\n\nRepeated.\n\nFinal.\n",
+    )
+    .unwrap();
+    run(&repo, &["init", "-q", "-b", "main"]);
+    run(&repo, &["config", "user.email", "test@example.invalid"]);
+    run(&repo, &["config", "user.name", "Test"]);
+    run(&repo, &["add", "."]);
+    run(&repo, &["commit", "-qm", "source"]);
+
+    let counter = tmp.path().join("counter");
+    let provider = tmp.path().join("provider.sh");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\njq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(.task.source | gsub(\"Alpha\";\"阿尔法\") | gsub(\"Repeated\";\"重复\") | gsub(\"Final\";\"最后\"))}}'\n",
+            counter = counter.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&provider).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&provider, permissions).unwrap();
+
+    let config = tmp.path().join("fani.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[repo]]
+path = "{}"
+languages = ["zh-CN"]
+include = ["docs/**/*.md"]
+data_dir = ".fani"
+target_pattern = "translations/{{lang}}/{{relpath}}"
+max_tasks = 2
+repair_budget = 0
+[repo.quality]
+revision = false
+proofread = false
+[repo.publish]
+enabled = false
+source_ref = "HEAD"
+[agents.fixture]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
+cmd = ["{}"]
+concurrency = 1
+timeout_s = 5
+retries = 0
+[routing]
+translate = "fixture"
+repair = "fixture"
+"#,
+            repo.display(),
+            provider.display()
+        ),
+    )
+    .unwrap();
+    let reports = tmp.path().join("reports");
+
+    let first = fani(&[
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--report-dir",
+        reports.to_str().unwrap(),
+        "--quiet",
+    ]);
+    let first_report: Value =
+        serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
+    assert_eq!(
+        first.status.code(),
+        Some(3),
+        "stdout={} stderr={} report={first_report}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(first_report["status"], "partial");
+    assert_eq!(first_report["totals"]["findings"], 0);
+    assert_eq!(first_report["totals"]["remaining_tasks"], 2);
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+    assert!(!repo.join("translations/zh-CN/docs/guide.md").exists());
+
+    let status = fani(&["status", "--config", config.to_str().unwrap()]);
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(status_text.contains("conflicts=0"), "{status_text}");
+    assert!(status_text.contains("pending=1"), "{status_text}");
+    assert!(status_text.contains("reused=3"), "{status_text}");
+
+    let second = fani(&[
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--report-dir",
+        reports.to_str().unwrap(),
+        "--quiet",
+    ]);
+    let second_report: Value =
+        serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "stdout={} stderr={} report={second_report}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(second_report["status"], "ok");
+    assert_eq!(second_report["totals"]["agent_calls"], 1);
+    assert_eq!(second_report["totals"]["conflicts"], 0);
+    assert_eq!(second_report["totals"]["findings"], 0);
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "3");
+    assert_eq!(
+        fs::read_to_string(repo.join("translations/zh-CN/docs/guide.md")).unwrap(),
+        "# 阿尔法\n\n重复.\n\n重复.\n\n最后.\n"
+    );
+
+    let third = fani(&[
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--report-dir",
+        reports.to_str().unwrap(),
+        "--quiet",
+    ]);
+    let third_report: Value =
+        serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
+    assert_eq!(third.status.code(), Some(0), "{third_report}");
+    assert_eq!(third_report["totals"]["agent_calls"], 0);
+    assert_eq!(third_report["totals"]["files_written"], 0);
+    assert_eq!(
+        third_report["languages"][0]["message"],
+        "every translation is up to date"
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "3");
+}
+
+#[test]
 fn command_adapter_accepts_only_strict_versioned_json_envelopes() {
     let (code, report) = strict_provider_case(
         r##"#!/bin/sh
