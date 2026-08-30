@@ -253,9 +253,10 @@ fn release_workflow_has_least_privilege_pinned_provenance_and_gates() {
     for required in [
         "pull_request:",
         "branches: [main]",
-        "cargo install --locked cargo-audit@0.22.2 cargo-deny@0.20.2",
-        "run: cargo audit",
-        "run: cargo deny check",
+        "rustup toolchain install 1.98.0 --profile minimal",
+        "cargo +1.98.0 install --locked cargo-audit@0.22.2 cargo-deny@0.20.2",
+        "run: cargo +1.98.0 audit",
+        "run: cargo +1.98.0 deny check",
     ] {
         assert!(security.contains(required), "missing {required}");
     }
