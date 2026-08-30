@@ -331,7 +331,37 @@ repair = "fixture"
     assert_eq!(initial.status.code(), Some(0));
     assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
 
-    fs::write(&target, "# 人工翻译 `fani`\n").unwrap();
+    let human_translation = "# 人工翻译 `fani`\n";
+    fs::write(&target, human_translation).unwrap();
+    let blocked = fani(&[
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--report-dir",
+        reports.to_str().unwrap(),
+        "--quiet",
+    ]);
+    assert_eq!(
+        blocked.status.code(),
+        Some(1),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), human_translation);
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+    let blocked_report: Value =
+        serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
+    assert_eq!(blocked_report["status"], "needs_human");
+    assert_eq!(blocked_report["exit_code"], 1);
+    assert!(
+        blocked_report["languages"][0]["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "HUMAN-EDIT")
+    );
+
     let adopted = fani(&["adopt", "--config", config.to_str().unwrap()]);
     assert_eq!(
         adopted.status.code(),
