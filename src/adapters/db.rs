@@ -1,9 +1,9 @@
 use crate::adapters::process::process_identity;
 use crate::application::ports::{
     AttemptCandidateInput, AttemptInput, AttemptReceipt, CanonicalFile, CanonicalFileInput,
-    CanonicalTranslationInput, FindingInput, OutboxEntry, OutboxKind, PublicationManifestInput,
-    PullRequestStateInput, RecoveredAttempt, StateStore, StoredPullRequest, TrustTranslationInput,
-    UnitHistory,
+    CanonicalTranslationInput, FailedAttemptContext, FindingInput, OutboxEntry, OutboxKind,
+    PublicationManifestInput, PullRequestStateInput, RecoveredAttempt, StateStore,
+    StoredPullRequest, TrustTranslationInput, UnitHistory,
 };
 use crate::domain::model::{CanonicalTransition, PublicationState};
 use anyhow::{Context, Result, anyhow, bail};
@@ -779,6 +779,37 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    pub fn failed_attempt_context(
+        &self,
+        work_item_id: i64,
+    ) -> Result<Option<FailedAttemptContext>> {
+        let conn = self.connect()?;
+        let attempt: Option<(i64, Option<String>, Option<String>)> = conn
+            .query_row(
+                r#"SELECT id,response_json,error FROM attempts
+                   WHERE work_item_id=?1 AND status!='succeeded'
+                   ORDER BY id DESC LIMIT 1"#,
+                [work_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((attempt_id, response_json, error)) = attempt else {
+            return Ok(None);
+        };
+        let output = if let Some(response) = response_json {
+            let value: serde_json::Value = serde_json::from_str(&response)
+                .context("failed Agent response is not valid JSON")?;
+            value
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        let _ = attempt_id;
+        Ok(Some(FailedAttemptContext { output, error }))
     }
 
     pub fn successful_attempt(
@@ -2488,6 +2519,10 @@ impl StateStore for Database {
 
     fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>> {
         Database::attempt_status(self, work_item_id, dedupe_key)
+    }
+
+    fn failed_attempt_context(&self, work_item_id: i64) -> Result<Option<FailedAttemptContext>> {
+        Database::failed_attempt_context(self, work_item_id)
     }
 
     fn recoverable_candidate(

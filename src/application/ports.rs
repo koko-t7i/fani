@@ -228,6 +228,12 @@ pub struct RecoveredAttempt {
     pub output: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailedAttemptContext {
+    pub output: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TrustTranslationInput<'a> {
     pub repository_id: i64,
@@ -407,6 +413,9 @@ pub trait StateStore {
         dedupe_key: &str,
     ) -> Result<Option<RecoveredAttempt>>;
     fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>>;
+    fn failed_attempt_context(&self, _work_item_id: i64) -> Result<Option<FailedAttemptContext>> {
+        Ok(None)
+    }
     fn recoverable_candidate(
         &self,
         run_id: &str,

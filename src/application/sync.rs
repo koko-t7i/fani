@@ -26,6 +26,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
+const REPAIR_CONTEXT_VERSION: &str = "v2";
+
 fn hash(parts: &[&[u8]]) -> String {
     let mut digest = Sha256::new();
     for part in parts {
@@ -691,7 +693,13 @@ impl<'a> Orchestrator<'a> {
                                 self.database.record_finding(FindingInput {
                                     work_item_id,
                                     attempt_id: Some(receipt.id),
-                                    finding_key: &format!("{}:{}", validation.code, unit.stable_id),
+                                    finding_key: &format!(
+                                        "{}:{}:{}:{}",
+                                        validation.code,
+                                        unit.stable_id,
+                                        receipt.id,
+                                        &hash(&[validation.message.as_bytes()])[..16]
+                                    ),
                                     severity: "error",
                                     code: validation.code,
                                     message: &validation.message,
@@ -747,7 +755,8 @@ impl<'a> Orchestrator<'a> {
                     else {
                         continue;
                     };
-                    let dedupe_key = format!("{}:repair:{round}", unit.stable_id);
+                    let dedupe_key =
+                        format!("{}:repair:{REPAIR_CONTEXT_VERSION}:{round}", unit.stable_id);
                     if let Some(recovered) = self
                         .database
                         .successful_attempt(work_item_id, &dedupe_key)?
@@ -779,6 +788,42 @@ impl<'a> Orchestrator<'a> {
                         skipped_terminal_attempt = true;
                         continue;
                     }
+                    let failed = self.database.failed_attempt_context(work_item_id)?;
+                    let previous_translation = failed
+                        .as_ref()
+                        .and_then(|context| context.output.clone())
+                        .or_else(|| unit.previous_translation.clone());
+                    let mut repair_findings = failed
+                        .as_ref()
+                        .and_then(|context| context.output.as_deref())
+                        .and_then(|output| validate_translation(&unit.markdown, output).err())
+                        .map(|validation| {
+                            validation
+                                .into_iter()
+                                .map(|stored| {
+                                    finding(
+                                        &document.source_path,
+                                        Some(unit.stable_id.clone()),
+                                        stored.code,
+                                        stored.message,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if repair_findings.is_empty() {
+                        repair_findings.push(finding(
+                            &document.source_path,
+                            Some(unit.stable_id.clone()),
+                            DecisionCode::VerificationFailed.as_str(),
+                            failed
+                                .as_ref()
+                                .and_then(|context| context.error.as_deref())
+                                .unwrap_or(
+                                    "previous output failed deterministic Markdown validation",
+                                ),
+                        ));
+                    }
                     tasks.push(AgentTask {
                         id: unit.stable_id.clone(),
                         stage: AgentStage::Repair,
@@ -786,13 +831,8 @@ impl<'a> Orchestrator<'a> {
                         target_language: language.into(),
                         source: unit.markdown.protected_source.clone(),
                         previous_source: unit.previous_source.clone(),
-                        previous_translation: unit.previous_translation.clone(),
-                        findings: vec![finding(
-                            &document.source_path,
-                            Some(unit.stable_id.clone()),
-                            DecisionCode::VerificationFailed.as_str(),
-                            "previous output failed deterministic Markdown validation",
-                        )],
+                        previous_translation,
+                        findings: repair_findings,
                         protected_tokens: unit
                             .markdown
                             .protected
@@ -828,7 +868,8 @@ impl<'a> Orchestrator<'a> {
                     let Some(result) = by_id.get(unit.stable_id.as_str()) else {
                         continue;
                     };
-                    let dedupe_key = format!("{}:repair:{round}", unit.stable_id);
+                    let dedupe_key =
+                        format!("{}:repair:{REPAIR_CONTEXT_VERSION}:{round}", unit.stable_id);
                     if result.ok && validate_translation(&unit.markdown, &result.output).is_ok() {
                         self.database
                             .record_attempt_candidate(AttemptCandidateInput {
@@ -866,7 +907,7 @@ impl<'a> Orchestrator<'a> {
                         } else {
                             "failed"
                         };
-                        self.database.record_attempt(AttemptInput {
+                        let receipt = self.database.record_attempt(AttemptInput {
                             work_item_id,
                             dedupe_key: &dedupe_key,
                             agent: &agent_name,
@@ -886,6 +927,27 @@ impl<'a> Orchestrator<'a> {
                                 result.diagnostic.as_str()
                             }),
                         })?;
+                        if result.ok {
+                            for validation in validate_translation(&unit.markdown, &result.output)
+                                .expect_err("invalid repair output was checked above")
+                            {
+                                self.database.record_finding(FindingInput {
+                                    work_item_id,
+                                    attempt_id: Some(receipt.id),
+                                    finding_key: &format!(
+                                        "{}:{}:{}:{}",
+                                        validation.code,
+                                        unit.stable_id,
+                                        receipt.id,
+                                        &hash(&[validation.message.as_bytes()])[..16]
+                                    ),
+                                    severity: "error",
+                                    code: validation.code,
+                                    message: &validation.message,
+                                    details_json: "{}",
+                                })?;
+                            }
+                        }
                     }
                 }
             }
