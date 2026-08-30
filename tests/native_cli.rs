@@ -346,6 +346,30 @@ repair = "fixture"
     assert!(durable_request["prompt"]["content"].is_string());
     assert!(!report.to_string().contains("--- SOURCE ---"));
 
+    database
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE units SET unit_key='legacy-unit-key' WHERE id=(SELECT id FROM units ORDER BY id LIMIT 1)",
+            [],
+        )
+        .unwrap();
+    let legacy_status = fani(&["status", "--config", config.to_str().unwrap()]);
+    assert_eq!(
+        legacy_status.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&legacy_status.stdout),
+        String::from_utf8_lossy(&legacy_status.stderr)
+    );
+    let legacy_status_text = String::from_utf8_lossy(&legacy_status.stdout);
+    assert!(
+        legacy_status_text.contains("pending=0")
+            && legacy_status_text.contains("reused=2")
+            && legacy_status_text.contains("deferred=0"),
+        "{legacy_status_text}"
+    );
+
     let second = fani(&[
         "sync",
         "--config",

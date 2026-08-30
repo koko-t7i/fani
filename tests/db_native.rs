@@ -570,6 +570,20 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
             .as_deref(),
         Some("候选译文")
     );
+    assert_eq!(
+        fixture
+            .db
+            .recoverable_invocation_candidate(
+                "sync:abc123:zh-CN",
+                fixture.unit_id,
+                "zh-CN",
+                TEST_FINGERPRINT,
+                "fani-leading-strong-separator-v1",
+            )
+            .unwrap()
+            .as_deref(),
+        Some("候选译文")
+    );
     let fingerprint = prompts::policy_fingerprint();
     assert_ne!(fingerprint, TEST_FINGERPRINT);
     assert_eq!(

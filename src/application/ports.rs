@@ -425,6 +425,16 @@ pub trait StateStore {
         policy_fingerprint: &str,
         deterministic_repair_version: &str,
     ) -> Result<Option<String>>;
+    fn recoverable_invocation_candidate(
+        &self,
+        _invocation_key: &str,
+        _unit_id: i64,
+        _locale: &str,
+        _policy_fingerprint: &str,
+        _deterministic_repair_version: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn recoverable_unit_candidate(
         &self,
         _unit_id: i64,

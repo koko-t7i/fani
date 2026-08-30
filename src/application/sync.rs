@@ -289,6 +289,8 @@ impl<'a> Orchestrator<'a> {
         let source_revision = self.git.resolve_source_revision(self.repo)?;
         let repository_id = self.repository_id()?;
         let policy_fingerprint = prompts::policy_fingerprint();
+        let invocation =
+            format!("sync:{repository_id}:{language}:{source_revision}:{policy_fingerprint}");
         let documents = self.git.discover(self.repo, &source_revision)?;
         let mut pending = 0;
         let mut reused = 0;
@@ -330,10 +332,14 @@ impl<'a> Orchestrator<'a> {
                     _ => {
                         let context = kind_name(unit);
                         let source_hash = hash(&[unit.source.as_bytes()]);
-                        let database_id = matched.stable_id.as_ref().and_then(|stable_id| {
+                        let stable_id = matched.stable_id.as_deref().or_else(|| {
+                            (!stable_hints[ordinal].is_empty())
+                                .then_some(stable_hints[ordinal].as_str())
+                        });
+                        let database_id = stable_id.and_then(|stable_id| {
                             history
                                 .iter()
-                                .find(|row| row.unit_key == *stable_id)
+                                .find(|row| row.unit_key == stable_id)
                                 .map(|row| row.id)
                         });
                         let trusted = self.database.trusted_translation(
@@ -343,6 +349,16 @@ impl<'a> Orchestrator<'a> {
                             &context,
                         )?;
                         let candidate = match database_id {
+                            Some(database_id) => self.database.recoverable_invocation_candidate(
+                                &invocation,
+                                database_id,
+                                language,
+                                &policy_fingerprint,
+                                LEADING_STRONG_SEPARATOR_VERSION,
+                            )?,
+                            None => None,
+                        };
+                        let prior_candidate = match database_id {
                             Some(database_id) if !stable_hints[ordinal].is_empty() => {
                                 self.database.recoverable_unit_candidate(
                                     database_id,
@@ -353,7 +369,7 @@ impl<'a> Orchestrator<'a> {
                             }
                             _ => None,
                         };
-                        if trusted.or(candidate).is_some() {
+                        if trusted.or(candidate).or(prior_candidate).is_some() {
                             reused += 1;
                         } else {
                             pending += 1;

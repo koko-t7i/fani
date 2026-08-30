@@ -2216,6 +2216,38 @@ impl Database {
             .optional()?)
     }
 
+    pub fn recoverable_invocation_candidate(
+        &self,
+        invocation_key: &str,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
+    ) -> Result<Option<String>> {
+        require_fingerprint(policy_fingerprint, "translation policy")?;
+        Ok(self
+            .connect()?
+            .query_row(
+                r#"SELECT c.target_text
+                   FROM canonical_candidates c
+                   JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
+                   JOIN work_items w ON w.id=a.work_item_id
+                   JOIN runs r ON r.id=w.run_id
+                   WHERE r.invocation_key=?1 AND c.unit_id=?2 AND c.locale=?3 AND c.selected=1
+                     AND a.policy_fingerprint=?4
+                     AND (a.agent<>'fani' OR a.provider<>'deterministic' OR a.adapter<>'native' OR a.model=?5)"#,
+                params![
+                    invocation_key,
+                    unit_id,
+                    locale,
+                    policy_fingerprint,
+                    deterministic_repair_version
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn recoverable_unit_candidate(
         &self,
         unit_id: i64,
@@ -2557,6 +2589,24 @@ impl StateStore for Database {
         Database::recoverable_candidate(
             self,
             run_id,
+            unit_id,
+            locale,
+            policy_fingerprint,
+            deterministic_repair_version,
+        )
+    }
+
+    fn recoverable_invocation_candidate(
+        &self,
+        invocation_key: &str,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
+    ) -> Result<Option<String>> {
+        Database::recoverable_invocation_candidate(
+            self,
+            invocation_key,
             unit_id,
             locale,
             policy_fingerprint,
