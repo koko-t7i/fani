@@ -559,7 +559,12 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
     assert_eq!(
         fixture
             .db
-            .recoverable_candidate(&fixture.run_id, fixture.unit_id, "zh-CN")
+            .recoverable_candidate(
+                &fixture.run_id,
+                fixture.unit_id,
+                "zh-CN",
+                "fani-leading-strong-separator-v1",
+            )
             .unwrap()
             .as_deref(),
         Some("候选译文")
@@ -593,7 +598,12 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
     assert_eq!(
         fixture
             .db
-            .recoverable_candidate("different-run", fixture.unit_id, "zh-CN")
+            .recoverable_candidate(
+                "different-run",
+                fixture.unit_id,
+                "zh-CN",
+                "fani-leading-strong-separator-v1",
+            )
             .unwrap(),
         None
     );

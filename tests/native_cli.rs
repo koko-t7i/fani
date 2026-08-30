@@ -725,6 +725,99 @@ repair = "fixture"
 }
 
 #[test]
+fn repair_receives_explicit_protected_token_order_finding() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(
+        repo.join("docs/guide.md"),
+        "Run `fani doctor` in the same environment as `fani sync`.\n",
+    )
+    .unwrap();
+    run(&repo, &["init", "-q", "-b", "main"]);
+    run(&repo, &["config", "user.email", "test@example.invalid"]);
+    run(&repo, &["config", "user.name", "Test"]);
+    run(&repo, &["add", "."]);
+    run(&repo, &["commit", "-qm", "source"]);
+
+    let counter = tmp.path().join("counter");
+    let provider = tmp.path().join("provider.sh");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\nif [ \"$count\" -eq 1 ]; then\n  jq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(\"在与 \" + .task.protected_tokens[1] + \" 相同的环境中运行 \" + .task.protected_tokens[0] + \"。\")}}'\nelse\n  jq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(if any(.task.findings[]; .code == \"MD-PROTECTED-ORDER\") then .task.source else \"still invalid\" end)}}'\nfi\n",
+            counter = counter.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&provider).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&provider, permissions).unwrap();
+
+    let config = tmp.path().join("fani.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[repo]]
+path = "{}"
+languages = ["zh-CN"]
+include = ["docs/**/*.md"]
+data_dir = ".fani"
+target_pattern = "translations/{{lang}}/{{relpath}}"
+max_tasks = 1
+repair_budget = 1
+[repo.quality]
+revision = false
+proofread = false
+[repo.publish]
+enabled = false
+source_ref = "HEAD"
+[agents.fixture]
+provider = "fixture-provider"
+model = "fixture-model"
+adapter = "command-json-v1"
+cmd = ["{}"]
+concurrency = 1
+timeout_s = 5
+retries = 0
+[routing]
+translate = "fixture"
+repair = "fixture"
+"#,
+            repo.display(),
+            provider.display()
+        ),
+    )
+    .unwrap();
+    let reports = tmp.path().join("reports");
+
+    let output = fani(&[
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--report-dir",
+        reports.to_str().unwrap(),
+        "--quiet",
+    ]);
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={} report={report}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report["totals"]["agent_calls"], 2);
+    assert_eq!(report["totals"]["repair_rounds"], 1);
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+    assert_eq!(
+        fs::read_to_string(repo.join("translations/zh-CN/docs/guide.md")).unwrap(),
+        "Run `fani doctor` in the same environment as `fani sync`.\n"
+    );
+}
+
+#[test]
 fn missing_separator_after_leading_strong_is_repaired_deterministically() {
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -741,7 +834,7 @@ fn missing_separator_after_leading_strong_is_repaired_deterministically() {
     fs::write(
         &provider,
         format!(
-            "#!/bin/sh\nset -eu\nprintf 1 > '{counter}'\njq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:\"**标签：**文本。\"}}'\n",
+            "#!/bin/sh\nset -eu\ncount=0\n[ ! -f '{counter}' ] || count=$(cat '{counter}')\ncount=$((count+1))\nprintf '%s' \"$count\" > '{counter}'\njq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:\"**标签：**文本。\"}}'\n",
             counter = counter.display()
         ),
     )
@@ -786,6 +879,23 @@ repair = "fixture"
     )
     .unwrap();
     let reports = tmp.path().join("reports");
+    let marker = tmp.path().join("failpoint-marker");
+    let target = repo.join("translations/zh-CN/docs/guide.md");
+
+    kill_sync_at_failpoint(&config, &reports, "repair_candidate_committed", &marker);
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+    assert!(!target.exists());
+    let database = Database::open(repo.join(".fani/fani.db")).unwrap();
+    let durable: i64 = database
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM attempts WHERE status='succeeded' AND dedupe_key LIKE '%:fani-leading-strong-separator-v1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(durable, 1);
 
     let output = fani(&[
         "sync",
@@ -798,12 +908,100 @@ repair = "fixture"
     let report: Value =
         serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
     assert_eq!(output.status.code(), Some(0), "{report}");
-    assert_eq!(report["totals"]["agent_calls"], 1);
+    assert_eq!(report["totals"]["agent_calls"], 0);
     assert_eq!(report["totals"]["repair_rounds"], 0);
     assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "**标签：** 文本。\n");
+
+    let connection = database.connect().unwrap();
+    let (unit_id, policy_fingerprint, run_id): (i64, String, String) = connection
+        .query_row(
+            "SELECT c.unit_id,w.policy_fingerprint,w.run_id FROM canonical_candidates c JOIN attempts a ON a.id=c.source_attempt_id JOIN work_items w ON w.id=a.work_item_id WHERE a.provider='deterministic' AND c.selected=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE attempts SET model='fani-leading-strong-separator-old' WHERE provider='deterministic'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
     assert_eq!(
-        fs::read_to_string(repo.join("translations/zh-CN/docs/guide.md")).unwrap(),
-        "**标签：** 文本。\n"
+        database
+            .recoverable_candidate(
+                &run_id,
+                unit_id,
+                "zh-CN",
+                "fani-leading-strong-separator-v1",
+            )
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        database
+            .recoverable_unit_candidate(
+                unit_id,
+                "zh-CN",
+                &policy_fingerprint,
+                "fani-leading-strong-separator-v1",
+            )
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        database
+            .recoverable_candidate(
+                &run_id,
+                unit_id,
+                "zh-CN",
+                "fani-leading-strong-separator-old",
+            )
+            .unwrap(),
+        Some("**标签：** 文本。".into())
+    );
+    assert_eq!(
+        database
+            .recoverable_unit_candidate(
+                unit_id,
+                "zh-CN",
+                &policy_fingerprint,
+                "fani-leading-strong-separator-old",
+            )
+            .unwrap(),
+        Some("**标签：** 文本。".into())
+    );
+
+    database
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE attempts SET adapter='command-json-v1' WHERE provider='deterministic'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .recoverable_candidate(
+                &run_id,
+                unit_id,
+                "zh-CN",
+                "fani-leading-strong-separator-v1",
+            )
+            .unwrap(),
+        Some("**标签：** 文本。".into())
+    );
+    assert_eq!(
+        database
+            .recoverable_unit_candidate(
+                unit_id,
+                "zh-CN",
+                &policy_fingerprint,
+                "fani-leading-strong-separator-v1",
+            )
+            .unwrap(),
+        Some("**标签：** 文本。".into())
     );
 }
 

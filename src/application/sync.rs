@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
-const REPAIR_CONTEXT_VERSION: &str = "v3";
+const REPAIR_CONTEXT_VERSION: &str = "v4";
 const LEADING_STRONG_SEPARATOR_VERSION: &str = "fani-leading-strong-separator-v1";
 
 fn hash(parts: &[&[u8]]) -> String {
@@ -439,9 +439,12 @@ impl<'a> Orchestrator<'a> {
                     &source_hash,
                     &serde_json::to_string(&json!({"kind": context}))?,
                 )?;
-                let candidate =
-                    self.database
-                        .recoverable_candidate(run_id, database_id, language)?;
+                let candidate = self.database.recoverable_candidate(
+                    run_id,
+                    database_id,
+                    language,
+                    LEADING_STRONG_SEPARATOR_VERSION,
+                )?;
                 let prior_candidate = if stable_hints[ordinal].is_empty() {
                     None
                 } else {
@@ -449,6 +452,7 @@ impl<'a> Orchestrator<'a> {
                         database_id,
                         language,
                         &policy_fingerprint,
+                        LEADING_STRONG_SEPARATOR_VERSION,
                     )?
                 };
                 let trusted = self.database.trusted_translation(
@@ -764,7 +768,7 @@ impl<'a> Orchestrator<'a> {
                     continue;
                 };
                 let deterministic_key = format!(
-                    "{}:repair:{REPAIR_CONTEXT_VERSION}:leading-strong-separator",
+                    "{}:repair:{REPAIR_CONTEXT_VERSION}:{LEADING_STRONG_SEPARATOR_VERSION}",
                     unit.stable_id
                 );
                 if let Some(recovered) = self

@@ -117,6 +117,39 @@ fn deterministic_validation_rejects_missing_tokens_and_structure_changes() {
 }
 
 #[test]
+fn validation_reports_protected_token_reordering_explicitly() {
+    let source = "Run `fani doctor` in the same environment as `fani sync`.\n";
+    let units = extract_units(source);
+    let unit = &units[0];
+    let translated = format!(
+        "在与 {} 相同的环境中运行 {}。",
+        unit.protected[1].token, unit.protected[0].token
+    );
+
+    let findings = validate_translation(unit, &translated).unwrap_err();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].code, "MD-PROTECTED-ORDER");
+    assert!(findings[0].message.contains(&unit.protected[0].token));
+    assert!(findings[0].message.contains(&unit.protected[1].token));
+}
+
+#[test]
+fn validation_ignores_adjacent_plain_text_event_segmentation() {
+    let source = "Use `command-json-v1` for a private integration. The command must implement fani's strict envelopes.\n";
+    let units = extract_units(source);
+    let unit = &units[0];
+    let translated = format!(
+        "对于私有集成，请使用 {}。该命令必须实现 fani 严格的封装。",
+        unit.protected[0].token
+    );
+
+    assert_eq!(
+        validate_translation(unit, &translated).unwrap(),
+        "对于私有集成，请使用 `command-json-v1`。该命令必须实现 fani 严格的封装。"
+    );
+}
+
+#[test]
 fn apply_is_order_independent_and_rejects_unknown_or_duplicate_ids() {
     let source = "First paragraph.\n\nSecond paragraph.\n";
     let units = extract_units(source);
@@ -330,16 +363,20 @@ fn corpus_rejects_malicious_tokens_links_and_structure_changes() {
             .any(|finding| finding.code == "MD-PROTECTED")
     );
 
-    let injected = format!(
-        "{} @@FANI_PLACEHOLDER_9999_deadbeefdeadbeef@@",
-        linked.protected_source
-    );
-    assert!(
-        validate_translation(linked, &injected)
-            .unwrap_err()
-            .iter()
-            .any(|finding| finding.code == "MD-UNKNOWN-TOKEN")
-    );
+    for unknown in [
+        "@@FANI_PLACEHOLDER_9999_deadbeefdeadbeef@@",
+        "@@FANI_PLACEHOLDER_9999_DEADBEEFDEADBEEF@@",
+        "@@FANI_EVIL@@",
+    ] {
+        let injected = format!("{} {unknown}", linked.protected_source);
+        assert!(
+            validate_translation(linked, &injected)
+                .unwrap_err()
+                .iter()
+                .any(|finding| finding.code == "MD-UNKNOWN-TOKEN"),
+            "accepted reserved token {unknown}"
+        );
+    }
 }
 
 #[test]

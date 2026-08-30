@@ -284,6 +284,30 @@ pub fn validate_translation(
         return Err(findings);
     }
 
+    let expected_order = unit
+        .protected
+        .iter()
+        .map(|protected| protected.token.as_str())
+        .collect::<Vec<_>>();
+    let mut positioned = expected_order
+        .iter()
+        .map(|token| (translated.find(token).unwrap(), *token))
+        .collect::<Vec<_>>();
+    positioned.sort_by_key(|(position, _)| *position);
+    let observed_order = positioned
+        .into_iter()
+        .map(|(_, token)| token)
+        .collect::<Vec<_>>();
+    if expected_order != observed_order {
+        findings.push(ValidationFinding {
+            code: "MD-PROTECTED-ORDER",
+            message: format!(
+                "protected tokens are reordered (expected {expected_order:?}, found {observed_order:?})"
+            ),
+        });
+        return Err(findings);
+    }
+
     let restored = restore_protected(unit, translated);
     let expected = structure_signature(&unit.source);
     let actual = structure_signature(&restored);
@@ -549,8 +573,9 @@ fn short_hash(value: &str) -> String {
 }
 
 fn structure_signature(markdown: &str) -> Vec<String> {
-    Parser::new_ext(markdown, Options::all())
-        .map(|event| match event {
+    let mut signature = Vec::new();
+    for event in Parser::new_ext(markdown, Options::all()) {
+        let part = match event {
             Event::Start(tag) => format!("start:{}", tag_name(&tag)),
             Event::End(tag) => format!("end:{}", tag_end_name(tag)),
             Event::Code(value) => format!("code:{value}"),
@@ -564,8 +589,13 @@ fn structure_signature(markdown: &str) -> Vec<String> {
             Event::InlineMath(value) => format!("inline-math:{value}"),
             Event::DisplayMath(value) => format!("display-math:{value}"),
             Event::Text(_) => "text".into(),
-        })
-        .collect()
+        };
+        if part == "text" && signature.last().is_some_and(|previous| previous == "text") {
+            continue;
+        }
+        signature.push(part);
+    }
+    signature
 }
 
 fn tag_name(tag: &Tag<'_>) -> String {
@@ -629,8 +659,6 @@ fn placeholder_regex() -> &'static Regex {
 
 fn protection_token_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r"@@FANI_[A-Z_]+_[0-9]{4}_[0-9a-f]{16}@@")
-            .expect("protection token regex is valid")
-    })
+    REGEX
+        .get_or_init(|| Regex::new(r"@@FANI_[^@\r\n]*@@").expect("protection token regex is valid"))
 }
