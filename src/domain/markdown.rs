@@ -648,7 +648,7 @@ fn placeholder_regex() -> &'static Regex {
             |%\([A-Za-z_][A-Za-z0-9_.-]*\)[\#0 +\-]?[0-9]*(?:\.[0-9]+)?[A-Za-z]
             |%(?:[1-9][0-9]*\$)?[\#0 +\-]?[0-9]*(?:\.[0-9]+)?[A-Za-z%]
             |\{[A-Za-z_][A-Za-z0-9_.-]*(?::[^{}\r\n]+)?\}
-            |@@[A-Za-z_][A-Za-z0-9_.-]*@@
+            |@@[A-Za-z_][A-Za-z0-9_.*-]*@@
             "#,
         )
         .expect("placeholder regex is valid")

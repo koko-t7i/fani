@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
-const REPAIR_CONTEXT_VERSION: &str = "v5";
+const REPAIR_CONTEXT_VERSION: &str = "v6";
 const LEADING_STRONG_SEPARATOR_VERSION: &str = "fani-leading-strong-separator-v1";
 
 fn hash(parts: &[&[u8]]) -> String {

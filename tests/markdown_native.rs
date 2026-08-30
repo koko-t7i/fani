@@ -133,6 +133,21 @@ fn validation_allows_protected_inline_code_reordering() {
 }
 
 #[test]
+fn literal_fani_wildcard_namespace_is_protected() {
+    let source = "Every @@FANI_*@@ token is immutable.\n";
+    let units = extract_units(source);
+    let unit = &units[0];
+    assert_eq!(unit.protected.len(), 1);
+    assert_eq!(unit.protected[0].value, "@@FANI_*@@");
+
+    let translated = format!("每个 {} 标记均不可更改。", unit.protected[0].token);
+    assert_eq!(
+        validate_translation(unit, &translated).unwrap(),
+        "每个 @@FANI_*@@ 标记均不可更改。"
+    );
+}
+
+#[test]
 fn validation_rejects_delimiters_that_change_protected_inline_code() {
     let source = "Use `a` and `b`.\n";
     let units = extract_units(source);
