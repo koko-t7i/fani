@@ -22,7 +22,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
@@ -71,6 +71,28 @@ fn stable_unit_id(path: &str, unit: &MarkdownUnit, ordinal: usize) -> String {
             ordinal.to_string().as_bytes(),
         ])[..24]
     )
+}
+
+fn stable_unit_hints(
+    database: &dyn StateStore,
+    repository_id: i64,
+    path: &str,
+    content_hash: &str,
+    stable_ids: &[String],
+) -> Result<Vec<String>> {
+    let current = database
+        .unchanged_document_unit_keys(repository_id, path, content_hash)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    Ok(stable_ids
+        .iter()
+        .map(|stable_id| {
+            current
+                .contains(stable_id)
+                .then(|| stable_id.clone())
+                .unwrap_or_default()
+        })
+        .collect())
 }
 
 fn finding(path: &str, unit_id: Option<String>, code: &str, message: impl Into<String>) -> Finding {
@@ -263,29 +285,31 @@ impl<'a> Orchestrator<'a> {
         let source_revision = self.git.resolve_source_revision(self.repo)?;
         let repository_id = self.repository_id()?;
         let documents = self.git.discover(self.repo, &source_revision)?;
-        let policy_fingerprint = prompts::policy_fingerprint();
         let mut pending = 0;
         let mut reused = 0;
         let mut conflicts = 0;
         for document in &documents {
             let text = std::str::from_utf8(&document.bytes)
                 .with_context(|| format!("{} is not UTF-8", document.path))?;
-            let document_id = self.database.upsert_document(
-                repository_id,
-                &document.path,
-                Some(&source_revision),
-                &document.content_hash,
-                "{}",
-            )?;
             let units = extract_units(text);
             let stable_ids = units
                 .iter()
                 .enumerate()
                 .map(|(ordinal, unit)| stable_unit_id(&document.path, unit, ordinal))
                 .collect::<Vec<_>>();
-            let history = self.database.unit_history(document_id, language)?;
+            let stable_hints = stable_unit_hints(
+                self.database,
+                repository_id,
+                &document.path,
+                &document.content_hash,
+                &stable_ids,
+            )?;
+            let history = match self.database.document_id(repository_id, &document.path)? {
+                Some(document_id) => self.database.unit_history(document_id, language)?,
+                None => Vec::new(),
+            };
             let matched =
-                match_units_with_stable_ids(&previous_units(&history), &units, &stable_ids);
+                match_units_with_stable_ids(&previous_units(&history), &units, &stable_hints);
             for (unit, matched) in units.iter().zip(matched) {
                 match matched.kind {
                     MatchKind::Ambiguous => conflicts += 1,
@@ -307,14 +331,7 @@ impl<'a> Orchestrator<'a> {
                             &source_hash,
                             &context,
                         )?;
-                        let candidate = self.database.candidate_translation(
-                            repository_id,
-                            language,
-                            &source_hash,
-                            &context,
-                            &policy_fingerprint,
-                        )?;
-                        if trusted.or(candidate).is_some() {
+                        if trusted.is_some() {
                             reused += 1;
                         } else {
                             pending += 1;
@@ -351,6 +368,48 @@ impl<'a> Orchestrator<'a> {
         for document in documents {
             let source_text = String::from_utf8(document.bytes)
                 .with_context(|| format!("{} is not UTF-8", document.path))?;
+            let markdown_units = extract_units(&source_text);
+            let stable_ids = markdown_units
+                .iter()
+                .enumerate()
+                .map(|(ordinal, unit)| stable_unit_id(&document.path, unit, ordinal))
+                .collect::<Vec<_>>();
+            let stable_hints = stable_unit_hints(
+                self.database,
+                repository_id,
+                &document.path,
+                &document.content_hash,
+                &stable_ids,
+            )?;
+            let history = match self.database.document_id(repository_id, &document.path)? {
+                Some(document_id) => self.database.unit_history(document_id, language)?,
+                None => Vec::new(),
+            };
+            let matched = match_units_with_stable_ids(
+                &previous_units(&history),
+                &markdown_units,
+                &stable_hints,
+            );
+            if matched
+                .iter()
+                .any(|matched| matched.kind == MatchKind::Ambiguous)
+            {
+                conflicts.extend(
+                    markdown_units
+                        .iter()
+                        .zip(&matched)
+                        .filter(|(_, matched)| matched.kind == MatchKind::Ambiguous)
+                        .map(|(markdown, _)| {
+                            finding(
+                                &document.path,
+                                Some(markdown.id.clone()),
+                                DecisionCode::AmbiguousMatch.as_str(),
+                                "multiple previous units match this Markdown unit",
+                            )
+                        }),
+                );
+                continue;
+            }
             let document_id = self.database.upsert_document(
                 repository_id,
                 &document.path,
@@ -358,31 +417,10 @@ impl<'a> Orchestrator<'a> {
                 &document.content_hash,
                 "{}",
             )?;
-            let markdown_units = extract_units(&source_text);
-            let stable_ids = markdown_units
-                .iter()
-                .enumerate()
-                .map(|(ordinal, unit)| stable_unit_id(&document.path, unit, ordinal))
-                .collect::<Vec<_>>();
-            let history = self.database.unit_history(document_id, language)?;
-            let matched = match_units_with_stable_ids(
-                &previous_units(&history),
-                &markdown_units,
-                &stable_ids,
-            );
             let mut units = Vec::new();
             for (ordinal, (markdown, matched)) in
                 markdown_units.into_iter().zip(matched).enumerate()
             {
-                if matched.kind == MatchKind::Ambiguous {
-                    conflicts.push(finding(
-                        &document.path,
-                        Some(markdown.id.clone()),
-                        DecisionCode::AmbiguousMatch.as_str(),
-                        "multiple previous units match this Markdown unit",
-                    ));
-                    continue;
-                }
                 let stable_id = matched
                     .stable_id
                     .clone()
@@ -400,20 +438,22 @@ impl<'a> Orchestrator<'a> {
                 let candidate =
                     self.database
                         .recoverable_candidate(run_id, database_id, language)?;
+                let prior_candidate = if stable_hints[ordinal].is_empty() {
+                    None
+                } else {
+                    self.database.recoverable_unit_candidate(
+                        database_id,
+                        language,
+                        &policy_fingerprint,
+                    )?
+                };
                 let trusted = self.database.trusted_translation(
                     repository_id,
                     language,
                     &source_hash,
                     &context,
                 )?;
-                let stored_candidate = self.database.candidate_translation(
-                    repository_id,
-                    language,
-                    &source_hash,
-                    &context,
-                    &policy_fingerprint,
-                )?;
-                let reusable = trusted.or(candidate).or(stored_candidate).or_else(|| {
+                let reusable = trusted.or(candidate).or(prior_candidate).or_else(|| {
                     (matched.trusted_reuse
                         && matches!(matched.kind, MatchKind::Exact | MatchKind::Moved))
                     .then_some(matched.previous_translation.clone())
@@ -2020,6 +2060,30 @@ pub fn adopt_human_edit(
                 |findings| anyhow!("human target {target} failed validation: {findings:?}"),
             )?;
         }
+        let stable_ids = source_units
+            .iter()
+            .enumerate()
+            .map(|(ordinal, unit)| stable_unit_id(&document.path, unit, ordinal))
+            .collect::<Vec<_>>();
+        let stable_hints = stable_unit_hints(
+            database,
+            repository_id,
+            &document.path,
+            &document.content_hash,
+            &stable_ids,
+        )?;
+        let history = match database.document_id(repository_id, &document.path)? {
+            Some(document_id) => database.unit_history(document_id, language)?,
+            None => Vec::new(),
+        };
+        let matched =
+            match_units_with_stable_ids(&previous_units(&history), &source_units, &stable_hints);
+        if matched
+            .iter()
+            .any(|matched| matched.kind == MatchKind::Ambiguous)
+        {
+            bail!("human target {target} cannot be mapped to stable source units");
+        }
         let document_id = database.upsert_document(
             repository_id,
             &document.path,
@@ -2027,23 +2091,12 @@ pub fn adopt_human_edit(
             &document.content_hash,
             "{}",
         )?;
-        let stable_ids = source_units
-            .iter()
-            .enumerate()
-            .map(|(ordinal, unit)| stable_unit_id(&document.path, unit, ordinal))
-            .collect::<Vec<_>>();
-        let history = database.unit_history(document_id, language)?;
-        let matched =
-            match_units_with_stable_ids(&previous_units(&history), &source_units, &stable_ids);
         for (ordinal, ((source_unit, target_unit), matched)) in source_units
             .iter()
             .zip(&target_units)
             .zip(matched)
             .enumerate()
         {
-            if matched.kind == MatchKind::Ambiguous {
-                bail!("human target {target} cannot be mapped to stable source units");
-            }
             let stable_id = matched
                 .stable_id
                 .unwrap_or_else(|| stable_ids[ordinal].clone());

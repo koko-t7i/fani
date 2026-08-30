@@ -3,7 +3,7 @@ use crate::domain::model::{
     AgentResult, AgentTask, CanonicalTransition, Freshness, MemoryTier, PublicationState,
     Published, ReviewState, SourceDocument, TranslationProvenance, ValidationState,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -352,6 +352,11 @@ pub trait StateStore {
         content_hash: &str,
         metadata_json: &str,
     ) -> Result<i64>;
+    fn document_id(&self, _repository_id: i64, _path: &str) -> Result<Option<i64>> {
+        Err(anyhow!(
+            "state store does not support document identity lookup"
+        ))
+    }
     fn upsert_unit(
         &self,
         document_id: i64,
@@ -362,20 +367,20 @@ pub trait StateStore {
         context_json: &str,
     ) -> Result<i64>;
     fn unit_history(&self, document_id: i64, locale: &str) -> Result<Vec<UnitHistory>>;
+    fn unchanged_document_unit_keys(
+        &self,
+        _repository_id: i64,
+        _path: &str,
+        _content_hash: &str,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     fn trusted_translation(
         &self,
         repository_id: i64,
         locale: &str,
         source_hash: &str,
         context_key: &str,
-    ) -> Result<Option<String>>;
-    fn candidate_translation(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        source_hash: &str,
-        context_key: &str,
-        policy_fingerprint: &str,
     ) -> Result<Option<String>>;
     fn trust_translation(&self, input: TrustTranslationInput<'_>) -> Result<i64>;
     fn begin_run(
@@ -408,6 +413,14 @@ pub trait StateStore {
         unit_id: i64,
         locale: &str,
     ) -> Result<Option<String>>;
+    fn recoverable_unit_candidate(
+        &self,
+        _unit_id: i64,
+        _locale: &str,
+        _policy_fingerprint: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt>;
     fn record_attempt_candidate(&self, input: AttemptCandidateInput<'_>) -> Result<AttemptReceipt>;
     fn select_canonical_candidate(

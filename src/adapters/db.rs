@@ -489,6 +489,17 @@ impl Database {
         )?)
     }
 
+    pub fn document_id(&self, repository_id: i64, path: &str) -> Result<Option<i64>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT id FROM documents WHERE repository_id=?1 AND path=?2 AND deleted_at IS NULL",
+                params![repository_id, path],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn upsert_unit(
         &self,
         document_id: i64,
@@ -2091,6 +2102,33 @@ impl Database {
         )? == 1)
     }
 
+    pub fn unchanged_document_unit_keys(
+        &self,
+        repository_id: i64,
+        path: &str,
+        content_hash: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            r#"SELECT u.unit_key
+               FROM units u
+               JOIN documents d ON d.id=u.document_id
+               WHERE d.repository_id=?1 AND d.path=?2 AND d.content_hash=?3
+                 AND d.deleted_at IS NULL AND u.active=1
+                 AND EXISTS (
+                     SELECT 1 FROM unit_versions uv
+                     WHERE uv.unit_id=u.id
+                       AND uv.source_revision=COALESCE(d.source_revision,'')
+                       AND uv.source_hash=u.source_hash
+                       AND uv.source_text=u.source_text
+                 )
+               ORDER BY u.ordinal,u.id"#,
+        )?;
+        let rows =
+            statement.query_map(params![repository_id, path, content_hash], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn trusted_translation(
         &self,
         repository_id: i64,
@@ -2103,33 +2141,6 @@ impl Database {
             params![repository_id, locale, source_hash, context_key],
             |row| row.get(0),
         ).optional()?)
-    }
-
-    pub fn candidate_translation(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        source_hash: &str,
-        context_key: &str,
-        policy_fingerprint: &str,
-    ) -> Result<Option<String>> {
-        require_fingerprint(policy_fingerprint, "translation policy")?;
-        Ok(self
-            .connect()?
-            .query_row(
-                r#"SELECT target_text FROM translation_memory_entries
-               WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4
-                 AND tier='candidate' AND policy_fingerprint=?5 AND superseded_at IS NULL"#,
-                params![
-                    repository_id,
-                    locale,
-                    source_hash,
-                    context_key,
-                    policy_fingerprint
-                ],
-                |row| row.get(0),
-            )
-            .optional()?)
     }
 
     pub fn selected_candidate(&self, unit_id: i64, locale: &str) -> Result<Option<String>> {
@@ -2155,6 +2166,28 @@ impl Database {
                    JOIN work_items w ON w.id=a.work_item_id
                    WHERE w.run_id=?1 AND c.unit_id=?2 AND c.locale=?3 AND c.selected=1"#,
                 params![run_id, unit_id, locale],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn recoverable_unit_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+    ) -> Result<Option<String>> {
+        require_fingerprint(policy_fingerprint, "translation policy")?;
+        Ok(self
+            .connect()?
+            .query_row(
+                r#"SELECT c.target_text
+                   FROM canonical_candidates c
+                   JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
+                   JOIN work_items w ON w.id=a.work_item_id
+                   WHERE c.unit_id=?1 AND c.locale=?2 AND c.selected=1
+                     AND w.policy_fingerprint=?3"#,
+                params![unit_id, locale, policy_fingerprint],
                 |row| row.get(0),
             )
             .optional()?)
@@ -2360,6 +2393,10 @@ impl StateStore for Database {
         )
     }
 
+    fn document_id(&self, repository_id: i64, path: &str) -> Result<Option<i64>> {
+        Database::document_id(self, repository_id, path)
+    }
+
     fn upsert_unit(
         &self,
         document_id: i64,
@@ -2384,6 +2421,15 @@ impl StateStore for Database {
         Database::unit_history(self, document_id, locale)
     }
 
+    fn unchanged_document_unit_keys(
+        &self,
+        repository_id: i64,
+        path: &str,
+        content_hash: &str,
+    ) -> Result<Vec<String>> {
+        Database::unchanged_document_unit_keys(self, repository_id, path, content_hash)
+    }
+
     fn trusted_translation(
         &self,
         repository_id: i64,
@@ -2392,24 +2438,6 @@ impl StateStore for Database {
         context_key: &str,
     ) -> Result<Option<String>> {
         Database::trusted_translation(self, repository_id, locale, source_hash, context_key)
-    }
-
-    fn candidate_translation(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        source_hash: &str,
-        context_key: &str,
-        policy_fingerprint: &str,
-    ) -> Result<Option<String>> {
-        Database::candidate_translation(
-            self,
-            repository_id,
-            locale,
-            source_hash,
-            context_key,
-            policy_fingerprint,
-        )
     }
 
     fn trust_translation(&self, input: TrustTranslationInput<'_>) -> Result<i64> {
@@ -2469,6 +2497,15 @@ impl StateStore for Database {
         locale: &str,
     ) -> Result<Option<String>> {
         Database::recoverable_candidate(self, run_id, unit_id, locale)
+    }
+
+    fn recoverable_unit_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+    ) -> Result<Option<String>> {
+        Database::recoverable_unit_candidate(self, unit_id, locale, policy_fingerprint)
     }
 
     fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt> {
