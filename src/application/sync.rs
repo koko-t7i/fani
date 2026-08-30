@@ -288,6 +288,7 @@ impl<'a> Orchestrator<'a> {
     pub fn plan_language(&self, language: &str) -> Result<PlanSummary> {
         let source_revision = self.git.resolve_source_revision(self.repo)?;
         let repository_id = self.repository_id()?;
+        let policy_fingerprint = prompts::policy_fingerprint();
         let documents = self.git.discover(self.repo, &source_revision)?;
         let mut pending = 0;
         let mut reused = 0;
@@ -314,7 +315,7 @@ impl<'a> Orchestrator<'a> {
             };
             let matched =
                 match_units_with_stable_ids(&previous_units(&history), &units, &stable_hints);
-            for (unit, matched) in units.iter().zip(matched) {
+            for (ordinal, (unit, matched)) in units.iter().zip(matched).enumerate() {
                 match matched.kind {
                     MatchKind::Ambiguous => conflicts += 1,
                     MatchKind::Exact | MatchKind::Moved
@@ -329,13 +330,30 @@ impl<'a> Orchestrator<'a> {
                     _ => {
                         let context = kind_name(unit);
                         let source_hash = hash(&[unit.source.as_bytes()]);
+                        let database_id = matched.stable_id.as_ref().and_then(|stable_id| {
+                            history
+                                .iter()
+                                .find(|row| row.unit_key == *stable_id)
+                                .map(|row| row.id)
+                        });
                         let trusted = self.database.trusted_translation(
                             repository_id,
                             language,
                             &source_hash,
                             &context,
                         )?;
-                        if trusted.is_some() {
+                        let candidate = match database_id {
+                            Some(database_id) if !stable_hints[ordinal].is_empty() => {
+                                self.database.recoverable_unit_candidate(
+                                    database_id,
+                                    language,
+                                    &policy_fingerprint,
+                                    LEADING_STRONG_SEPARATOR_VERSION,
+                                )?
+                            }
+                            _ => None,
+                        };
+                        if trusted.or(candidate).is_some() {
                             reused += 1;
                         } else {
                             pending += 1;

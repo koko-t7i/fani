@@ -296,6 +296,23 @@ repair = "fixture"
     let report: Value =
         serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
     assert_eq!(report["totals"]["agent_calls"], 2);
+
+    let completed_status = fani(&["status", "--config", config.to_str().unwrap()]);
+    assert_eq!(
+        completed_status.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&completed_status.stdout),
+        String::from_utf8_lossy(&completed_status.stderr)
+    );
+    let completed_status_text = String::from_utf8_lossy(&completed_status.stdout);
+    assert!(
+        completed_status_text.contains("pending=0")
+            && completed_status_text.contains("reused=2")
+            && completed_status_text.contains("deferred=0"),
+        "{completed_status_text}"
+    );
+
     let database = Database::open(repo.join(".fani/fani.db")).unwrap();
     let provenance: (String, String, String, String, String, String, String, String) = database
         .connect()
@@ -451,13 +468,19 @@ repair = "fixture"
     let status = fani(&["status", "--config", config.to_str().unwrap()]);
     assert_eq!(
         status.status.code(),
-        Some(3),
+        Some(0),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&status.stdout),
         String::from_utf8_lossy(&status.stderr)
     );
     let status_text = String::from_utf8_lossy(&status.stdout);
-    assert!(status_text.contains("conflicts=0"), "{status_text}");
+    assert!(
+        status_text.contains("pending=2")
+            && status_text.contains("reused=2")
+            && status_text.contains("conflicts=0")
+            && status_text.contains("deferred=0"),
+        "{status_text}"
+    );
 
     let second = fani(&[
         "sync",
