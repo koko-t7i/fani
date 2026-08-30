@@ -2190,8 +2190,10 @@ impl Database {
         run_id: &str,
         unit_id: i64,
         locale: &str,
+        policy_fingerprint: &str,
         deterministic_repair_version: &str,
     ) -> Result<Option<String>> {
+        require_fingerprint(policy_fingerprint, "translation policy")?;
         Ok(self
             .connect()?
             .query_row(
@@ -2200,8 +2202,15 @@ impl Database {
                    JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
                    JOIN work_items w ON w.id=a.work_item_id
                    WHERE w.run_id=?1 AND c.unit_id=?2 AND c.locale=?3 AND c.selected=1
-                     AND (a.agent<>'fani' OR a.provider<>'deterministic' OR a.adapter<>'native' OR a.model=?4)"#,
-                params![run_id, unit_id, locale, deterministic_repair_version],
+                     AND a.policy_fingerprint=?4
+                     AND (a.agent<>'fani' OR a.provider<>'deterministic' OR a.adapter<>'native' OR a.model=?5)"#,
+                params![
+                    run_id,
+                    unit_id,
+                    locale,
+                    policy_fingerprint,
+                    deterministic_repair_version
+                ],
                 |row| row.get(0),
             )
             .optional()?)
@@ -2223,7 +2232,7 @@ impl Database {
                    JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
                    JOIN work_items w ON w.id=a.work_item_id
                    WHERE c.unit_id=?1 AND c.locale=?2 AND c.selected=1
-                     AND w.policy_fingerprint=?3
+                     AND a.policy_fingerprint=?3
                      AND (a.agent<>'fani' OR a.provider<>'deterministic' OR a.adapter<>'native' OR a.model=?4)"#,
                 params![
                     unit_id,
@@ -2542,9 +2551,17 @@ impl StateStore for Database {
         run_id: &str,
         unit_id: i64,
         locale: &str,
+        policy_fingerprint: &str,
         deterministic_repair_version: &str,
     ) -> Result<Option<String>> {
-        Database::recoverable_candidate(self, run_id, unit_id, locale, deterministic_repair_version)
+        Database::recoverable_candidate(
+            self,
+            run_id,
+            unit_id,
+            locale,
+            policy_fingerprint,
+            deterministic_repair_version,
+        )
     }
 
     fn recoverable_unit_candidate(

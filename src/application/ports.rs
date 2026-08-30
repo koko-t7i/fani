@@ -422,6 +422,7 @@ pub trait StateStore {
         run_id: &str,
         unit_id: i64,
         locale: &str,
+        policy_fingerprint: &str,
         deterministic_repair_version: &str,
     ) -> Result<Option<String>>;
     fn recoverable_unit_candidate(

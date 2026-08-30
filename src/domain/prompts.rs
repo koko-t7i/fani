@@ -2,7 +2,7 @@ use crate::domain::model::{AgentStage, AgentTask};
 use sha2::{Digest, Sha256};
 
 pub const PROMPT_VERSION: &str = "fani-native-markdown-prompts-v3";
-pub const VERIFIER_VERSION: &str = "fani-markdown-verifier-v2";
+pub const VERIFIER_VERSION: &str = "fani-markdown-verifier-v3";
 
 pub const TRANSLATE: &str = include_str!("../../prompts/translate.md");
 pub const REVISE: &str = include_str!("../../prompts/revise.md");

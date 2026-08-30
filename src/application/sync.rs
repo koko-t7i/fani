@@ -443,6 +443,7 @@ impl<'a> Orchestrator<'a> {
                     run_id,
                     database_id,
                     language,
+                    &policy_fingerprint,
                     LEADING_STRONG_SEPARATOR_VERSION,
                 )?;
                 let prior_candidate = if stable_hints[ordinal].is_empty() {

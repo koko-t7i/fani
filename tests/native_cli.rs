@@ -934,6 +934,7 @@ repair = "fixture"
                 &run_id,
                 unit_id,
                 "zh-CN",
+                &policy_fingerprint,
                 "fani-leading-strong-separator-v1",
             )
             .unwrap(),
@@ -956,6 +957,7 @@ repair = "fixture"
                 &run_id,
                 unit_id,
                 "zh-CN",
+                &policy_fingerprint,
                 "fani-leading-strong-separator-old",
             )
             .unwrap(),
@@ -987,6 +989,7 @@ repair = "fixture"
                 &run_id,
                 unit_id,
                 "zh-CN",
+                &policy_fingerprint,
                 "fani-leading-strong-separator-v1",
             )
             .unwrap(),

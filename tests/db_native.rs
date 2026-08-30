@@ -563,6 +563,7 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
                 &fixture.run_id,
                 fixture.unit_id,
                 "zh-CN",
+                TEST_FINGERPRINT,
                 "fani-leading-strong-separator-v1",
             )
             .unwrap()
@@ -570,6 +571,20 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
         Some("候选译文")
     );
     let fingerprint = prompts::policy_fingerprint();
+    assert_ne!(fingerprint, TEST_FINGERPRINT);
+    assert_eq!(
+        fixture
+            .db
+            .recoverable_candidate(
+                &fixture.run_id,
+                fixture.unit_id,
+                "zh-CN",
+                &fingerprint,
+                "fani-leading-strong-separator-v1",
+            )
+            .unwrap(),
+        None
+    );
     let conn = fixture.db.connect().unwrap();
     let persisted: (String, String, String, String) = conn
         .query_row(
@@ -602,6 +617,7 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
                 "different-run",
                 fixture.unit_id,
                 "zh-CN",
+                TEST_FINGERPRINT,
                 "fani-leading-strong-separator-v1",
             )
             .unwrap(),
