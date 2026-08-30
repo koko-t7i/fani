@@ -6,7 +6,8 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 allow-dirty = ["ci"]
 targets = ["x86_64-unknown-linux-gnu"]
-installers = []
+installers = ["shell"]
+install-path = "~/.local/bin"
 unix-archive = ".tar.xz"
 checksum = "sha256"
 source-tarball = false
@@ -36,7 +37,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Unattended documentation translation orchestrator"
 license = "MIT"
-repository = "https://github.com/koko/fani"
+repository = "https://github.com/koko-t7i/fani"
 
 [[bin]]
 name = "fani"

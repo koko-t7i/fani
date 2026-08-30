@@ -10,19 +10,18 @@ The shipped binary is fully native Rust. Running fani does not require Python, `
 - Git;
 - either an API key for Anthropic, OpenAI, xAI, or DeepSeek, or a command implementing the custom Agent protocol;
 - `gh` only when GitHub pull-request publication is enabled;
-- Rust 1.85 or newer only when building from source.
+- Rust 1.85 or newer only for source builds.
 
 ## Install
 
-Download the `x86_64-unknown-linux-gnu` archive from [GitHub Releases](https://github.com/koko/fani/releases), verify it, and install the included `fani` binary. The archive also contains shell completions, the `fani(1)` man page, systemd user units, and an annotated configuration example.
-
-See [Release process and asset contract](docs/release.md) for checksum, attestation, archive installation, and reproducibility instructions.
-
-To install from a local source checkout:
+For Intel/AMD 64-bit Linux with glibc 2.31 or newer:
 
 ```bash
-cargo install --path . --locked
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/koko-t7i/fani/releases/latest/download/fani-installer.sh | sh
 ```
+
+No Rust toolchain is required. For verified downloads or source installation, see [Release and installation](docs/release.md).
 
 ## Five-minute start
 

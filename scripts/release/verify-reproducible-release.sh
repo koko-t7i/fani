@@ -39,6 +39,7 @@ right="$tmp/environment-b/target/distrib"
 archive=fani-x86_64-unknown-linux-gnu.tar.xz
 
 for asset in \
+    fani-installer.sh \
     "$archive" \
     "$archive.sha256" \
     fani.cdx.xml \
@@ -76,10 +77,12 @@ do
     cmp "$tmp/environment-a/$comparison" "$tmp/environment-b/$comparison"
 done
 
+installer_sha256=$(sha256sum "$left/fani-installer.sh" | awk '{print $1}')
 archive_sha256=$(sha256sum "$left/$archive" | awk '{print $1}')
 binary_sha256=$(cat "$tmp/environment-a/binary-sha256.txt")
 build_id=$(cut -d ' ' -f 3 "$tmp/environment-a/build-id.txt")
 sbom_sha256=$(sha256sum "$left/fani.cdx.xml" | awk '{print $1}')
+printf 'installer_sha256=%s\n' "$installer_sha256"
 printf 'archive_sha256=%s\n' "$archive_sha256"
 printf 'binary_sha256=%s\n' "$binary_sha256"
 printf 'build_id=%s\n' "$build_id"

@@ -26,7 +26,7 @@ jobs:
         run: |
           set -euo pipefail
           archive="fani-${FANI_TARGET}.tar.xz"
-          base="https://github.com/koko/fani/releases/download/v${FANI_VERSION}"
+          base="https://github.com/koko-t7i/fani/releases/download/v${FANI_VERSION}"
           curl --proto '=https' --tlsv1.2 -fsSLO "${base}/${archive}"
           curl --proto '=https' --tlsv1.2 -fsSLO "${base}/${archive}.sha256"
           sha256sum --check "${archive}.sha256"

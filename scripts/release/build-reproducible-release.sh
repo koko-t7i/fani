@@ -69,3 +69,6 @@ trap - EXIT HUP INT TERM
 scripts/release/verify-archive.sh \
     target/distrib/fani-x86_64-unknown-linux-gnu.tar.xz \
     target/distrib/fani.cdx.xml
+scripts/release/verify-installer.sh \
+    target/distrib/fani-installer.sh \
+    target/distrib/fani-x86_64-unknown-linux-gnu.tar.xz
