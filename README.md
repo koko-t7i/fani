@@ -1,5 +1,7 @@
 # fani
 
+[简体中文](i18n/zh-CN/README.md)
+
 fani is a Linux-first CLI for continuously translating Markdown documentation. It reads source files from a fixed Git commit, reuses trusted translations from SQLite, sends only unresolved units to a built-in model provider or a strict custom Agent, verifies the result, and can publish one stable branch and GitHub pull request per language.
 
 The shipped binary is fully native Rust. Running fani does not require Python, `uv`, an external i18n skill, or a provider adapter script.
