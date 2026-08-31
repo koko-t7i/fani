@@ -1,4 +1,4 @@
-use crate::adapters::config::{AgentConfig, Config};
+use crate::adapters::config::{AgentConfig, Config, STAGES};
 use crate::adapters::process::{
     enable_subreaper, finish_process_group, process_token, spawn_tracked, terminate_process_group,
     wrapped_command,
@@ -432,6 +432,9 @@ fn native_http_once(
             "max_tokens"
         };
         body[token_field] = serde_json::json!(config.max_output_tokens);
+        if let Some(reasoning_effort) = &config.reasoning_effort {
+            body["reasoning_effort"] = serde_json::json!(reasoning_effort);
+        }
         body
     };
     let body = serde_json::to_vec(&body).map_err(|_| {
@@ -760,7 +763,52 @@ impl<'a> RoutedAgentExecutor<'a> {
     }
 }
 
+fn provider_fingerprint(config: &AgentConfig) -> String {
+    let mut identity = Sha256::new();
+    for value in [&config.provider, &config.model, &config.adapter] {
+        identity.update((value.len() as u64).to_be_bytes());
+        identity.update(value.as_bytes());
+    }
+    if config.adapter == "native-http-v1" {
+        if let Some(endpoint) = config.endpoint() {
+            identity.update((endpoint.len() as u64).to_be_bytes());
+            identity.update(endpoint.as_bytes());
+        }
+        identity.update(config.max_output_tokens.to_be_bytes());
+        if let Some(reasoning_effort) = &config.reasoning_effort {
+            const FIELD: &[u8] = b"reasoning_effort";
+            identity.update((FIELD.len() as u64).to_be_bytes());
+            identity.update(FIELD);
+            identity.update((reasoning_effort.len() as u64).to_be_bytes());
+            identity.update(reasoning_effort.as_bytes());
+        }
+    }
+    for argument in &config.cmd {
+        identity.update((argument.len() as u64).to_be_bytes());
+        identity.update(argument.as_bytes());
+    }
+    format!("{:x}", identity.finalize())
+}
+
 impl AgentExecutor for RoutedAgentExecutor<'_> {
+    fn configuration_fingerprint(&self) -> Result<Option<String>> {
+        let mut identity = Sha256::new();
+        let mut configured = false;
+        for stage in STAGES {
+            let config = self.config.agent_for(stage)?;
+            if config.reasoning_effort.is_none() {
+                continue;
+            }
+            configured = true;
+            identity.update((stage.len() as u64).to_be_bytes());
+            identity.update(stage.as_bytes());
+            let fingerprint = provider_fingerprint(config);
+            identity.update((fingerprint.len() as u64).to_be_bytes());
+            identity.update(fingerprint.as_bytes());
+        }
+        Ok(configured.then(|| format!("{:x}", identity.finalize())))
+    }
+
     fn execute(&self, tasks: &[AgentTask]) -> Result<AgentExecution> {
         let config = self.config_for_tasks(tasks)?;
         let stage = tasks[0].stage.as_str();
@@ -777,23 +825,7 @@ impl AgentExecutor for RoutedAgentExecutor<'_> {
             adapter = config.adapter,
             task_count = tasks.len(),
         );
-        let mut identity = Sha256::new();
-        for value in [&config.provider, &config.model, &config.adapter] {
-            identity.update((value.len() as u64).to_be_bytes());
-            identity.update(value.as_bytes());
-        }
-        if config.adapter == "native-http-v1" {
-            if let Some(endpoint) = config.endpoint() {
-                identity.update((endpoint.len() as u64).to_be_bytes());
-                identity.update(endpoint.as_bytes());
-            }
-            identity.update(config.max_output_tokens.to_be_bytes());
-        }
-        for argument in &config.cmd {
-            identity.update((argument.len() as u64).to_be_bytes());
-            identity.update(argument.as_bytes());
-        }
-        let provider_fingerprint = format!("{:x}", identity.finalize());
+        let provider_fingerprint = provider_fingerprint(config);
         let results = match config.adapter.as_str() {
             "native-http-v1" => NativeHttpAgent::new(config).execute(tasks)?,
             "command-json-v1" => CommandAgent::new(config).execute(tasks)?,
@@ -863,6 +895,7 @@ mod tests {
             cmd: Vec::new(),
             endpoint: Some(endpoint),
             api_key_env: Some(key_env.into()),
+            reasoning_effort: None,
             max_output_tokens: 512,
             concurrency: 1,
             timeout_s: 5.0,
@@ -979,12 +1012,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, "Bonjour");
-        assert!(
-            request
-                .join()
-                .unwrap()
-                .contains("authorization: Bearer secret-openai-key")
-        );
+        let request = request.join().unwrap();
+        assert!(request.contains("authorization: Bearer secret-openai-key"));
+        assert!(!request.contains("reasoning_effort"));
 
         let (endpoint, _) = server("401 Unauthorized", r#"{"error":"secret response"}"#);
         let error = native_http_once(
@@ -999,6 +1029,92 @@ mod tests {
         assert!(error.contains("HTTP 401"));
         assert!(!error.contains("secret response"));
         assert!(!error.contains("secret-openai-key"));
+    }
+
+    #[test]
+    fn native_openai_compatible_sends_configured_reasoning_effort() {
+        let key_env = "FANI_TEST_REASONING_KEY";
+        unsafe { std::env::set_var(key_env, "secret") };
+        let (endpoint, request) = server(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"Bonjour"}}]}"#,
+        );
+        let mut config = config("openai-compatible", endpoint, key_env);
+        config.reasoning_effort = Some("medium".into());
+        native_http_once(&config, &http_agent(), "task-reasoning", "Translate").unwrap();
+        unsafe { std::env::remove_var(key_env) };
+        let request = request.join().unwrap();
+        assert!(request.contains(r#""reasoning_effort":"medium""#));
+    }
+
+    #[test]
+    fn reasoning_effort_isolated_in_provider_fingerprint() {
+        let endpoint = "https://models.example.com/v1/chat/completions".to_owned();
+        let base = config("openai-compatible", endpoint, "FANI_TEST_KEY");
+        assert_eq!(
+            provider_fingerprint(&base),
+            "56036def8603d65648909ee5542f99103fb0c26fe2c89632853637fb67d4ff59"
+        );
+
+        let mut medium = base.clone();
+        medium.reasoning_effort = Some("medium".into());
+        let mut high = base.clone();
+        high.reasoning_effort = Some("high".into());
+        assert_ne!(provider_fingerprint(&base), provider_fingerprint(&medium));
+        assert_ne!(provider_fingerprint(&medium), provider_fingerprint(&high));
+    }
+
+    #[test]
+    fn routed_reasoning_configuration_isolates_run_invocations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let path = tmp.path().join("fani.toml");
+        let medium = format!(
+            r#"[[repo]]
+path = "{}"
+languages = ["zh-CN"]
+target_pattern = "i18n/{{lang}}/{{relpath}}"
+[agents.default]
+provider = "openai-compatible"
+model = "test-model"
+endpoint = "https://models.example.com/v1/chat/completions"
+api_key_env = "FANI_TEST_KEY"
+reasoning_effort = "medium"
+[routing]
+translate = "default"
+"#,
+            repo.display()
+        );
+        std::fs::write(&path, &medium).unwrap();
+        let medium_config = Config::load(&path).unwrap();
+        let medium_fingerprint = RoutedAgentExecutor::new(&medium_config)
+            .configuration_fingerprint()
+            .unwrap()
+            .unwrap();
+
+        std::fs::write(&path, medium.replace("medium", "high")).unwrap();
+        let high_config = Config::load(&path).unwrap();
+        let high_fingerprint = RoutedAgentExecutor::new(&high_config)
+            .configuration_fingerprint()
+            .unwrap()
+            .unwrap();
+        assert_ne!(medium_fingerprint, high_fingerprint);
+
+        std::fs::write(
+            &path,
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("reasoning_effort = \"high\"\n", ""),
+        )
+        .unwrap();
+        let default_config = Config::load(&path).unwrap();
+        assert_eq!(
+            RoutedAgentExecutor::new(&default_config)
+                .configuration_fingerprint()
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

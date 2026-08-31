@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 pub const ERROR_EXIT_CODE: i32 = 2;
+pub const REASONING_EFFORTS: [&str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
 #[derive(Clone, Debug)]
 pub struct Selection {
@@ -17,6 +18,7 @@ pub struct InitRequest {
     pub language: String,
     pub provider: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub force: bool,
 }
 
@@ -153,6 +155,7 @@ mod tests {
                 language: "zh-CN".into(),
                 provider: "anthropic".into(),
                 model: "test-model".into(),
+                reasoning_effort: None,
                 force: false,
             }))
             .unwrap();

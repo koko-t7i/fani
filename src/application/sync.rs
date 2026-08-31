@@ -289,8 +289,12 @@ impl<'a> Orchestrator<'a> {
         let source_revision = self.git.resolve_source_revision(self.repo)?;
         let repository_id = self.repository_id()?;
         let policy_fingerprint = prompts::policy_fingerprint();
-        let invocation =
+        let mut invocation =
             format!("sync:{repository_id}:{language}:{source_revision}:{policy_fingerprint}");
+        if let Some(agent_fingerprint) = self.agents.configuration_fingerprint()? {
+            invocation.push(':');
+            invocation.push_str(&agent_fingerprint);
+        }
         let documents = self.git.discover(self.repo, &source_revision)?;
         let mut pending = 0;
         let mut reused = 0;
@@ -2025,8 +2029,12 @@ impl<'a> Orchestrator<'a> {
             let repository_id = self.repository_id()?;
             self.reconcile_pull_request(repository_id, language)?;
             let policy_fingerprint = prompts::policy_fingerprint();
-            let invocation =
+            let mut invocation =
                 format!("sync:{repository_id}:{language}:{source_revision}:{policy_fingerprint}");
+            if let Some(agent_fingerprint) = self.agents.configuration_fingerprint()? {
+                invocation.push(':');
+                invocation.push_str(&agent_fingerprint);
+            }
             let run_id = self.database.begin_run(
                 repository_id,
                 &invocation,

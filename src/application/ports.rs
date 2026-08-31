@@ -53,6 +53,10 @@ pub struct AgentExecution {
 }
 
 pub trait AgentExecutor: Send + Sync {
+    fn configuration_fingerprint(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     fn execute(&self, tasks: &[AgentTask]) -> Result<AgentExecution>;
 }
 

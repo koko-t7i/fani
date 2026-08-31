@@ -63,6 +63,7 @@ fn init_creates_a_script_free_safe_starter_config() {
     assert!(text.contains("enabled = false"));
     assert!(!text.contains("cmd ="));
     assert!(!text.contains("adapter ="));
+    assert!(!text.contains("reasoning_effort"));
 
     let second = fani(&[
         "init",
@@ -79,6 +80,59 @@ fn init_creates_a_script_free_safe_starter_config() {
     ]);
     assert!(!second.status.success());
     assert!(String::from_utf8_lossy(&second.stderr).contains("already exists"));
+}
+
+#[test]
+fn init_writes_reasoning_effort_only_for_openai() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let config = tmp.path().join("fani.toml");
+    let output = fani(&[
+        "init",
+        "--config",
+        config.to_str().unwrap(),
+        "--repo",
+        repo.to_str().unwrap(),
+        "--lang",
+        "zh-CN",
+        "--provider",
+        "openai",
+        "--model",
+        "gpt-test",
+        "--reasoning-effort",
+        "medium",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("reasoning_effort = \"medium\"")
+    );
+
+    let rejected = fani(&[
+        "init",
+        "--config",
+        tmp.path().join("anthropic.toml").to_str().unwrap(),
+        "--repo",
+        repo.to_str().unwrap(),
+        "--lang",
+        "zh-CN",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-test",
+        "--reasoning-effort",
+        "medium",
+    ]);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("only supported with --provider openai")
+    );
 }
 
 fn strict_provider_case(script: &str, output_file: bool) -> (i32, Value) {

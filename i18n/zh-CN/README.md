@@ -56,6 +56,8 @@ fani sync
 
 对于自定义的 OpenAI 兼容服务，请使用 `provider = "openai-compatible"`，并明确指定 HTTPS `endpoint` 和专用的 `api_key_env`。高级私有集成可以使用严格的 `command-json-v1` 子进程协议。请将所有凭据保存在环境变量或密钥存储中，切勿保存在 `fani.toml` 中。
 
+OpenAI 和 OpenAI 兼容的原生 Agent 可以选择在 `[agents.<name>]` 下设置 `reasoning_effort = "medium"`，也可以使用 `fani init --provider openai --reasoning-effort medium`。可接受的值为 `none`、`minimal`、`low`、`medium`、`high` 和 `xhigh`；所选提供商和模型必须支持该值。未配置时，fani 不会在请求中发送 `reasoning_effort`。对于其他提供商或子进程适配器，`fani doctor` 会拒绝此选项。
+
 有关这两种方式，请参阅[最佳实践](docs/best-practices.md#提供商和凭据)和[带注释的配置](../../examples/fani.toml)。
 
 ## 核心工作流程

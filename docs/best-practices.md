@@ -30,6 +30,8 @@ Built-in Anthropic, OpenAI, xAI, and DeepSeek support needs only a provider name
 
 Official provider endpoints and credential-variable names are fixed. This prevents repository configuration from redirecting a standard provider key. Built-in clients also reject redirects and do not inherit proxy environment variables.
 
+OpenAI and OpenAI-compatible native agents may set `reasoning_effort` to `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`. Confirm that the selected provider and model support the value. Leave it unset to preserve the provider's default behavior; fani omits the field entirely. The setting is part of the provider fingerprint, so changing it cannot reuse attempts made with a different effort.
+
 Use `openai-compatible` only for a service you trust. Give it an explicit HTTPS endpoint and a dedicated credential variable that is not reused for an official provider:
 
 ```toml

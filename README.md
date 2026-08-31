@@ -56,6 +56,8 @@ Add `.fani/` and `.fani-report/` to `.gitignore`. Inspect generated translations
 
 For a custom OpenAI-compatible service, use `provider = "openai-compatible"` with an explicit HTTPS `endpoint` and a dedicated `api_key_env`. Advanced private integrations can use the strict `command-json-v1` subprocess protocol. Keep every credential in the environment or a secret store, never in `fani.toml`.
 
+OpenAI and OpenAI-compatible native agents can optionally set `reasoning_effort = "medium"` under `[agents.<name>]`, or use `fani init --provider openai --reasoning-effort medium`. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; the selected provider and model must support the value. When omitted, fani leaves `reasoning_effort` out of the request. `fani doctor` rejects the option for other providers or the subprocess adapter.
+
 See [Best practices](docs/best-practices.md#providers-and-credentials) and the [annotated configuration](examples/fani.toml) for both paths.
 
 ## Core workflow
