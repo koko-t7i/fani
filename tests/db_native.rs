@@ -792,7 +792,6 @@ fn expired_outbox_claims_are_recovered_and_replayed_once() {
 #[test]
 fn newer_materialization_supersedes_stale_processing_content() {
     let fixture = fixture();
-    let now = chrono::Utc::now().timestamp_millis();
     let stale_key = "materialize:guide.md:zh-CN:old";
     let active_key = "materialize:guide.md:zh-CN:new";
     fixture
@@ -803,6 +802,7 @@ fn newer_materialization_supersedes_stale_processing_content() {
             r#"{"locale":"zh-CN","path":"zh-CN/guide.md"}"#,
         )
         .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
     fixture
         .db
         .claim_outbox_key(
