@@ -559,12 +559,46 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
     assert_eq!(
         fixture
             .db
-            .recoverable_candidate(&fixture.run_id, fixture.unit_id, "zh-CN")
+            .recoverable_candidate(
+                &fixture.run_id,
+                fixture.unit_id,
+                "zh-CN",
+                TEST_FINGERPRINT,
+                "fani-leading-strong-separator-v1",
+            )
+            .unwrap()
+            .as_deref(),
+        Some("候选译文")
+    );
+    assert_eq!(
+        fixture
+            .db
+            .recoverable_invocation_candidate(
+                "sync:abc123:zh-CN",
+                fixture.unit_id,
+                "zh-CN",
+                TEST_FINGERPRINT,
+                "fani-leading-strong-separator-v1",
+            )
             .unwrap()
             .as_deref(),
         Some("候选译文")
     );
     let fingerprint = prompts::policy_fingerprint();
+    assert_ne!(fingerprint, TEST_FINGERPRINT);
+    assert_eq!(
+        fixture
+            .db
+            .recoverable_candidate(
+                &fixture.run_id,
+                fixture.unit_id,
+                "zh-CN",
+                &fingerprint,
+                "fani-leading-strong-separator-v1",
+            )
+            .unwrap(),
+        None
+    );
     let conn = fixture.db.connect().unwrap();
     let persisted: (String, String, String, String) = conn
         .query_row(
@@ -593,7 +627,13 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
     assert_eq!(
         fixture
             .db
-            .recoverable_candidate("different-run", fixture.unit_id, "zh-CN")
+            .recoverable_candidate(
+                "different-run",
+                fixture.unit_id,
+                "zh-CN",
+                TEST_FINGERPRINT,
+                "fani-leading-strong-separator-v1",
+            )
             .unwrap(),
         None
     );
@@ -752,7 +792,6 @@ fn expired_outbox_claims_are_recovered_and_replayed_once() {
 #[test]
 fn newer_materialization_supersedes_stale_processing_content() {
     let fixture = fixture();
-    let now = chrono::Utc::now().timestamp_millis();
     let stale_key = "materialize:guide.md:zh-CN:old";
     let active_key = "materialize:guide.md:zh-CN:new";
     fixture
@@ -763,6 +802,7 @@ fn newer_materialization_supersedes_stale_processing_content() {
             r#"{"locale":"zh-CN","path":"zh-CN/guide.md"}"#,
         )
         .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
     fixture
         .db
         .claim_outbox_key(

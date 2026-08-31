@@ -1,5 +1,7 @@
 # fani
 
+[简体中文](i18n/zh-CN/README.md)
+
 fani is a Linux-first CLI for continuously translating Markdown documentation. It reads source files from a fixed Git commit, reuses trusted translations from SQLite, sends only unresolved units to a built-in model provider or a strict custom Agent, verifies the result, and can publish one stable branch and GitHub pull request per language.
 
 The shipped binary is fully native Rust. Running fani does not require Python, `uv`, an external i18n skill, or a provider adapter script.
@@ -53,6 +55,8 @@ Add `.fani/` and `.fani-report/` to `.gitignore`. Inspect generated translations
 | DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` |
 
 For a custom OpenAI-compatible service, use `provider = "openai-compatible"` with an explicit HTTPS `endpoint` and a dedicated `api_key_env`. Advanced private integrations can use the strict `command-json-v1` subprocess protocol. Keep every credential in the environment or a secret store, never in `fani.toml`.
+
+OpenAI and OpenAI-compatible native agents can optionally set `reasoning_effort = "medium"` under `[agents.<name>]`, or use `fani init --provider openai --reasoning-effort medium`. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; the selected provider and model must support the value. When omitted, fani leaves `reasoning_effort` out of the request. `fani doctor` rejects the option for other providers or the subprocess adapter.
 
 See [Best practices](docs/best-practices.md#providers-and-credentials) and the [annotated configuration](examples/fani.toml) for both paths.
 

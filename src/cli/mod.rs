@@ -1,7 +1,7 @@
 use crate::VERSION;
 use crate::application::command::{
-    CommandOutput, CommandRequest, ERROR_EXIT_CODE, InitRequest, OutputReporter, ReconcileMode,
-    Selection, SyncRequest,
+    CommandOutput, CommandRequest, ERROR_EXIT_CODE, InitRequest, OutputReporter, REASONING_EFFORTS,
+    ReconcileMode, Selection, SyncRequest,
 };
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, Write};
@@ -44,6 +44,8 @@ struct InitArgs {
     provider: String,
     #[arg(long)]
     model: String,
+    #[arg(long, value_parser = REASONING_EFFORTS)]
+    reasoning_effort: Option<String>,
     #[arg(long)]
     force: bool,
 }
@@ -108,6 +110,7 @@ pub fn run() -> i32 {
             language: args.lang,
             provider: args.provider,
             model: args.model,
+            reasoning_effort: args.reasoning_effort,
             force: args.force,
         }),
         Command::Sync(args) => CommandRequest::Sync(SyncRequest {

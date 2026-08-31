@@ -1,9 +1,9 @@
 use crate::adapters::process::process_identity;
 use crate::application::ports::{
     AttemptCandidateInput, AttemptInput, AttemptReceipt, CanonicalFile, CanonicalFileInput,
-    CanonicalTranslationInput, FindingInput, OutboxEntry, OutboxKind, PublicationManifestInput,
-    PullRequestStateInput, RecoveredAttempt, StateStore, StoredPullRequest, TrustTranslationInput,
-    UnitHistory,
+    CanonicalTranslationInput, FailedAttemptContext, FindingInput, OutboxEntry, OutboxKind,
+    PublicationManifestInput, PullRequestStateInput, RecoveredAttempt, StateStore,
+    StoredPullRequest, TrustTranslationInput, UnitHistory,
 };
 use crate::domain::model::{CanonicalTransition, PublicationState};
 use anyhow::{Context, Result, anyhow, bail};
@@ -489,6 +489,17 @@ impl Database {
         )?)
     }
 
+    pub fn document_id(&self, repository_id: i64, path: &str) -> Result<Option<i64>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT id FROM documents WHERE repository_id=?1 AND path=?2 AND deleted_at IS NULL",
+                params![repository_id, path],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn upsert_unit(
         &self,
         document_id: i64,
@@ -768,6 +779,40 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    pub fn failed_attempt_context(
+        &self,
+        work_item_id: i64,
+    ) -> Result<Option<FailedAttemptContext>> {
+        let conn = self.connect()?;
+        let attempt: Option<(i64, Option<String>, Option<String>)> = conn
+            .query_row(
+                r#"SELECT id,response_json,error FROM attempts
+                   WHERE work_item_id=?1 AND status!='succeeded'
+                   ORDER BY id DESC LIMIT 1"#,
+                [work_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((attempt_id, response_json, error)) = attempt else {
+            return Ok(None);
+        };
+        let output = if let Some(response) = response_json {
+            let value: serde_json::Value = serde_json::from_str(&response)
+                .context("failed Agent response is not valid JSON")?;
+            value
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        Ok(Some(FailedAttemptContext {
+            attempt_id,
+            output,
+            error,
+        }))
     }
 
     pub fn successful_attempt(
@@ -2091,6 +2136,33 @@ impl Database {
         )? == 1)
     }
 
+    pub fn unchanged_document_unit_keys(
+        &self,
+        repository_id: i64,
+        path: &str,
+        content_hash: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            r#"SELECT u.unit_key
+               FROM units u
+               JOIN documents d ON d.id=u.document_id
+               WHERE d.repository_id=?1 AND d.path=?2 AND d.content_hash=?3
+                 AND d.deleted_at IS NULL AND u.active=1
+                 AND EXISTS (
+                     SELECT 1 FROM unit_versions uv
+                     WHERE uv.unit_id=u.id
+                       AND uv.source_revision=COALESCE(d.source_revision,'')
+                       AND uv.source_hash=u.source_hash
+                       AND uv.source_text=u.source_text
+                 )
+               ORDER BY u.ordinal,u.id"#,
+        )?;
+        let rows =
+            statement.query_map(params![repository_id, path, content_hash], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn trusted_translation(
         &self,
         repository_id: i64,
@@ -2118,7 +2190,10 @@ impl Database {
         run_id: &str,
         unit_id: i64,
         locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
     ) -> Result<Option<String>> {
+        require_fingerprint(policy_fingerprint, "translation policy")?;
         Ok(self
             .connect()?
             .query_row(
@@ -2126,8 +2201,77 @@ impl Database {
                    FROM canonical_candidates c
                    JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
                    JOIN work_items w ON w.id=a.work_item_id
-                   WHERE w.run_id=?1 AND c.unit_id=?2 AND c.locale=?3 AND c.selected=1"#,
-                params![run_id, unit_id, locale],
+                   WHERE w.run_id=?1 AND c.unit_id=?2 AND c.locale=?3 AND c.selected=1
+                     AND a.policy_fingerprint=?4
+                     AND (a.agent<>'fani' OR a.provider<>'deterministic' OR a.adapter<>'native' OR a.model=?5)"#,
+                params![
+                    run_id,
+                    unit_id,
+                    locale,
+                    policy_fingerprint,
+                    deterministic_repair_version
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn recoverable_invocation_candidate(
+        &self,
+        invocation_key: &str,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
+    ) -> Result<Option<String>> {
+        require_fingerprint(policy_fingerprint, "translation policy")?;
+        Ok(self
+            .connect()?
+            .query_row(
+                r#"SELECT c.target_text
+                   FROM canonical_candidates c
+                   JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
+                   JOIN work_items w ON w.id=a.work_item_id
+                   JOIN runs r ON r.id=w.run_id
+                   WHERE r.invocation_key=?1 AND c.unit_id=?2 AND c.locale=?3 AND c.selected=1
+                     AND a.policy_fingerprint=?4
+                     AND (a.agent<>'fani' OR a.provider<>'deterministic' OR a.adapter<>'native' OR a.model=?5)"#,
+                params![
+                    invocation_key,
+                    unit_id,
+                    locale,
+                    policy_fingerprint,
+                    deterministic_repair_version
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn recoverable_unit_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
+    ) -> Result<Option<String>> {
+        require_fingerprint(policy_fingerprint, "translation policy")?;
+        Ok(self
+            .connect()?
+            .query_row(
+                r#"SELECT c.target_text
+                   FROM canonical_candidates c
+                   JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
+                   JOIN work_items w ON w.id=a.work_item_id
+                   WHERE c.unit_id=?1 AND c.locale=?2 AND c.selected=1
+                     AND a.policy_fingerprint=?3
+                     AND (a.agent<>'fani' OR a.provider<>'deterministic' OR a.adapter<>'native' OR a.model=?4)"#,
+                params![
+                    unit_id,
+                    locale,
+                    policy_fingerprint,
+                    deterministic_repair_version
+                ],
                 |row| row.get(0),
             )
             .optional()?)
@@ -2333,6 +2477,10 @@ impl StateStore for Database {
         )
     }
 
+    fn document_id(&self, repository_id: i64, path: &str) -> Result<Option<i64>> {
+        Database::document_id(self, repository_id, path)
+    }
+
     fn upsert_unit(
         &self,
         document_id: i64,
@@ -2355,6 +2503,15 @@ impl StateStore for Database {
 
     fn unit_history(&self, document_id: i64, locale: &str) -> Result<Vec<UnitHistory>> {
         Database::unit_history(self, document_id, locale)
+    }
+
+    fn unchanged_document_unit_keys(
+        &self,
+        repository_id: i64,
+        path: &str,
+        content_hash: &str,
+    ) -> Result<Vec<String>> {
+        Database::unchanged_document_unit_keys(self, repository_id, path, content_hash)
     }
 
     fn trusted_translation(
@@ -2417,13 +2574,60 @@ impl StateStore for Database {
         Database::attempt_status(self, work_item_id, dedupe_key)
     }
 
+    fn failed_attempt_context(&self, work_item_id: i64) -> Result<Option<FailedAttemptContext>> {
+        Database::failed_attempt_context(self, work_item_id)
+    }
+
     fn recoverable_candidate(
         &self,
         run_id: &str,
         unit_id: i64,
         locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
     ) -> Result<Option<String>> {
-        Database::recoverable_candidate(self, run_id, unit_id, locale)
+        Database::recoverable_candidate(
+            self,
+            run_id,
+            unit_id,
+            locale,
+            policy_fingerprint,
+            deterministic_repair_version,
+        )
+    }
+
+    fn recoverable_invocation_candidate(
+        &self,
+        invocation_key: &str,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
+    ) -> Result<Option<String>> {
+        Database::recoverable_invocation_candidate(
+            self,
+            invocation_key,
+            unit_id,
+            locale,
+            policy_fingerprint,
+            deterministic_repair_version,
+        )
+    }
+
+    fn recoverable_unit_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
+    ) -> Result<Option<String>> {
+        Database::recoverable_unit_candidate(
+            self,
+            unit_id,
+            locale,
+            policy_fingerprint,
+            deterministic_repair_version,
+        )
     }
 
     fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt> {

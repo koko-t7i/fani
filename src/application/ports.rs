@@ -3,7 +3,7 @@ use crate::domain::model::{
     AgentResult, AgentTask, CanonicalTransition, Freshness, MemoryTier, PublicationState,
     Published, ReviewState, SourceDocument, TranslationProvenance, ValidationState,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -53,6 +53,10 @@ pub struct AgentExecution {
 }
 
 pub trait AgentExecutor: Send + Sync {
+    fn configuration_fingerprint(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     fn execute(&self, tasks: &[AgentTask]) -> Result<AgentExecution>;
 }
 
@@ -228,6 +232,13 @@ pub struct RecoveredAttempt {
     pub output: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailedAttemptContext {
+    pub attempt_id: i64,
+    pub output: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TrustTranslationInput<'a> {
     pub repository_id: i64,
@@ -352,6 +363,11 @@ pub trait StateStore {
         content_hash: &str,
         metadata_json: &str,
     ) -> Result<i64>;
+    fn document_id(&self, _repository_id: i64, _path: &str) -> Result<Option<i64>> {
+        Err(anyhow!(
+            "state store does not support document identity lookup"
+        ))
+    }
     fn upsert_unit(
         &self,
         document_id: i64,
@@ -362,6 +378,14 @@ pub trait StateStore {
         context_json: &str,
     ) -> Result<i64>;
     fn unit_history(&self, document_id: i64, locale: &str) -> Result<Vec<UnitHistory>>;
+    fn unchanged_document_unit_keys(
+        &self,
+        _repository_id: i64,
+        _path: &str,
+        _content_hash: &str,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     fn trusted_translation(
         &self,
         repository_id: i64,
@@ -394,12 +418,36 @@ pub trait StateStore {
         dedupe_key: &str,
     ) -> Result<Option<RecoveredAttempt>>;
     fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>>;
+    fn failed_attempt_context(&self, _work_item_id: i64) -> Result<Option<FailedAttemptContext>> {
+        Ok(None)
+    }
     fn recoverable_candidate(
         &self,
         run_id: &str,
         unit_id: i64,
         locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
     ) -> Result<Option<String>>;
+    fn recoverable_invocation_candidate(
+        &self,
+        _invocation_key: &str,
+        _unit_id: i64,
+        _locale: &str,
+        _policy_fingerprint: &str,
+        _deterministic_repair_version: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+    fn recoverable_unit_candidate(
+        &self,
+        _unit_id: i64,
+        _locale: &str,
+        _policy_fingerprint: &str,
+        _deterministic_repair_version: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt>;
     fn record_attempt_candidate(&self, input: AttemptCandidateInput<'_>) -> Result<AttemptReceipt>;
     fn select_canonical_candidate(

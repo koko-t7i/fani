@@ -8,9 +8,10 @@ use crate::application::ports::{
 };
 use crate::application::settings::RepoConfig;
 use crate::domain::markdown::{
-    MarkdownUnit, UnitTranslation, apply_translations, extract_units, validate_translation,
+    MarkdownUnit, UnitTranslation, apply_translations, extract_units,
+    repair_leading_strong_separator, validate_translation,
 };
-use crate::domain::matching::{MatchKind, PreviousUnit, match_units};
+use crate::domain::matching::{MatchKind, PreviousUnit, match_units_with_stable_ids};
 use crate::domain::model::{
     AgentResult, AgentStage, AgentTask, CanonicalTransition, DecisionCode, Finding,
     FindingSeverity, Freshness, LanguageOutcome, MemoryTier, PlanSummary, PublicationState,
@@ -22,9 +23,12 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
+
+const REPAIR_CONTEXT_VERSION: &str = "v6";
+const LEADING_STRONG_SEPARATOR_VERSION: &str = "fani-leading-strong-separator-v1";
 
 fn hash(parts: &[&[u8]]) -> String {
     let mut digest = Sha256::new();
@@ -60,6 +64,39 @@ fn target_path(repo: &RepoConfig, language: &str, source_path: &str) -> Result<P
 
 fn kind_name(unit: &MarkdownUnit) -> String {
     format!("{:?}", unit.kind)
+}
+
+fn stable_unit_id(path: &str, unit: &MarkdownUnit, ordinal: usize) -> String {
+    format!(
+        "unit-{}",
+        &hash(&[
+            path.as_bytes(),
+            unit.id.as_bytes(),
+            ordinal.to_string().as_bytes(),
+        ])[..24]
+    )
+}
+
+fn stable_unit_hints(
+    database: &dyn StateStore,
+    repository_id: i64,
+    path: &str,
+    content_hash: &str,
+    stable_ids: &[String],
+) -> Result<Vec<String>> {
+    let current = database
+        .unchanged_document_unit_keys(repository_id, path, content_hash)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    Ok(stable_ids
+        .iter()
+        .map(|stable_id| {
+            current
+                .contains(stable_id)
+                .then(|| stable_id.clone())
+                .unwrap_or_default()
+        })
+        .collect())
 }
 
 fn finding(path: &str, unit_id: Option<String>, code: &str, message: impl Into<String>) -> Finding {
@@ -251,6 +288,13 @@ impl<'a> Orchestrator<'a> {
     pub fn plan_language(&self, language: &str) -> Result<PlanSummary> {
         let source_revision = self.git.resolve_source_revision(self.repo)?;
         let repository_id = self.repository_id()?;
+        let policy_fingerprint = prompts::policy_fingerprint();
+        let mut invocation =
+            format!("sync:{repository_id}:{language}:{source_revision}:{policy_fingerprint}");
+        if let Some(agent_fingerprint) = self.agents.configuration_fingerprint()? {
+            invocation.push(':');
+            invocation.push_str(&agent_fingerprint);
+        }
         let documents = self.git.discover(self.repo, &source_revision)?;
         let mut pending = 0;
         let mut reused = 0;
@@ -258,17 +302,26 @@ impl<'a> Orchestrator<'a> {
         for document in &documents {
             let text = std::str::from_utf8(&document.bytes)
                 .with_context(|| format!("{} is not UTF-8", document.path))?;
-            let document_id = self.database.upsert_document(
+            let units = extract_units(text);
+            let stable_ids = units
+                .iter()
+                .enumerate()
+                .map(|(ordinal, unit)| stable_unit_id(&document.path, unit, ordinal))
+                .collect::<Vec<_>>();
+            let stable_hints = stable_unit_hints(
+                self.database,
                 repository_id,
                 &document.path,
-                Some(&source_revision),
                 &document.content_hash,
-                "{}",
+                &stable_ids,
             )?;
-            let units = extract_units(text);
-            let history = self.database.unit_history(document_id, language)?;
-            let matched = match_units(&previous_units(&history), &units);
-            for (unit, matched) in units.iter().zip(matched) {
+            let history = match self.database.document_id(repository_id, &document.path)? {
+                Some(document_id) => self.database.unit_history(document_id, language)?,
+                None => Vec::new(),
+            };
+            let matched =
+                match_units_with_stable_ids(&previous_units(&history), &units, &stable_hints);
+            for (ordinal, (unit, matched)) in units.iter().zip(matched).enumerate() {
                 match matched.kind {
                     MatchKind::Ambiguous => conflicts += 1,
                     MatchKind::Exact | MatchKind::Moved
@@ -283,11 +336,44 @@ impl<'a> Orchestrator<'a> {
                     _ => {
                         let context = kind_name(unit);
                         let source_hash = hash(&[unit.source.as_bytes()]);
-                        if self
-                            .database
-                            .trusted_translation(repository_id, language, &source_hash, &context)?
-                            .is_some()
-                        {
+                        let stable_id = matched.stable_id.as_deref().or_else(|| {
+                            (!stable_hints[ordinal].is_empty())
+                                .then_some(stable_hints[ordinal].as_str())
+                        });
+                        let database_id = stable_id.and_then(|stable_id| {
+                            history
+                                .iter()
+                                .find(|row| row.unit_key == stable_id)
+                                .map(|row| row.id)
+                        });
+                        let trusted = self.database.trusted_translation(
+                            repository_id,
+                            language,
+                            &source_hash,
+                            &context,
+                        )?;
+                        let candidate = match database_id {
+                            Some(database_id) => self.database.recoverable_invocation_candidate(
+                                &invocation,
+                                database_id,
+                                language,
+                                &policy_fingerprint,
+                                LEADING_STRONG_SEPARATOR_VERSION,
+                            )?,
+                            None => None,
+                        };
+                        let prior_candidate = match database_id {
+                            Some(database_id) if !stable_hints[ordinal].is_empty() => {
+                                self.database.recoverable_unit_candidate(
+                                    database_id,
+                                    language,
+                                    &policy_fingerprint,
+                                    LEADING_STRONG_SEPARATOR_VERSION,
+                                )?
+                            }
+                            _ => None,
+                        };
+                        if trusted.or(candidate).or(prior_candidate).is_some() {
                             reused += 1;
                         } else {
                             pending += 1;
@@ -319,10 +405,53 @@ impl<'a> Orchestrator<'a> {
         let mut conflicts = Vec::new();
         let mut reused = 0;
         let mut scheduled = 0;
+        let policy_fingerprint = prompts::policy_fingerprint();
         let documents = self.git.discover(self.repo, source_revision)?;
         for document in documents {
             let source_text = String::from_utf8(document.bytes)
                 .with_context(|| format!("{} is not UTF-8", document.path))?;
+            let markdown_units = extract_units(&source_text);
+            let stable_ids = markdown_units
+                .iter()
+                .enumerate()
+                .map(|(ordinal, unit)| stable_unit_id(&document.path, unit, ordinal))
+                .collect::<Vec<_>>();
+            let stable_hints = stable_unit_hints(
+                self.database,
+                repository_id,
+                &document.path,
+                &document.content_hash,
+                &stable_ids,
+            )?;
+            let history = match self.database.document_id(repository_id, &document.path)? {
+                Some(document_id) => self.database.unit_history(document_id, language)?,
+                None => Vec::new(),
+            };
+            let matched = match_units_with_stable_ids(
+                &previous_units(&history),
+                &markdown_units,
+                &stable_hints,
+            );
+            if matched
+                .iter()
+                .any(|matched| matched.kind == MatchKind::Ambiguous)
+            {
+                conflicts.extend(
+                    markdown_units
+                        .iter()
+                        .zip(&matched)
+                        .filter(|(_, matched)| matched.kind == MatchKind::Ambiguous)
+                        .map(|(markdown, _)| {
+                            finding(
+                                &document.path,
+                                Some(markdown.id.clone()),
+                                DecisionCode::AmbiguousMatch.as_str(),
+                                "multiple previous units match this Markdown unit",
+                            )
+                        }),
+                );
+                continue;
+            }
             let document_id = self.database.upsert_document(
                 repository_id,
                 &document.path,
@@ -330,32 +459,14 @@ impl<'a> Orchestrator<'a> {
                 &document.content_hash,
                 "{}",
             )?;
-            let markdown_units = extract_units(&source_text);
-            let history = self.database.unit_history(document_id, language)?;
-            let matched = match_units(&previous_units(&history), &markdown_units);
             let mut units = Vec::new();
             for (ordinal, (markdown, matched)) in
                 markdown_units.into_iter().zip(matched).enumerate()
             {
-                if matched.kind == MatchKind::Ambiguous {
-                    conflicts.push(finding(
-                        &document.path,
-                        Some(markdown.id.clone()),
-                        DecisionCode::AmbiguousMatch.as_str(),
-                        "multiple previous units match this Markdown unit",
-                    ));
-                    continue;
-                }
-                let stable_id = matched.stable_id.clone().unwrap_or_else(|| {
-                    format!(
-                        "unit-{}",
-                        &hash(&[
-                            document.path.as_bytes(),
-                            markdown.id.as_bytes(),
-                            ordinal.to_string().as_bytes()
-                        ])[..24]
-                    )
-                });
+                let stable_id = matched
+                    .stable_id
+                    .clone()
+                    .unwrap_or_else(|| stable_ids[ordinal].clone());
                 let source_hash = hash(&[markdown.source.as_bytes()]);
                 let context = kind_name(&markdown);
                 let database_id = self.database.upsert_unit(
@@ -366,16 +477,30 @@ impl<'a> Orchestrator<'a> {
                     &source_hash,
                     &serde_json::to_string(&json!({"kind": context}))?,
                 )?;
-                let candidate =
-                    self.database
-                        .recoverable_candidate(run_id, database_id, language)?;
+                let candidate = self.database.recoverable_candidate(
+                    run_id,
+                    database_id,
+                    language,
+                    &policy_fingerprint,
+                    LEADING_STRONG_SEPARATOR_VERSION,
+                )?;
+                let prior_candidate = if stable_hints[ordinal].is_empty() {
+                    None
+                } else {
+                    self.database.recoverable_unit_candidate(
+                        database_id,
+                        language,
+                        &policy_fingerprint,
+                        LEADING_STRONG_SEPARATOR_VERSION,
+                    )?
+                };
                 let trusted = self.database.trusted_translation(
                     repository_id,
                     language,
                     &source_hash,
                     &context,
                 )?;
-                let reusable = trusted.or(candidate).or_else(|| {
+                let reusable = trusted.or(candidate).or(prior_candidate).or_else(|| {
                     (matched.trusted_reuse
                         && matches!(matched.kind, MatchKind::Exact | MatchKind::Moved))
                     .then_some(matched.previous_translation.clone())
@@ -613,7 +738,13 @@ impl<'a> Orchestrator<'a> {
                                 self.database.record_finding(FindingInput {
                                     work_item_id,
                                     attempt_id: Some(receipt.id),
-                                    finding_key: &format!("{}:{}", validation.code, unit.stable_id),
+                                    finding_key: &format!(
+                                        "{}:{}:{}:{}",
+                                        validation.code,
+                                        unit.stable_id,
+                                        receipt.id,
+                                        &hash(&[validation.message.as_bytes()])[..16]
+                                    ),
                                     severity: "error",
                                     code: validation.code,
                                     message: &validation.message,
@@ -658,6 +789,94 @@ impl<'a> Orchestrator<'a> {
         documents: &mut [PlannedDocument],
         all_results: &mut Vec<AgentResult>,
     ) -> Result<usize> {
+        for document in documents.iter_mut() {
+            for unit in &mut document.units {
+                let Some(work_item_id) = unit.work_item_id.filter(|_| unit.translation.is_none())
+                else {
+                    continue;
+                };
+                let Some(failed) = self.database.failed_attempt_context(work_item_id)? else {
+                    continue;
+                };
+                let Some(rejected) = failed.output.as_deref() else {
+                    continue;
+                };
+                let Some(repaired) = repair_leading_strong_separator(&unit.markdown, rejected)
+                    .filter(|output| validate_translation(&unit.markdown, output).is_ok())
+                else {
+                    continue;
+                };
+                let deterministic_key = format!(
+                    "{}:repair:{REPAIR_CONTEXT_VERSION}:{LEADING_STRONG_SEPARATOR_VERSION}",
+                    unit.stable_id
+                );
+                if let Some(recovered) = self
+                    .database
+                    .successful_attempt(work_item_id, &deterministic_key)?
+                {
+                    self.database.select_canonical_candidate(
+                        unit.database_id,
+                        language,
+                        &format!("attempt:{}", recovered.id),
+                        &recovered.output,
+                        Some(recovered.id),
+                        Some(1.0),
+                    )?;
+                    unit.translation = Some(recovered.output);
+                    continue;
+                }
+                if self
+                    .database
+                    .attempt_status(work_item_id, &deterministic_key)?
+                    .is_some()
+                {
+                    continue;
+                }
+                let rejected_hash = hash(&[rejected.as_bytes()]);
+                let request_json = serde_json::to_string(&json!({
+                    "schema": "fani.deterministic.repair.request.v1",
+                    "task_id": unit.stable_id,
+                    "operation": LEADING_STRONG_SEPARATOR_VERSION,
+                    "source_attempt_id": failed.attempt_id,
+                    "source_output_hash": rejected_hash,
+                }))?;
+                let response_json = serde_json::to_string(&json!({
+                    "schema": "fani.agent.response.v1",
+                    "task_id": unit.stable_id,
+                    "output": repaired,
+                }))?;
+                let algorithm_hash = hash(&[LEADING_STRONG_SEPARATOR_VERSION.as_bytes()]);
+                self.database
+                    .record_attempt_candidate(AttemptCandidateInput {
+                        attempt: AttemptInput {
+                            work_item_id,
+                            dedupe_key: &deterministic_key,
+                            agent: "fani",
+                            provider: "deterministic",
+                            model: LEADING_STRONG_SEPARATOR_VERSION,
+                            adapter: "native",
+                            provider_fingerprint: &algorithm_hash,
+                            prompt_version: LEADING_STRONG_SEPARATOR_VERSION,
+                            prompt_hash: &algorithm_hash,
+                            policy_fingerprint: &prompts::policy_fingerprint(),
+                            status: "succeeded",
+                            request_json: &request_json,
+                            response_json: Some(&response_json),
+                            error: None,
+                        },
+                        unit_id: unit.database_id,
+                        locale: language,
+                        candidate_key: &format!("attempt:{deterministic_key}"),
+                        target_text: &repaired,
+                        score: Some(1.0),
+                        policy_fingerprint: &prompts::policy_fingerprint(),
+                        provenance: TranslationProvenance::RepairedAi,
+                    })?;
+                (self.failpoint)("repair_candidate_committed");
+                unit.translation = Some(repaired);
+            }
+        }
+
         let mut rounds = 0;
         for round in 0..self.repo.repair_budget {
             let mut tasks = Vec::new();
@@ -669,7 +888,8 @@ impl<'a> Orchestrator<'a> {
                     else {
                         continue;
                     };
-                    let dedupe_key = format!("{}:repair:{round}", unit.stable_id);
+                    let dedupe_key =
+                        format!("{}:repair:{REPAIR_CONTEXT_VERSION}:{round}", unit.stable_id);
                     if let Some(recovered) = self
                         .database
                         .successful_attempt(work_item_id, &dedupe_key)?
@@ -701,6 +921,42 @@ impl<'a> Orchestrator<'a> {
                         skipped_terminal_attempt = true;
                         continue;
                     }
+                    let failed = self.database.failed_attempt_context(work_item_id)?;
+                    let previous_translation = failed
+                        .as_ref()
+                        .and_then(|context| context.output.clone())
+                        .or_else(|| unit.previous_translation.clone());
+                    let mut repair_findings = failed
+                        .as_ref()
+                        .and_then(|context| context.output.as_deref())
+                        .and_then(|output| validate_translation(&unit.markdown, output).err())
+                        .map(|validation| {
+                            validation
+                                .into_iter()
+                                .map(|stored| {
+                                    finding(
+                                        &document.source_path,
+                                        Some(unit.stable_id.clone()),
+                                        stored.code,
+                                        stored.message,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if repair_findings.is_empty() {
+                        repair_findings.push(finding(
+                            &document.source_path,
+                            Some(unit.stable_id.clone()),
+                            DecisionCode::VerificationFailed.as_str(),
+                            failed
+                                .as_ref()
+                                .and_then(|context| context.error.as_deref())
+                                .unwrap_or(
+                                    "previous output failed deterministic Markdown validation",
+                                ),
+                        ));
+                    }
                     tasks.push(AgentTask {
                         id: unit.stable_id.clone(),
                         stage: AgentStage::Repair,
@@ -708,13 +964,8 @@ impl<'a> Orchestrator<'a> {
                         target_language: language.into(),
                         source: unit.markdown.protected_source.clone(),
                         previous_source: unit.previous_source.clone(),
-                        previous_translation: unit.previous_translation.clone(),
-                        findings: vec![finding(
-                            &document.source_path,
-                            Some(unit.stable_id.clone()),
-                            DecisionCode::VerificationFailed.as_str(),
-                            "previous output failed deterministic Markdown validation",
-                        )],
+                        previous_translation,
+                        findings: repair_findings,
                         protected_tokens: unit
                             .markdown
                             .protected
@@ -750,7 +1001,8 @@ impl<'a> Orchestrator<'a> {
                     let Some(result) = by_id.get(unit.stable_id.as_str()) else {
                         continue;
                     };
-                    let dedupe_key = format!("{}:repair:{round}", unit.stable_id);
+                    let dedupe_key =
+                        format!("{}:repair:{REPAIR_CONTEXT_VERSION}:{round}", unit.stable_id);
                     if result.ok && validate_translation(&unit.markdown, &result.output).is_ok() {
                         self.database
                             .record_attempt_candidate(AttemptCandidateInput {
@@ -788,7 +1040,7 @@ impl<'a> Orchestrator<'a> {
                         } else {
                             "failed"
                         };
-                        self.database.record_attempt(AttemptInput {
+                        let receipt = self.database.record_attempt(AttemptInput {
                             work_item_id,
                             dedupe_key: &dedupe_key,
                             agent: &agent_name,
@@ -808,6 +1060,27 @@ impl<'a> Orchestrator<'a> {
                                 result.diagnostic.as_str()
                             }),
                         })?;
+                        if result.ok {
+                            for validation in validate_translation(&unit.markdown, &result.output)
+                                .expect_err("invalid repair output was checked above")
+                            {
+                                self.database.record_finding(FindingInput {
+                                    work_item_id,
+                                    attempt_id: Some(receipt.id),
+                                    finding_key: &format!(
+                                        "{}:{}:{}:{}",
+                                        validation.code,
+                                        unit.stable_id,
+                                        receipt.id,
+                                        &hash(&[validation.message.as_bytes()])[..16]
+                                    ),
+                                    severity: "error",
+                                    code: validation.code,
+                                    message: &validation.message,
+                                    details_json: "{}",
+                                })?;
+                            }
+                        }
                     }
                 }
             }
@@ -1095,12 +1368,24 @@ impl<'a> Orchestrator<'a> {
                 .filter(|unit| unit.translation.is_none())
                 .collect();
             if !missing.is_empty() {
-                findings.push(finding(
-                    &document.source_path,
-                    missing.first().map(|unit| unit.stable_id.clone()),
-                    DecisionCode::VerificationFailed.as_str(),
-                    format!("{} unit(s) have no verified translation", missing.len()),
-                ));
+                let unresolved_scheduled = missing
+                    .iter()
+                    .copied()
+                    .filter(|unit| unit.work_item_id.is_some())
+                    .collect::<Vec<_>>();
+                if !unresolved_scheduled.is_empty() {
+                    findings.push(finding(
+                        &document.source_path,
+                        unresolved_scheduled
+                            .first()
+                            .map(|unit| unit.stable_id.clone()),
+                        DecisionCode::VerificationFailed.as_str(),
+                        format!(
+                            "{} scheduled unit(s) have no verified translation",
+                            unresolved_scheduled.len()
+                        ),
+                    ));
+                }
                 continue;
             }
             let translations: Vec<_> = document
@@ -1744,8 +2029,12 @@ impl<'a> Orchestrator<'a> {
             let repository_id = self.repository_id()?;
             self.reconcile_pull_request(repository_id, language)?;
             let policy_fingerprint = prompts::policy_fingerprint();
-            let invocation =
+            let mut invocation =
                 format!("sync:{repository_id}:{language}:{source_revision}:{policy_fingerprint}");
+            if let Some(agent_fingerprint) = self.agents.configuration_fingerprint()? {
+                invocation.push(':');
+                invocation.push_str(&agent_fingerprint);
+            }
             let run_id = self.database.begin_run(
                 repository_id,
                 &invocation,
@@ -1970,6 +2259,30 @@ pub fn adopt_human_edit(
                 |findings| anyhow!("human target {target} failed validation: {findings:?}"),
             )?;
         }
+        let stable_ids = source_units
+            .iter()
+            .enumerate()
+            .map(|(ordinal, unit)| stable_unit_id(&document.path, unit, ordinal))
+            .collect::<Vec<_>>();
+        let stable_hints = stable_unit_hints(
+            database,
+            repository_id,
+            &document.path,
+            &document.content_hash,
+            &stable_ids,
+        )?;
+        let history = match database.document_id(repository_id, &document.path)? {
+            Some(document_id) => database.unit_history(document_id, language)?,
+            None => Vec::new(),
+        };
+        let matched =
+            match_units_with_stable_ids(&previous_units(&history), &source_units, &stable_hints);
+        if matched
+            .iter()
+            .any(|matched| matched.kind == MatchKind::Ambiguous)
+        {
+            bail!("human target {target} cannot be mapped to stable source units");
+        }
         let document_id = database.upsert_document(
             repository_id,
             &document.path,
@@ -1977,27 +2290,15 @@ pub fn adopt_human_edit(
             &document.content_hash,
             "{}",
         )?;
-        let history = database.unit_history(document_id, language)?;
-        let matched = match_units(&previous_units(&history), &source_units);
         for (ordinal, ((source_unit, target_unit), matched)) in source_units
             .iter()
             .zip(&target_units)
             .zip(matched)
             .enumerate()
         {
-            if matched.kind == MatchKind::Ambiguous {
-                bail!("human target {target} cannot be mapped to stable source units");
-            }
-            let stable_id = matched.stable_id.unwrap_or_else(|| {
-                format!(
-                    "unit-{}",
-                    &hash(&[
-                        document.path.as_bytes(),
-                        source_unit.id.as_bytes(),
-                        ordinal.to_string().as_bytes()
-                    ])[..24]
-                )
-            });
+            let stable_id = matched
+                .stable_id
+                .unwrap_or_else(|| stable_ids[ordinal].clone());
             let source_hash = hash(&[source_unit.source.as_bytes()]);
             let context = kind_name(source_unit);
             let unit_id = database.upsert_unit(

@@ -221,6 +221,32 @@ fn is_inline_event(event: &Event<'_>) -> bool {
     )
 }
 
+pub fn repair_leading_strong_separator(unit: &MarkdownUnit, translated: &str) -> Option<String> {
+    fn closing_strong_end(value: &str) -> Option<usize> {
+        value
+            .strip_prefix("**")?
+            .find("**")
+            .map(|offset| offset + 4)
+    }
+
+    let source_end = closing_strong_end(&unit.protected_source)?;
+    if !unit.protected_source[source_end..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
+    let translated_end = closing_strong_end(translated)?;
+    let next = translated[translated_end..].chars().next()?;
+    if next.is_whitespace() {
+        return None;
+    }
+    let mut repaired = translated.to_owned();
+    repaired.insert(translated_end, ' ');
+    Some(repaired)
+}
+
 pub fn validate_translation(
     unit: &MarkdownUnit,
     translated: &str,
@@ -259,6 +285,17 @@ pub fn validate_translation(
     }
 
     let restored = restore_protected(unit, translated);
+    let expected_code = inline_code_values(&unit.source);
+    let actual_code = inline_code_values(&restored);
+    if expected_code != actual_code {
+        findings.push(ValidationFinding {
+            code: "MD-PROTECTED-CODE",
+            message: format!(
+                "protected inline code changed (expected {expected_code:?}, found {actual_code:?})"
+            ),
+        });
+    }
+
     let expected = structure_signature(&unit.source);
     let actual = structure_signature(&restored);
     if expected != actual {
@@ -522,12 +559,24 @@ fn short_hash(value: &str) -> String {
         })
 }
 
+fn inline_code_values(markdown: &str) -> Vec<String> {
+    let mut values = Parser::new_ext(markdown, Options::all())
+        .filter_map(|event| match event {
+            Event::Code(value) => Some(value.into_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
 fn structure_signature(markdown: &str) -> Vec<String> {
-    Parser::new_ext(markdown, Options::all())
-        .map(|event| match event {
+    let mut signature = Vec::new();
+    for event in Parser::new_ext(markdown, Options::all()) {
+        let part = match event {
             Event::Start(tag) => format!("start:{}", tag_name(&tag)),
             Event::End(tag) => format!("end:{}", tag_end_name(tag)),
-            Event::Code(value) => format!("code:{value}"),
+            Event::Code(_) => "code".into(),
             Event::Html(value) => format!("html:{value}"),
             Event::InlineHtml(value) => format!("inline-html:{value}"),
             Event::FootnoteReference(value) => format!("footnote:{value}"),
@@ -538,8 +587,13 @@ fn structure_signature(markdown: &str) -> Vec<String> {
             Event::InlineMath(value) => format!("inline-math:{value}"),
             Event::DisplayMath(value) => format!("display-math:{value}"),
             Event::Text(_) => "text".into(),
-        })
-        .collect()
+        };
+        if part == "text" && signature.last().is_some_and(|previous| previous == "text") {
+            continue;
+        }
+        signature.push(part);
+    }
+    signature
 }
 
 fn tag_name(tag: &Tag<'_>) -> String {
@@ -594,7 +648,7 @@ fn placeholder_regex() -> &'static Regex {
             |%\([A-Za-z_][A-Za-z0-9_.-]*\)[\#0 +\-]?[0-9]*(?:\.[0-9]+)?[A-Za-z]
             |%(?:[1-9][0-9]*\$)?[\#0 +\-]?[0-9]*(?:\.[0-9]+)?[A-Za-z%]
             |\{[A-Za-z_][A-Za-z0-9_.-]*(?::[^{}\r\n]+)?\}
-            |@@[A-Za-z_][A-Za-z0-9_.-]*@@
+            |@@[A-Za-z_][A-Za-z0-9_.*-]*@@
             "#,
         )
         .expect("placeholder regex is valid")
@@ -603,8 +657,6 @@ fn placeholder_regex() -> &'static Regex {
 
 fn protection_token_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r"@@FANI_[A-Z_]+_[0-9]{4}_[0-9a-f]{16}@@")
-            .expect("protection token regex is valid")
-    })
+    REGEX
+        .get_or_init(|| Regex::new(r"@@FANI_[^@\r\n]*@@").expect("protection token regex is valid"))
 }

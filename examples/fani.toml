@@ -60,6 +60,9 @@ draft = false
 [agents.primary]
 provider = "anthropic"
 model = "claude-sonnet-4-5" # Example only; choose a model available to your account.
+# OpenAI and OpenAI-compatible native agents may set one of: none, minimal,
+# low, medium, high, or xhigh. The selected provider and model must support it.
+# reasoning_effort = "medium"
 concurrency = 4
 timeout_s = 300
 retries = 2

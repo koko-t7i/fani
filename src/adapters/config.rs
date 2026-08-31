@@ -1,3 +1,4 @@
+use crate::application::command::REASONING_EFFORTS;
 use crate::application::settings::RepoConfig;
 use globset::Glob;
 use serde::Deserialize;
@@ -34,6 +35,8 @@ pub struct AgentConfig {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
     #[serde(default = "default_concurrency")]
@@ -298,6 +301,21 @@ impl Config {
                     return Err(ConfigError::Invalid(format!(
                         "[agents.{name}]: unsupported adapter {:?}",
                         agent.adapter
+                    )));
+                }
+            }
+            if let Some(effort) = &agent.reasoning_effort {
+                if !REASONING_EFFORTS.contains(&effort.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "[agents.{name}]: reasoning_effort must be one of {}",
+                        REASONING_EFFORTS.join(", ")
+                    )));
+                }
+                if agent.adapter != "native-http-v1"
+                    || !matches!(agent.provider.as_str(), "openai" | "openai-compatible")
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "[agents.{name}]: reasoning_effort is only supported by openai and openai-compatible with native-http-v1"
                     )));
                 }
             }
@@ -578,6 +596,41 @@ translate = "fake"
         fs::write(&path, text).unwrap();
         let error = Config::load(&path).unwrap_err().to_string();
         assert!(error.contains("fixed endpoint"), "{error}");
+    }
+
+    #[test]
+    fn validates_reasoning_effort_provider_and_value() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        let path = tmp.path().join("fani.toml");
+        let openai = minimal(tmp.path())
+            .replace("provider = \"fixture\"", "provider = \"openai\"")
+            .replace(
+                "model = \"fixture\"",
+                "model = \"gpt-test\"\nreasoning_effort = \"medium\"",
+            )
+            .replace("adapter = \"command-json-v1\"\ncmd = [\"true\"]\n", "");
+        fs::write(&path, &openai).unwrap();
+        assert_eq!(
+            Config::load(&path)
+                .unwrap()
+                .agent_for("translate")
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("medium")
+        );
+
+        fs::write(&path, openai.replace("medium", "extreme")).unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("reasoning_effort must be one of"), "{error}");
+
+        let anthropic = openai
+            .replace("provider = \"openai\"", "provider = \"anthropic\"")
+            .replace("model = \"gpt-test\"", "model = \"claude-test\"");
+        fs::write(&path, anthropic).unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("only supported by openai"), "{error}");
     }
 
     #[test]
