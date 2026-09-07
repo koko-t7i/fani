@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const AGENT_REQUEST_SCHEMA: &str = "fani.agent.request.v1";
+pub const AGENT_REQUEST_SCHEMA: &str = "fani.agent.request.v2";
 pub const AGENT_RESPONSE_SCHEMA: &str = "fani.agent.response.v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

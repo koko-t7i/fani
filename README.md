@@ -60,6 +60,8 @@ OpenAI and OpenAI-compatible native agents can optionally set `reasoning_effort 
 
 See [Best practices](docs/best-practices.md#providers-and-credentials) and the [annotated configuration](examples/fani.toml) for both paths.
 
+Explicit source sets support independent Markdown directory and filename mappings. They are mutually exclusive with repo-level `include`, `exclude`, and `target_pattern`, even when those fields are empty. Legacy globs matching non-`.md` files now fail with migration guidance; JSON and MDX remain unavailable. Read the [configuration upgrade notes](docs/best-practices.md#explicit-source-sets-and-upgrade-safety) before upgrading. Custom command providers must accept [Agent request v2](docs/architecture/native-i18n.md#request-v2-upgrade); response v1 is unchanged.
+
 ## Core workflow
 
 ```bash

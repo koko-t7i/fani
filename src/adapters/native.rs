@@ -289,6 +289,9 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
     );
 
     for repo in repositories {
+        let mut repo = repo.clone();
+        repo.reserved_paths.push(report_dir.clone());
+        let repo = &repo;
         let database = open_database(repo)?;
         database_paths.push(database.path().to_owned());
         let mut lock = match RepoLock::acquire(database.clone(), &repo.path) {

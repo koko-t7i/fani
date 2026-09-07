@@ -117,6 +117,7 @@ impl AgentConfig {
 fn validate_repo_relative(value: &str, field: &str, repo: &Path) -> Result<(), ConfigError> {
     let path = Path::new(value);
     if path.as_os_str().is_empty()
+        || value.contains(['\\', '\0'])
         || path.is_absolute()
         || path.components().any(|component| {
             matches!(
@@ -129,6 +130,82 @@ fn validate_repo_relative(value: &str, field: &str, repo: &Path) -> Result<(), C
             "{}: {field} must be a non-empty path inside the repository",
             repo.display()
         )));
+    }
+    Ok(())
+}
+
+fn validate_template(
+    pattern: &str,
+    relpath_required: bool,
+    repo: &Path,
+) -> Result<(), ConfigError> {
+    for token in ["{lang}", "{relpath}"] {
+        if (token == "{lang}" || relpath_required) && !pattern.contains(token) {
+            return Err(ConfigError::Invalid(format!(
+                "target_pattern must contain {token}"
+            )));
+        }
+    }
+    let expanded = pattern
+        .replace("{lang}", "language")
+        .replace("{relpath}", "document.md");
+    if expanded.contains(['{', '}']) {
+        return Err(ConfigError::Invalid(
+            "unknown target_pattern placeholder".into(),
+        ));
+    }
+    validate_repo_relative(&expanded, "target_pattern", repo)
+}
+
+fn validate_sources(repo: &RepoConfig) -> Result<(), ConfigError> {
+    let invalid =
+        |message: &str| ConfigError::Invalid(format!("{}: {message}", repo.path.display()));
+    let mut languages = std::collections::HashSet::new();
+    for language in &repo.languages {
+        if language.is_empty()
+            || language == "."
+            || language == ".."
+            || !language
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !languages.insert(language)
+        {
+            return Err(invalid("languages must be unique safe path components"));
+        }
+    }
+    let Some(sources) = &repo.sources else {
+        return validate_template(&repo.target_pattern, true, &repo.path);
+    };
+    for source in sources {
+        if source.format != crate::domain::document::DocumentFormat::Markdown {
+            return Err(invalid(
+                "source format is unavailable in this build; only markdown is enabled",
+            ));
+        }
+        if source.message_syntax.is_some() {
+            return Err(invalid("message_syntax is only valid for JSON source sets"));
+        }
+        if source.include.is_empty() {
+            return Err(invalid("source set include must not be empty"));
+        }
+        for pattern in source.include.iter().chain(&source.exclude) {
+            Glob::new(pattern)
+                .map_err(|error| invalid(&format!("invalid source glob {pattern:?}: {error}")))?;
+        }
+        if let Some(prefix) = &source.strip_prefix {
+            validate_repo_relative(prefix, "strip_prefix", &repo.path)?;
+        }
+        validate_template(&source.target_pattern, false, &repo.path)?;
+        if !source.target_pattern.contains("{relpath}") {
+            if source.include.len() != 1
+                || source.include[0].contains(['*', '?', '[', ']', '{', '}', '\\'])
+            {
+                return Err(invalid(
+                    "target_pattern without {relpath} requires one explicit non-glob source file",
+                ));
+            }
+            validate_repo_relative(&source.include[0], "include", &repo.path)?;
+        }
     }
     Ok(())
 }
@@ -169,6 +246,7 @@ impl Config {
                     repo.path.display()
                 )));
             }
+            validate_sources(repo)?;
             for pattern in repo.include.iter().chain(&repo.exclude) {
                 Glob::new(pattern).map_err(|error| {
                     ConfigError::Invalid(format!(
@@ -177,22 +255,6 @@ impl Config {
                     ))
                 })?;
             }
-            for token in ["{lang}", "{relpath}"] {
-                if !repo.target_pattern.contains(token) {
-                    return Err(ConfigError::Invalid(format!(
-                        "{}: target_pattern must contain {token}",
-                        repo.path.display()
-                    )));
-                }
-            }
-            validate_repo_relative(
-                &repo
-                    .target_pattern
-                    .replace("{lang}", "language")
-                    .replace("{relpath}", "document.md"),
-                "target_pattern",
-                &repo.path,
-            )?;
             if !repo.documentation.timeout_s.is_finite() || repo.documentation.timeout_s <= 0.0 {
                 return Err(ConfigError::Invalid(format!(
                     "{}: documentation.timeout_s must be a positive finite number",
@@ -443,6 +505,111 @@ translate = "fake"
 "#,
             root.join("repo").display()
         )
+    }
+
+    fn source_config(root: &Path, fields: &str) -> String {
+        minimal(root).replace("target_pattern = \"docs/{lang}/{relpath}\"", fields)
+    }
+
+    #[test]
+    fn source_modes_preserve_absent_and_explicitly_empty_fields() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("fani.toml");
+        for legacy in ["", "include = []", "exclude = []"] {
+            fs::write(&path, source_config(tmp.path(), legacy)).unwrap();
+            let config = Config::load(&path).unwrap();
+            assert!(config.repos[0].sources.is_none());
+            assert!(config.repos[0].include.is_empty());
+        }
+        let source = "sources = [{ format = 'markdown', include = ['README.md'], target_pattern = 'out/{lang}.md' }]";
+        fs::write(&path, source_config(tmp.path(), source)).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().repos[0]
+                .sources
+                .as_ref()
+                .unwrap()
+                .len(),
+            1
+        );
+        for legacy in ["include = []", "exclude = []", "target_pattern = ''"] {
+            fs::write(
+                &path,
+                source_config(tmp.path(), &format!("{legacy}\n{source}")),
+            )
+            .unwrap();
+            assert!(
+                Config::load(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("mutually exclusive")
+            );
+        }
+        fs::write(&path, source_config(tmp.path(), "sources = []")).unwrap();
+        assert!(
+            Config::load(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("sources must not be empty")
+        );
+    }
+
+    #[test]
+    fn source_configuration_rejects_unsafe_or_unavailable_contracts_without_git() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("fani.toml");
+        let valid = "sources = [{ format = 'markdown', include = ['docs/a.md'], strip_prefix = 'docs/', target_pattern = 'out/{lang}.md' }]";
+        for (fields, expected) in [
+            (valid.replace("markdown", "json"), "unavailable"),
+            (valid.replace("markdown", "mdx"), "unavailable"),
+            (valid.replace("markdown", "yaml"), "unknown variant"),
+            (
+                valid.replace("['docs/a.md']", "[]"),
+                "include must not be empty",
+            ),
+            (valid.replace("docs/a.md", "docs/*.md"), "non-glob"),
+            (valid.replace("docs/a.md", "["), "invalid source glob"),
+            (valid.replace("out/{lang}.md", "out/{locale}.md"), "{lang}"),
+            (
+                valid.replace("out/{lang}.md", "out/{lang}/{unknown}.md"),
+                "unknown target_pattern",
+            ),
+            (
+                valid.replace("out/{lang}.md", "../out/{lang}.md"),
+                "inside the repository",
+            ),
+            (
+                valid.replace("out/{lang}.md", "/out/{lang}.md"),
+                "inside the repository",
+            ),
+            (
+                valid.replace("strip_prefix = 'docs/'", "strip_prefix = '../docs/'"),
+                "inside the repository",
+            ),
+            (
+                valid.replace(
+                    "format = 'markdown'",
+                    "format = 'markdown', message_syntax = 'plain'",
+                ),
+                "only valid for JSON",
+            ),
+        ] {
+            fs::write(&path, source_config(tmp.path(), &fields)).unwrap();
+            let error = Config::load(&path).unwrap_err().to_string();
+            assert!(error.contains(expected), "{fields}: {error}");
+        }
+        for language in ["../fr", "fr/ca", "fr\\ca", ".", "", "{lang}"] {
+            let text = source_config(tmp.path(), valid).replace(
+                "[\"zh-CN\"]",
+                &format!("[{}]", serde_json::to_string(language).unwrap()),
+            );
+            fs::write(&path, text).unwrap();
+            assert!(
+                Config::load(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("safe path components")
+            );
+        }
     }
 
     #[test]

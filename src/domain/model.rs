@@ -67,11 +67,26 @@ impl DecisionCode {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceDocument {
+    pub source_format: crate::domain::document::DocumentFormat,
+    pub source_set_id: String,
+    pub mapping_identity: String,
+    pub mapped_relpath: String,
+    pub target_pattern: String,
+    pub message_syntax: Option<MessageSyntax>,
     pub repository: String,
     pub source_revision: String,
     pub path: String,
     pub bytes: Vec<u8>,
     pub content_hash: String,
+}
+
+impl SourceDocument {
+    pub fn target_path(&self, language: &str) -> PathBuf {
+        self.target_pattern
+            .replace("{lang}", language)
+            .replace("{relpath}", &self.mapped_relpath)
+            .into()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -284,9 +299,48 @@ impl AgentStage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum MessageSyntax {
+    #[serde(rename = "plain")]
+    Plain,
+    #[serde(rename = "i18next-interpolation-v1")]
+    I18nextInterpolationV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenPermissions {
+    pub contract: String,
+    pub reorderable_tokens: Vec<String>,
+}
+
+impl TokenPermissions {
+    pub fn for_unit(unit: &crate::domain::document::TranslatableUnit) -> Self {
+        Self {
+            contract: unit.context.token_contract.clone(),
+            reorderable_tokens: unit
+                .protected
+                .iter()
+                .filter(|span| {
+                    matches!(
+                        span.kind,
+                        crate::domain::document::ProtectedKind::InlineCode
+                    )
+                })
+                .map(|span| span.token.clone())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTask {
+    pub source_format: crate::domain::document::DocumentFormat,
+    pub unit_context: crate::domain::document::UnitContext,
+    pub context_key: String,
+    pub message_syntax: Option<MessageSyntax>,
+    pub token_permissions: TokenPermissions,
     pub id: String,
     pub stage: AgentStage,
     pub source_language: String,

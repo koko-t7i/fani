@@ -54,6 +54,26 @@ base = "main"
 draft = false
 # Enforce required CI checks through GitHub branch protection on the base branch.
 
+# Alternative explicit source mode: remove repo-level include, exclude, and
+# target_pattern above before uncommenting these tables. No global exclude or
+# implicit source set is inherited. Only Markdown is enabled in this build.
+#
+# [[repo.sources]]
+# format = "markdown"
+# include = ["docs/**/*.md"]
+# exclude = ["docs/archive/**"]
+# strip_prefix = "docs/"
+# target_pattern = "i18n/{lang}/{relpath}"
+# # docs/guide/start.md -> i18n/zh-CN/guide/start.md
+#
+# [[repo.sources]]
+# format = "markdown"
+# include = ["README.md"]
+# target_pattern = "readme/{lang}.md"
+# # One explicit filename permits omission of {relpath}.
+# # Locale values are literal: zh-CN is not automatically shortened to zh.
+# # JSON and MDX source sets remain rejected, not silently treated as Markdown.
+
 # Official providers need no script or provider CLI. Supported values are
 # anthropic, openai, xai, and deepseek. Their fixed standard API-key environment
 # variables are selected automatically and never stored here.

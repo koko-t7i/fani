@@ -6,6 +6,14 @@ use sha2::{Digest, Sha256};
 
 fn task(stage: AgentStage) -> AgentTask {
     AgentTask {
+        source_format: fani::domain::document::DocumentFormat::Markdown,
+        unit_context: fani::domain::document::UnitContext::markdown(),
+        context_key: "fixture-context".into(),
+        message_syntax: None,
+        token_permissions: fani::domain::model::TokenPermissions {
+            contract: "fani-markdown-tokens-v1".into(),
+            reorderable_tokens: Vec::new(),
+        },
         id: "unit-1".into(),
         stage,
         source_language: "en".into(),
@@ -24,27 +32,27 @@ fn embedded_prompt_resources_match_reviewed_golden_hashes() {
         (
             "translate",
             prompts::TRANSLATE,
-            "e5542d0c289e9d5f968a48d09c561697078455da0141a7f214986bf489f468db",
+            "96579857f1841c49e5ffaf3149ed6f50ebf8123c2e7a6a1d0478dbeefdd37136",
         ),
         (
             "revise",
             prompts::REVISE,
-            "2d88ac3badd067088a6dadaac8bf31e29ec9b70846b662099a4740a43a934414",
+            "7d99f3bff649505d1795afd1ccec92cbca54f2567cf67a0e3a53193dc3115c7a",
         ),
         (
             "repair",
             prompts::REPAIR,
-            "9915da0ff97327796a0a7b68cbee1704edf511a52a161a392f0e9da0677c6082",
+            "65ee2c277bac714a35dff3e5dfba030aab5ab8b9d7f7f29f92803640d3334c0f",
         ),
         (
             "revision",
             prompts::REVISION,
-            "31285f6338bc7645981b38f27229e2c0bd947829fa880d84c1595b88c612f7dd",
+            "242b03e51fefd8030a7c2707511a877fddaf86912f55ab5a98ed00c431903436",
         ),
         (
             "proofread",
             prompts::PROOFREAD,
-            "28d53c65af3fde48957f1c47967809ce5804f85375ce78b484f9b9342be05f0b",
+            "27ce9a8c1133c800aa46e6a585b4159b8ff9c7074dd1c2f4ccbd8cb9ef3e655d",
         ),
     ];
     for (name, resource, expected) in resources {
@@ -88,6 +96,76 @@ fn each_agent_behavior_selects_its_versioned_resource() {
     let rendered = prompts::render(&revise);
     assert!(rendered.contains("--- PREVIOUS SOURCE ---\nOld source"));
     assert!(rendered.contains("--- PREVIOUS TRANSLATION ---\n旧译文"));
+}
+
+#[test]
+fn request_v2_exposes_stable_context_and_safe_token_permissions_for_every_stage() {
+    use fani::application::ports::{
+        AGENT_REQUEST_SCHEMA, AgentPolicy, AgentPrompt, AgentRequestEnvelope,
+    };
+    use fani::domain::document::{DocumentFormat, parse_document, validate_unit};
+    use fani::domain::model::TokenPermissions;
+    let parsed = parse_document(DocumentFormat::Markdown, b"Use `one` before `two`.\n").unwrap();
+    let unit = &parsed.units[0];
+    let permissions = TokenPermissions::for_unit(unit);
+    assert_eq!(permissions.reorderable_tokens.len(), 2);
+    let swapped = unit
+        .protected_source
+        .replace(&permissions.reorderable_tokens[0], "TEMP")
+        .replace(
+            &permissions.reorderable_tokens[1],
+            &permissions.reorderable_tokens[0],
+        )
+        .replace("TEMP", &permissions.reorderable_tokens[1]);
+    validate_unit(unit, &swapped).unwrap();
+    for stage in [
+        AgentStage::Translate,
+        AgentStage::Repair,
+        AgentStage::Revision,
+        AgentStage::Proofread,
+    ] {
+        let mut task = task(stage);
+        task.unit_context = unit.context.clone();
+        task.context_key = unit.memory_context_key("docs/a.md");
+        task.token_permissions = permissions.clone();
+        task.source = unit.protected_source.clone();
+        task.protected_tokens = permissions.reorderable_tokens.clone();
+        let rendered = prompts::render(&task);
+        for field in [
+            "Source format: \"markdown\"",
+            "Unit context:",
+            "Context key:",
+            "Message syntax: null",
+            "Token permissions:",
+        ] {
+            assert!(rendered.contains(field), "{rendered}");
+        }
+        let envelope = AgentRequestEnvelope {
+            schema: AGENT_REQUEST_SCHEMA.into(),
+            prompt: AgentPrompt {
+                version: prompts::PROMPT_VERSION.into(),
+                resource: prompts::resource_name(&task).into(),
+                hash: prompts::task_prompt_hash(&task),
+                content: rendered,
+            },
+            policy: AgentPolicy {
+                fingerprint: prompts::policy_fingerprint(),
+            },
+            task,
+        };
+        let mut value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["schema"], "fani.agent.request.v2");
+        assert_eq!(value["task"]["source_format"], "markdown");
+        assert_eq!(
+            serde_json::from_value::<AgentRequestEnvelope>(value.clone()).unwrap(),
+            envelope
+        );
+        value["task"]
+            .as_object_mut()
+            .unwrap()
+            .remove("token_permissions");
+        assert!(serde_json::from_value::<AgentRequestEnvelope>(value).is_err());
+    }
 }
 
 #[test]

@@ -71,6 +71,30 @@ Connection policy is `foreign_keys=ON`, rollback journal, `synchronous=FULL`, an
 
 The provider receives one typed task rendered by an embedded versioned prompt. It runs in an empty temporary working directory with a temporary `HOME`, an explicit environment allowlist, bounded stdin/stdout/stderr/result files, an absolute deadline, process-group TERM/KILL escalation, descendant cleanup, and no repository path. fani validates the returned text and performs every file, database, and publication operation itself.
 
+### Request v2 upgrade
+
+The `command-json-v1` adapter name is unchanged, but commands must now accept `fani.agent.request.v2`. The strict envelope contains `schema`, `task`, `prompt` (`version`, `resource`, `hash`, `content`), and `policy` (`fingerprint`). Response remains `fani.agent.response.v1`, with exactly `schema`, `task_id`, and `output`. Unknown response fields, a mismatched task ID, or an unsupported response schema are rejected. Return unit text rather than a serialized document; fani owns escaping, assembly, and verification.
+
+Every task, including translate-with-previous-source, repair, blocking revision, and advisory proofread, carries these additional required fields:
+
+| Field | Meaning |
+| --- | --- |
+| `source_format` | Stable `markdown`, `json`, or `mdx` discriminator; this build dispatches only Markdown. |
+| `unit_context` | PR1 format, context version, structural path, and token contract. |
+| `context_key` | Source-document-bound stable memory context, including kind and semantic format contract; not an absolute repository path. |
+| `message_syntax` | `null` for Markdown; reserved typed values are `plain` and `i18next-interpolation-v1`, not enabled JSON support. |
+| `token_permissions` | Versioned `contract` and explicit `reorderable_tokens` allowlist; every token must still appear exactly once, unchanged. |
+
+Only listed Markdown inline-code tokens may move when meaning and associations remain intact. Structural tokens retain source order and nesting. JSON interpolation permissions must eventually come from its message dialect, never from model output. MDX executable syntax must never be translated or introduced. Prompt resources and rendered context expose the same constraints for all stages. Prompt hashes change independently of PR1's Markdown semantic compatibility fingerprint; a prompt upgrade does not by itself invalidate verified trusted Markdown memory. Old request receipts cannot serve as current v2 review approvals.
+
+### Source sets and fixed-revision preflight
+
+Absent `sources` retains legacy repo-level `include`, `exclude`, and `target_pattern`; absent or empty legacy include keeps Markdown defaults. Explicit `sources` must be nonempty and cannot coexist with any explicitly provided legacy field, including `include = []`, `exclude = []`, or an empty target pattern. There is no implicit Markdown set and no inherited global exclude in explicit mode.
+
+Configuration loading validates formats, globs, path components, placeholders, and mapping shape without Git, SQLite, or Agent calls. JSON and MDX remain unavailable and are explicitly rejected. Fixed-revision discovery then validates component-based `strip_prefix`, exact `.md` extensions, missing single-file inputs, source-set overlap, and targets for **every configured language**, even when the command selects only one language. Targets cannot collide (including file/directory ancestry), overwrite inputs, match any effective source rule, or overlap `.git`, configured state, or report directories. Sync includes its custom `--report-dir` reservation; status/check share discovery and default reservations without a report-dir option.
+
+Discovery carries format, message syntax, a content-derived source-set identity, a per-file mapping identity, mapped relative path, and target template. Planning, publication verification/recovery, adopt, and discard use the discovered mapping rather than the legacy template. Durable mapping identity comparison across configuration changes remains part of PR2's separate pipeline integration, not a claim implied by these fields.
+
 ## Git and GitHub publication
 
 A candidate tree starts from the fixed source commit and applies a typed allowlist of add/modify/delete target changes using a temporary index. `commit-tree` creates the candidate commit; local refs use compare-and-swap, and remote updates use force-with-lease. The checked-out branch, `HEAD`, real index bytes/staging, unrelated worktree files, database, prompts, responses, reports, and work files are never changed or published by candidate construction.

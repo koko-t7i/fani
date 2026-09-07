@@ -92,12 +92,22 @@ Recommended configuration rules:
 - Include only source Markdown that should be translated.
 - Exclude generated target roots such as `i18n/**`; otherwise translated files can be discovered as new sources.
 - Exclude archives, generated API references, vendored content, changelogs, or legal files unless they are intentionally in scope.
-- Keep `{lang}` and `{relpath}` in `target_pattern` so languages and source paths cannot collide.
+- Legacy `target_pattern` requires `{lang}` and `{relpath}`. Explicit source sets may omit `{relpath}` only for one exact non-glob filename; preflight rejects missing inputs and target collisions across all configured languages.
 - Keep `data_dir` inside the repository root but outside publication targets. Do not commit `<data_dir>/fani.db`.
 - Keep reports outside translated target paths. Reports are replaceable views, not state or publication inputs.
 - Use one configuration for related repositories only when they share an operating schedule and credential boundary. Otherwise use separate files and invocations.
 
 fani reads source blobs from `publish.source_ref`, not from mutable worktree source files. Set it to the branch or ref that represents approved source documentation, normally `origin/main` in a continuously fetched checkout.
+
+### Explicit source sets and upgrade safety
+
+For independent directory or filename mappings, replace the repo-level `include`, `exclude`, and `target_pattern` fields with `[[repo.sources]]` tables (see the annotated configuration). Do not leave even empty legacy fields alongside source sets: the two modes are mutually exclusive. Every set declares `format = "markdown"`, a nonempty `include`, optional `exclude` and `strip_prefix`, and a target pattern containing `{lang}`. No default set or global exclude is added.
+
+`strip_prefix = "website/docs/"` removes directory components, not a string substring, and every matching input must be below it. `{relpath}` is the remaining full relative filename. A single-file mapping such as `include = ["README.md"]` and `target_pattern = "readme/{lang}.md"` needs no `{relpath}`. More complex filename renaming is expressed with one set per file. Language values are used verbatim: `zh-CN` does **not** become `zh`; locale aliases are not supported.
+
+**Upgrade boundary:** legacy globs that match non-`.md` files now fail preflight with source-set migration guidance instead of parsing arbitrary extensions as Markdown. Narrow or exclude those paths. Explicit JSON and MDX configuration is still rejected until their backends ship; renaming a source file or relying on content sniffing does not enable another format. `fani init` remains Markdown-only.
+
+Preflight rejects generated paths that match any effective source rule, even if the targets do not exist yet. Always exclude generated target roots when using broad includes. It also checks all configured languages, source overlaps, target collisions and input/state/report/Git path protection before translation or target writes. Custom command providers must upgrade to [request v2](architecture/native-i18n.md#request-v2-upgrade); response v1 and the `command-json-v1` adapter name remain unchanged.
 
 ## Translation quality and cost
 

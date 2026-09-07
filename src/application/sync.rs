@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 const REPAIR_CONTEXT_VERSION: &str = "v6";
@@ -42,25 +42,6 @@ fn hash(parts: &[&[u8]]) -> String {
 
 fn content_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-fn target_path(repo: &RepoConfig, language: &str, source_path: &str) -> Result<PathBuf> {
-    let value = repo
-        .target_pattern
-        .replace("{lang}", language)
-        .replace("{relpath}", source_path);
-    let path = PathBuf::from(value);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        bail!("target path escapes repository: {}", path.display());
-    }
-    Ok(path)
 }
 
 fn reusable_candidate(
@@ -82,12 +63,14 @@ fn reusable_candidate(
 
 #[derive(Deserialize)]
 struct StoredReviewRequest {
+    schema: String,
     task: AgentTask,
 }
 
 fn compatible_review_request(
     receipt: &crate::application::ports::RecoveredAttempt,
     stage: &str,
+    path: &str,
     unit: &TranslatableUnit,
     translated: &str,
 ) -> bool {
@@ -95,7 +78,13 @@ fn compatible_review_request(
         return false;
     };
     let task = request.task;
-    task.stage.as_str() == stage
+    request.schema == crate::application::ports::AGENT_REQUEST_SCHEMA
+        && task.source_format == unit.context.format
+        && task.unit_context == unit.context
+        && task.context_key == unit.memory_context_key(path)
+        && task.message_syntax.is_none()
+        && task.token_permissions == crate::domain::model::TokenPermissions::for_unit(unit)
+        && task.stage.as_str() == stage
         && task.source == unit.protected_source
         && (task.previous_translation.as_deref() == Some(translated)
             || (stage == "revision"
@@ -339,7 +328,7 @@ impl<'a> Orchestrator<'a> {
         let mut reused = 0;
         let mut conflicts = 0;
         for document in &documents {
-            let parsed = match parse_document(DocumentFormat::Markdown, &document.bytes) {
+            let parsed = match parse_document(document.source_format, &document.bytes) {
                 Ok(parsed) => parsed,
                 Err(_) => {
                     conflicts += 1;
@@ -440,7 +429,7 @@ impl<'a> Orchestrator<'a> {
         let policy_fingerprint = prompts::policy_fingerprint();
         let documents = self.git.discover(self.repo, source_revision)?;
         for document in documents {
-            let parsed = match parse_document(DocumentFormat::Markdown, &document.bytes) {
+            let parsed = match parse_document(document.source_format, &document.bytes) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     conflicts.push(finding(
@@ -617,7 +606,7 @@ impl<'a> Orchestrator<'a> {
                 }
                 units.push(planned);
             }
-            let target = target_path(self.repo, language, &document.path)?;
+            let target = document.target_path(language);
             let target_path = target.to_string_lossy().into_owned();
             let canonical = self
                 .database
@@ -679,7 +668,7 @@ impl<'a> Orchestrator<'a> {
             {
                 continue;
             }
-            if !compatible_review_request(&receipt, stage, unit, &candidate.text)
+            if !compatible_review_request(&receipt, stage, path, unit, &candidate.text)
                 || !receipt.provenance.as_ref().is_some_and(|bound| {
                     bound.policy_fingerprint == prompts::policy_fingerprint()
                         && validate_provenance(path, unit, bound, &unit.protected_source).is_ok()
@@ -711,7 +700,13 @@ impl<'a> Orchestrator<'a> {
             unit.protected_source.as_str()
         };
         let review_matches = reviewed_translation.is_none_or(|text| {
-            compatible_review_request(&receipt, key.rsplit(':').next().unwrap_or(""), unit, text)
+            compatible_review_request(
+                &receipt,
+                key.rsplit(':').next().unwrap_or(""),
+                path,
+                unit,
+                text,
+            )
         });
         if review_matches
             && receipt.provenance.as_ref().is_some_and(|provenance| {
@@ -774,6 +769,11 @@ impl<'a> Orchestrator<'a> {
                     continue;
                 }
                 tasks.push(AgentTask {
+                    source_format: unit.unit.context.format,
+                    unit_context: unit.unit.context.clone(),
+                    context_key: unit.unit.memory_context_key(&document.source_path),
+                    message_syntax: None,
+                    token_permissions: crate::domain::model::TokenPermissions::for_unit(&unit.unit),
                     id: unit.stable_id.clone(),
                     stage: AgentStage::Translate,
                     source_language: "auto".into(),
@@ -1099,6 +1099,13 @@ impl<'a> Orchestrator<'a> {
                         ));
                     }
                     tasks.push(AgentTask {
+                        source_format: unit.unit.context.format,
+                        unit_context: unit.unit.context.clone(),
+                        context_key: unit.unit.memory_context_key(&document.source_path),
+                        message_syntax: None,
+                        token_permissions: crate::domain::model::TokenPermissions::for_unit(
+                            &unit.unit,
+                        ),
                         id: unit.stable_id.clone(),
                         stage: AgentStage::Repair,
                         source_language: "auto".into(),
@@ -1310,6 +1317,13 @@ impl<'a> Orchestrator<'a> {
                         continue;
                     }
                     tasks.push(AgentTask {
+                        source_format: unit.unit.context.format,
+                        unit_context: unit.unit.context.clone(),
+                        context_key: unit.unit.memory_context_key(&document.source_path),
+                        message_syntax: None,
+                        token_permissions: crate::domain::model::TokenPermissions::for_unit(
+                            &unit.unit,
+                        ),
                         id: unit.stable_id.clone(),
                         stage: stage.clone(),
                         source_language: "auto".into(),
@@ -1898,8 +1912,7 @@ impl<'a> Orchestrator<'a> {
             }
             let mut source = None;
             for document in &sources {
-                if target_path(self.repo, language, &document.path)?.to_string_lossy() == file.path
-                {
+                if document.target_path(language).to_string_lossy() == file.path {
                     source = Some(document);
                     break;
                 }
@@ -1907,7 +1920,7 @@ impl<'a> Orchestrator<'a> {
             let Some(source) = source else {
                 return Ok(false);
             };
-            let Ok(parsed) = parse_document(DocumentFormat::Markdown, &source.bytes) else {
+            let Ok(parsed) = parse_document(source.source_format, &source.bytes) else {
                 return Ok(false);
             };
             let Ok(text) = std::str::from_utf8(&file.content) else {
@@ -2054,7 +2067,7 @@ impl<'a> Orchestrator<'a> {
             let old_sources = self.git.discover(self.repo, &payload.source_revision)?;
             let current_sources = self.git.discover(self.repo, &outcome.source_revision)?;
             for old in &old_sources {
-                let target = target_path(self.repo, language, &old.path)?;
+                let target = old.target_path(language);
                 if records
                     .iter()
                     .any(|record| target.to_string_lossy() == record.path)
@@ -2539,7 +2552,8 @@ pub fn adopt_human_edit(
     let documents = git.discover(repo, &source_revision)?;
     let mut adoption_files = Vec::new();
     for document in &documents {
-        let target = target_path(repo, language, &document.path)?
+        let target = document
+            .target_path(language)
             .to_string_lossy()
             .into_owned();
         if database
@@ -2551,7 +2565,7 @@ pub fn adopt_human_edit(
         let bytes = materializer
             .read(&repo.path, Path::new(&target))?
             .with_context(|| format!("cannot read human target {target}"))?;
-        let source = parse_document(DocumentFormat::Markdown, &document.bytes)?;
+        let source = parse_document(document.source_format, &document.bytes)?;
         let translated = parse_document(DocumentFormat::Markdown, &bytes)?;
         verify_document(&source, &translated.source)
             .with_context(|| format!("human target {target} failed validation"))?;
@@ -2582,7 +2596,8 @@ pub fn adopt_human_edit(
     }
     let mut adopted = 0;
     for document in documents {
-        let target = target_path(repo, language, &document.path)?
+        let target = document
+            .target_path(language)
             .to_string_lossy()
             .into_owned();
         let Some(canonical) = database.canonical_file(repository_id, language, &target)? else {
@@ -2725,7 +2740,8 @@ pub fn discard_human_edit(
     let documents = git.discover(repo, &source_revision)?;
     let mut discarded = 0;
     for document in documents {
-        let target = target_path(repo, language, &document.path)?
+        let target = document
+            .target_path(language)
             .to_string_lossy()
             .into_owned();
         let Some(canonical) = database.canonical_file(repository_id, language, &target)? else {
