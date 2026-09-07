@@ -257,6 +257,23 @@ pub fn preflight(
             ));
         }
     }
+    for document in &documents {
+        let input = repository.join(&document.path);
+        // A dangling directory alias can become reachable when targets are created.
+        for ancestor in input.ancestors() {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(anyhow!(
+                        "input source path aliases another filesystem path: {}",
+                        document.path
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     let mut targets: Vec<std::path::PathBuf> = Vec::new();
     let mut reserved_paths = vec![
         repository.join(".git"),
@@ -566,6 +583,26 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("escapes repository")
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_reverse_input_alias_even_when_target_does_not_exist() {
+        use std::os::unix::fs::symlink;
+        let (tmp, mut repo, revision) = fixture(&["docs/fr.md"]);
+        repo.languages = vec!["fr".into()];
+        repo.sources = Some(vec![source("docs/fr.md", "out/{lang}.md")]);
+        fs::remove_dir_all(tmp.path().join("docs")).unwrap();
+        symlink("out", tmp.path().join("docs")).unwrap();
+        let error = discover(&repo, &revision).unwrap_err().to_string();
+        assert!(error.contains("input source path aliases"), "{error}");
+        fs::create_dir(tmp.path().join("out")).unwrap();
+        let error = discover(&repo, &revision).unwrap_err().to_string();
+        assert!(error.contains("input source path aliases"), "{error}");
+        assert!(!tmp.path().join("out/fr.md").exists());
+        assert_eq!(
+            git(tmp.path(), &["show", &format!("{revision}:docs/fr.md")]).unwrap(),
+            b"Hello\n"
         );
     }
 

@@ -134,6 +134,13 @@ translate = "fixture"
             .lines()
             .count()
     }
+    fn explicit_source(&self, target: &str) {
+        let config = fs::read_to_string(&self.config).unwrap()
+            .replace("include = [\"docs/**/*.md\"]", &format!("sources = [{{ format = 'markdown', include = ['docs/guide.md'], target_pattern = '{target}' }}]"))
+            .replace("target_pattern = \"translations/{lang}/{relpath}\"\n", "");
+        fs::write(&self.config, config).unwrap();
+    }
+
     fn budget_one(&self) {
         fs::write(
             &self.config,
@@ -165,6 +172,214 @@ translate = "fixture"
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn reverse_input_alias_is_rejected_before_cli_state_or_provider_effects() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new("Hello world.\n");
+    fixture.explicit_source("out/{lang}/guide.md");
+    fs::remove_dir_all(fixture.repo.join("docs")).unwrap();
+    symlink("out/zh-CN", fixture.repo.join("docs")).unwrap();
+    for create_parent in [false, true] {
+        if create_parent {
+            fs::create_dir_all(fixture.repo.join("out/zh-CN")).unwrap();
+        }
+        for command in ["status", "check", "sync", "adopt", "discard"] {
+            let output = fixture.run(command);
+            assert_eq!(output.status.code(), Some(2), "{command}: {output:?}");
+            let diagnostic = if command == "sync" {
+                fs::read_to_string(fixture.temp.path().join("reports/report.json")).unwrap()
+            } else {
+                String::from_utf8_lossy(&output.stderr).into_owned()
+            };
+            assert!(
+                diagnostic.contains("input source path aliases"),
+                "{command}: {diagnostic}"
+            );
+            assert_eq!(fixture.calls(), 0);
+            assert!(!fixture.repo.join(".fani").exists());
+            assert!(!fixture.repo.join("out/zh-CN/guide.md").exists());
+            assert!(!fixture.repo.join("docs/guide.md").exists());
+        }
+    }
+}
+
+#[test]
+fn invalid_mapping_preflight_precedes_database_open_for_every_entrypoint() {
+    let fixture = Fixture::new("Hello world.\n");
+    fixture.explicit_source(".{lang}/guide.md");
+    let config = fs::read_to_string(&fixture.config).unwrap().replace(
+        "languages = [\"zh-CN\"]",
+        "languages = [\"zh-CN\", \"fani\"]",
+    );
+    fs::write(&fixture.config, config).unwrap();
+    for command in ["status", "check", "sync", "adopt", "discard"] {
+        let output = fixture.run(command);
+        assert_eq!(output.status.code(), Some(2), "{command}: {output:?}");
+        assert!(
+            !fixture.repo.join(".fani").exists(),
+            "{command} created state"
+        );
+        assert_eq!(fixture.calls(), 0);
+    }
+    fs::create_dir(fixture.repo.join(".fani")).unwrap();
+    let database = fixture.repo.join(".fani/fani.db");
+    fs::write(&database, "must not be opened or migrated").unwrap();
+    for command in ["status", "check", "sync", "adopt", "discard"] {
+        let output = fixture.run(command);
+        assert_eq!(output.status.code(), Some(2));
+        let diagnostic = if command == "sync" {
+            fs::read_to_string(fixture.temp.path().join("reports/report.json")).unwrap()
+        } else {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+        assert!(
+            diagnostic.contains("reserved state/report/Git"),
+            "{command}: {diagnostic}"
+        );
+        assert_eq!(
+            fs::read_to_string(&database).unwrap(),
+            "must not be opened or migrated"
+        );
+        assert_eq!(fs::read_dir(fixture.repo.join(".fani")).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn actual_report_reservation_precedes_database_creation() {
+    let fixture = Fixture::new("Hello world.\n");
+    fixture.explicit_source("custom-reports/{lang}.md");
+    let reports = fixture.repo.join("custom-reports");
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("fani"))
+        .arg("sync")
+        .arg("--config")
+        .arg(&fixture.config)
+        .arg("--report-dir")
+        .arg(&reports)
+        .arg("--quiet")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(!fixture.repo.join(".fani").exists());
+    assert!(!reports.join("zh-CN.md").exists());
+    assert_eq!(fixture.calls(), 0);
+    assert!(
+        fs::read_to_string(reports.join("report.json"))
+            .unwrap()
+            .contains("reserved state/report/Git")
+    );
+}
+
+#[test]
+fn invalid_mapping_does_not_reconcile_stored_pr_or_mutate_existing_database() {
+    use fani::application::ports::PullRequestStateInput;
+    let fixture = Fixture::new("Hello world.\n");
+    fixture.sync(0);
+    {
+        let db = fixture.db();
+        let repository_id = db
+            .connect()
+            .unwrap()
+            .query_row("SELECT id FROM repositories", [], |row| row.get(0))
+            .unwrap();
+        db.record_pr_state(PullRequestStateInput {
+            repository_id,
+            provider: "github",
+            external_id: "1",
+            number: Some(1),
+            branch: "i18n/zh-CN",
+            url: Some("https://example.invalid/pull/1"),
+            state: "open",
+            head_revision: None,
+            event_key: "fixture",
+            payload_json: "{}",
+        })
+        .unwrap();
+    }
+    fixture.explicit_source(".fani/{lang}.md");
+    let config = fs::read_to_string(&fixture.config).unwrap()
+        .replace("enabled = false", "enabled = true")
+        .replace("source_ref = \"HEAD\"", "source_ref = \"HEAD\"\npush = true")
+        .replace("[agents.fixture]", "[repo.publish.github]\nenabled = true\nrepository = 'fixture/project'\n[agents.fixture]");
+    fs::write(&fixture.config, config).unwrap();
+    let bin = fixture.temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let marker = fixture.temp.path().join("gh-called");
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        format!("#!/bin/sh\ntouch '{}'\nexit 66\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let database = fixture.repo.join(".fani/fani.db");
+    let before = fs::read(&database).unwrap();
+    let target = fs::read(&fixture.target).unwrap();
+    for command in ["status", "check", "sync", "adopt", "discard"] {
+        let output = fixture.run(command);
+        assert_eq!(output.status.code(), Some(2), "{command}: {output:?}");
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            before,
+            "{command} mutated state"
+        );
+        assert_eq!(fs::read(&fixture.target).unwrap(), target);
+        assert_eq!(fixture.calls(), 1);
+        assert!(!marker.exists(), "{command} invoked gh");
+    }
+    assert!(
+        fs::read_to_string(fixture.temp.path().join("reports/report.json"))
+            .unwrap()
+            .contains("reserved state/report/Git")
+    );
+}
+
+#[test]
+fn validated_revision_remains_pinned_when_ref_moves_between_languages() {
+    let fixture = Fixture::new("Hello world.\n");
+    let revision = |fixture: &Fixture| {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&fixture.repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let original = revision(&fixture);
+    fs::write(fixture.repo.join("docs/unsupported.txt"), "not Markdown").unwrap();
+    fixture.commit();
+    let moved = revision(&fixture);
+    fixture.git(&["reset", "--hard", &original]);
+    let config = fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace("languages = [\"zh-CN\"]", "languages = [\"zh-CN\", \"fr\"]")
+        .replace("docs/**/*.md", "docs/**");
+    fs::write(&fixture.config, config).unwrap();
+    let provider = fixture.temp.path().join("provider.sh");
+    let script = fs::read_to_string(&provider).unwrap().replace(
+        "set -eu\n",
+        &format!(
+            "set -eu\ngit -C '{}' update-ref refs/heads/main '{}'\n",
+            fixture.repo.display(),
+            moved
+        ),
+    );
+    fs::write(&provider, script).unwrap();
+    fixture.sync(0);
+    assert_eq!(revision(&fixture), moved);
+    assert_eq!(fixture.calls(), 2);
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(fixture.temp.path().join("reports/report.json")).unwrap(),
+    )
+    .unwrap();
+    for language in report["languages"].as_array().unwrap() {
+        assert_eq!(language["source_revision"], original);
+    }
+    let output = fixture.run("status");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported source extension"));
 }
 
 #[test]

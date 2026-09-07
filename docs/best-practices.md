@@ -107,7 +107,7 @@ For independent directory or filename mappings, replace the repo-level `include`
 
 **Upgrade boundary:** legacy globs that match non-`.md` files now fail preflight with source-set migration guidance instead of parsing arbitrary extensions as Markdown. Narrow or exclude those paths. Explicit JSON and MDX configuration is still rejected until their backends ship; renaming a source file or relying on content sniffing does not enable another format. `fani init` remains Markdown-only.
 
-Preflight rejects generated paths that match any effective source rule, even if the targets do not exist yet. Always exclude generated target roots when using broad includes. It also checks all configured languages, source overlaps, target collisions and input/state/report/Git path protection before translation or target writes. Custom command providers must upgrade to [request v2](architecture/native-i18n.md#request-v2-upgrade); response v1 and the `command-json-v1` adapter name remain unchanged.
+Preflight rejects generated paths that match any effective source rule, even if the targets do not exist yet. Always exclude generated target roots when using broad includes. It also checks all configured languages, source overlaps, target collisions and input/state/report/Git path protection before database opening, leases, PR reconciliation, recovery, or translation. Selected source files and directories must not alias another filesystem path, even if their Git blobs are valid. The validated commit remains pinned across all languages in the invocation. Custom command providers must upgrade to [request v2](architecture/native-i18n.md#request-v2-upgrade); response v1 and the `command-json-v1` adapter name remain unchanged.
 
 ## Translation quality and cost
 

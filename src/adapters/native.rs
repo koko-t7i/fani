@@ -189,11 +189,22 @@ fn owner_identity() -> Result<String> {
     Ok(format!("{pid}:{started_at}"))
 }
 
+fn preflight_repo(repo: &RepoConfig) -> Result<RepoConfig> {
+    let revision = crate::adapters::source::resolve_source_revision(repo)?;
+    crate::adapters::source::discover(repo, &revision)?;
+    let mut pinned = repo.clone();
+    // Later planning and recovery must not resolve a moved source ref.
+    pinned.publish.source_ref = revision;
+    Ok(pinned)
+}
+
 fn status(args: Selection, output: &dyn OutputReporter) -> Result<CommandOutput> {
     let config = Config::load(&args.config)?;
     config.check_environment()?;
     let mut worst = Status::Ok;
     for repo in selected(&config, args.repository.as_deref())? {
+        let repo = preflight_repo(repo)?;
+        let repo = &repo;
         let snapshot_dir = tempfile::tempdir()?;
         let snapshot_path = snapshot_dir.path().join("fani.db");
         let authoritative_path = database_path(repo);
@@ -291,6 +302,19 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
     for repo in repositories {
         let mut repo = repo.clone();
         repo.reserved_paths.push(report_dir.clone());
+        let repo = match preflight_repo(&repo) {
+            Ok(repo) => repo,
+            Err(error) => {
+                for language in languages(&repo, args.selection.language.as_deref())? {
+                    let mut outcome = LanguageOutcome::new(&repo.path, &language);
+                    outcome.status = Status::Error;
+                    outcome.message = error.to_string();
+                    outcome.transitions.push("error:preflight".into());
+                    outcomes.push(outcome);
+                }
+                continue;
+            }
+        };
         let repo = &repo;
         let database = open_database(repo)?;
         database_paths.push(database.path().to_owned());
@@ -517,6 +541,8 @@ fn reconcile(
     config.check_environment()?;
     let mut count = 0;
     for repo in selected(&config, args.repository.as_deref())? {
+        let repo = preflight_repo(repo)?;
+        let repo = &repo;
         let database = open_database(repo)?;
         let mut lock = RepoLock::acquire(database.clone(), &repo.path)?;
         let materializer = FilesystemMaterializer;
