@@ -630,6 +630,346 @@ fn json_recovery_and_project_check_failure_preserve_verified_effect_boundary() {
 }
 
 #[test]
+fn mixed_enabled_formats_joint_acceptance_lifecycle() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = json_fixture(r#"{"message":"Hello {{name}}"}"#);
+    let zero = "{\r\n\"empty\":\"\",\"data\":[1,true,null]}";
+    fs::write(fixture.repo.join("docs/zero.json"), zero).unwrap();
+    fs::write(fixture.repo.join("docs/readme.md"), "Hello Markdown.\n").unwrap();
+    fixture.commit();
+    let paths = [
+        "translations/zh-CN/guide.json",
+        "translations/zh-CN/docs/readme.md",
+        "translations/zh-CN/zero.json",
+    ];
+    let translated = [
+        r#"{"message":"Bonjour {{name}}"}"#,
+        "Bonjour Markdown.\n",
+        zero,
+    ];
+    let expected = fixture.temp.path().join("expected");
+    fs::create_dir(&expected).unwrap();
+    let set_expected = |contents: &[&str; 3]| {
+        for (index, content) in contents.iter().enumerate() {
+            fs::write(expected.join(index.to_string()), content).unwrap();
+        }
+    };
+    set_expected(&translated);
+    let allow = fixture.temp.path().join("allow");
+    let checks = fixture.temp.path().join("checks");
+    let checker = fixture.temp.path().join("check.sh");
+    let mut script = String::from("#!/bin/sh\nset -eu\n");
+    for (index, path) in paths.iter().enumerate() {
+        script.push_str(&format!(
+            "cmp '{}' '{path}'\n",
+            expected.join(index.to_string()).display()
+        ));
+    }
+    script.push_str(&format!(
+        "sha256sum {} >> '{}'\ntest -f '{}'\n",
+        paths.join(" "),
+        checks.display(),
+        allow.display()
+    ));
+    fs::write(&checker, script).unwrap();
+    let config = fs::read_to_string(&fixture.config).unwrap()
+        .replace("sources = [{", "sources = [{ format = 'markdown', include = ['docs/*.md'], target_pattern = 'translations/{lang}/{relpath}' }, {")
+        .replace("enabled = false", "enabled = true\npush = true")
+        .replace("[agents.fixture]", "[repo.publish.github]\nenabled = true\nrepository = \"fixture/project\"\nbase = \"main\"\n[agents.fixture]")
+        .replace("[repo.quality]", &format!("[repo.documentation]\ncommands = [[\"sh\", \"{}\"]]\n[repo.quality]", checker.display()));
+    fs::write(&fixture.config, &config).unwrap();
+    let check_count = || {
+        fs::read_to_string(&checks)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            / 3
+    };
+    let manifest_for = |contents: &[&str; 3]| -> Value {
+        paths.iter().zip(contents).map(|(path, content)| {
+            serde_json::json!({"path": path, "content_hash": format!("{:x}", Sha256::digest(content.as_bytes()))})
+        }).collect()
+    };
+    fixture.status(2, 0);
+    fixture.sync(1);
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(check_count(), 1);
+    let db = fixture.db();
+    let conn = db.connect().unwrap();
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    for table in [
+        "canonical_content_versions",
+        "canonical_files",
+        "materialization_outbox",
+        "publication_outbox",
+        "publication_manifests",
+    ] {
+        assert_eq!(count(table), 0, "{table}");
+    }
+    for path in paths {
+        assert!(!fixture.repo.join(path).exists());
+    }
+    let (anchor, raw, result, state): (String, String, String, String) = conn.query_row("SELECT d.path,w.input_json,w.result_json,w.status FROM work_items w JOIN documents d ON d.id=w.document_id WHERE w.kind='project_check'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+    assert_eq!(anchor, "docs/guide.json");
+    assert_eq!(state, "failed");
+    let input: Value = serde_json::from_str(&raw).unwrap();
+    let manifest = manifest_for(&translated);
+    assert_eq!(input["manifest"], manifest);
+    assert_eq!(
+        input["manifest_hash"],
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&manifest).unwrap())
+        )
+    );
+    assert_eq!(
+        input["manifest_hash"],
+        serde_json::from_str::<Value>(&result).unwrap()["manifest_hash"]
+    );
+    assert_eq!(count("work_items WHERE kind='project_check'"), 1);
+
+    let remote = fixture.temp.path().join("remote.git");
+    fixture.git(&["init", "--bare", "-q", remote.to_str().unwrap()]);
+    fixture.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    fs::write(&allow, "allowed").unwrap();
+    fixture.kill_at("publication_candidate_persisted");
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(check_count(), 2);
+    let (manifest_id, repository, commit, source): (i64, i64, String, String) = conn
+        .query_row(
+            "SELECT id,repository_id,candidate_commit,source_revision FROM publication_manifests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), source);
+    let immutable = || -> String {
+        conn.query_row("SELECT json_group_array(json_array(p.manifest_id,p.canonical_content_version_id,p.canonical_file_id,p.content_hash,v.source_revision,hex(v.content),l.translation_version_id,t.unit_version_id,t.source_attempt_id,t.target_text,u.source_hash,u.source_revision,u.context_json,a.response_json)) FROM publication_manifest_files p JOIN canonical_content_versions v ON v.id=p.canonical_content_version_id LEFT JOIN canonical_file_translations l ON l.canonical_content_version_id=v.id LEFT JOIN translation_versions t ON t.id=l.translation_version_id LEFT JOIN unit_versions u ON u.id=t.unit_version_id LEFT JOIN attempts a ON a.id=t.source_attempt_id WHERE p.manifest_id=?1", [manifest_id], |row| row.get(0)).unwrap()
+    };
+    let original = immutable();
+    let outbox: (i64, String) = conn
+        .query_row(
+            "SELECT id,payload_json FROM publication_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let bin = fixture.temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let response = fixture.temp.path().join("pull.json");
+    fs::write(&response, serde_json::json!({"number":1,"url":"https://example.invalid/pull/1","state":"OPEN","headRefName":"i18n/zh-CN","baseRefName":"main","isDraft":false,"title":"fixture","body":"fixture","headRefOid":commit}).to_string()).unwrap();
+    let gh = bin.join("gh");
+    fs::write(&gh, format!("#!/bin/sh\nset -eu\ncase \"$1 $2\" in\n'pr list') printf '[]\\n';;\n'pr create') printf 'https://example.invalid/pull/1\\n';;\n'pr view') cat '{}';;\n'pr edit') :;;\n*) exit 1;;\nesac\n", response.display())).unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(
+        check_count(),
+        3,
+        "recovery checks the complete snapshot once"
+    );
+    let pushed = Command::new("git")
+        .args([
+            "--git-dir",
+            remote.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/i18n/zh-CN",
+        ])
+        .output()
+        .unwrap();
+    assert!(pushed.status.success());
+    assert_eq!(String::from_utf8(pushed.stdout).unwrap().trim(), commit);
+    assert_eq!(immutable(), original);
+    assert_eq!(count("publication_manifests"), 1);
+    assert_eq!(count("publication_outbox"), 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM publication_outbox WHERE id=?1 AND payload_json=?2",
+            params![outbox.0, outbox.1],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "done"
+    );
+    let snapshot = db
+        .publication_snapshot(repository, "zh-CN", &commit)
+        .unwrap();
+    assert_eq!(snapshot.len(), 3);
+    for (path, content) in paths.iter().zip(translated) {
+        assert_eq!(
+            fs::read(fixture.repo.join(path)).unwrap(),
+            content.as_bytes()
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|file| file.path == *path && file.content == content.as_bytes())
+        );
+        let blob = Command::new("git")
+            .args(["show", &format!("{commit}:{path}")])
+            .current_dir(&fixture.repo)
+            .output()
+            .unwrap();
+        assert!(blob.status.success());
+        assert_eq!(blob.stdout, content.as_bytes());
+    }
+    assert_eq!(count("units"), 2);
+    assert_eq!(count("attempts"), 2);
+    assert_eq!(count("canonical_file_translations"), 2);
+    assert_eq!(count("translation_memory_entries WHERE tier='trusted'"), 0);
+
+    fs::write(&response, serde_json::json!({"number":1,"url":"https://example.invalid/pull/1","state":"MERGED","headRefName":"i18n/zh-CN","baseRefName":"main","isDraft":false,"title":"fixture","body":"fixture","headRefOid":commit}).to_string()).unwrap();
+    fs::remove_file(&allow).unwrap();
+    let before_merge = check_count();
+    fixture.sync(1);
+    assert!(check_count() > before_merge);
+    assert_eq!(count("translation_memory_entries WHERE tier='trusted'"), 0);
+    assert_eq!(count("publication_manifests WHERE state='merged'"), 0);
+    fs::write(&allow, "allowed").unwrap();
+    fixture.sync(0);
+    assert_eq!(count("publication_manifests WHERE state='merged'"), 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(DISTINCT candidate_commit) FROM publication_manifests",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(DISTINCT canonical_content_version_id) FROM publication_manifest_files",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        3
+    );
+    assert_eq!(count("translation_memory_entries WHERE tier='trusted'"), 2);
+    let trust: String = conn.query_row("SELECT json_group_array(json_array(translation_version_id,source_hash,source_revision,context_key,target_text,provenance)) FROM translation_memory_entries WHERE tier='trusted'", [], |row| row.get(0)).unwrap();
+    println!(
+        "mixed merge checks_before={before_merge} checks_after={} trust={trust} immutable={original}",
+        check_count()
+    );
+    assert_eq!(
+        count(
+            "translation_memory_entries m JOIN translation_versions t ON t.id=m.translation_version_id JOIN unit_versions u ON u.id=t.unit_version_id JOIN units unit ON unit.id=u.unit_id JOIN documents d ON d.id=unit.document_id JOIN attempts a ON a.id=t.source_attempt_id JOIN canonical_file_translations l ON l.translation_version_id=t.id JOIN publication_manifest_files p ON p.canonical_content_version_id=l.canonical_content_version_id JOIN publication_manifests manifest ON manifest.id=p.manifest_id WHERE manifest.state='merged' AND m.tier='trusted' AND m.source_hash=u.source_hash AND m.source_revision=u.source_revision AND m.source_revision=manifest.source_revision AND m.target_text=t.target_text AND t.target_text=json_extract(a.response_json,'$.output') AND m.policy_fingerprint=t.policy_fingerprint AND m.context_key=json_extract(u.context_json,'$.memory_key') AND json_extract(m.provenance,'$._fani_unit.document_path')=d.path AND json_extract(m.provenance,'$._fani_unit.source')=u.source_text AND json_extract(m.provenance,'$._fani_unit.source_revision')=u.source_revision AND json_extract(m.provenance,'$._fani_unit.policy_fingerprint')=t.policy_fingerprint"
+        ),
+        2
+    );
+
+    let mut contexts = conn.prepare("SELECT json_extract(m.provenance,'$._fani_unit.context_json'),u.context_json FROM translation_memory_entries m JOIN translation_versions t ON t.id=m.translation_version_id JOIN unit_versions u ON u.id=t.unit_version_id WHERE m.tier='trusted'").unwrap();
+    for pair in contexts
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+    {
+        let (trusted, immutable) = pair.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&trusted).unwrap(),
+            serde_json::from_str::<Value>(&immutable).unwrap()
+        );
+    }
+    assert_eq!(immutable(), original);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(count("translation_memory_entries WHERE tier='trusted'"), 2);
+
+    fs::write(
+        &fixture.config,
+        config.replace("enabled = true", "enabled = false"),
+    )
+    .unwrap();
+    let proposed = [r#"{"message":"Salut {{name}}"}"#, "Salut Markdown.\n", zero];
+    set_expected(&proposed);
+    for (path, content) in paths.iter().zip(proposed) {
+        fs::write(fixture.repo.join(path), content).unwrap();
+    }
+    let canonical_before = count("canonical_content_versions");
+    let trust_before: String = conn.query_row("SELECT json_group_array(json_array(id,translation_version_id,target_text,tier,provenance)) FROM translation_memory_entries", [], |row| row.get(0)).unwrap();
+    fs::remove_file(&allow).unwrap();
+    let before_adopt = check_count();
+    let rejected = fixture.run("adopt");
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(check_count(), before_adopt + 1);
+    assert_eq!(count("canonical_content_versions"), canonical_before);
+    assert_eq!(conn.query_row("SELECT json_group_array(json_array(id,translation_version_id,target_text,tier,provenance)) FROM translation_memory_entries", [], |row| row.get::<_, String>(0)).unwrap(), trust_before);
+    let adoption_input: String = conn
+        .query_row(
+            "SELECT input_json FROM work_items WHERE kind='project_check' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&adoption_input).unwrap()["manifest"],
+        manifest_for(&proposed)
+    );
+    fs::write(&allow, "allowed").unwrap();
+    fixture.adopt();
+    assert_eq!(check_count(), before_adopt + 2);
+    assert_eq!(
+        count("translation_memory_entries WHERE tier='trusted' AND target_text LIKE 'Salut%'"),
+        2
+    );
+    assert_eq!(
+        count("units u JOIN documents d ON d.id=u.document_id WHERE d.path='docs/zero.json'"),
+        0
+    );
+    for (path, content) in paths.iter().zip(proposed) {
+        let canonical: Vec<u8> = conn
+            .query_row(
+                "SELECT content FROM canonical_files WHERE path=?1",
+                [path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical, content.as_bytes());
+        fs::write(fixture.repo.join(path), "unwanted human edit").unwrap();
+    }
+    let discarded = fixture.run("discard");
+    assert!(
+        discarded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&discarded.stderr)
+    );
+    for (path, content) in paths.iter().zip(proposed) {
+        assert_eq!(
+            fs::read(fixture.repo.join(path)).unwrap(),
+            content.as_bytes()
+        );
+    }
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(count("units"), 2);
+    assert_eq!(immutable(), original);
+    println!(
+        "mixed acceptance source={source} candidate={commit} manifest={manifest} immutable={original} checks={} provider_calls={}",
+        check_count(),
+        fixture.calls()
+    );
+}
+
+#[test]
 fn json_dialect_change_invalidates_memory_without_invalidating_markdown() {
     let fixture = json_fixture(r#"{"title":"Hello"}"#);
     fs::write(fixture.repo.join("docs/readme.md"), "Hello Markdown.\n").unwrap();
