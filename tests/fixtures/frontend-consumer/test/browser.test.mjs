@@ -4,6 +4,44 @@ import { chromium } from 'playwright';
 import { startServer } from '../server.mjs';
 import { routes, defaults } from '../src/app.mjs';
 
+test('initial HTTP documents with JavaScript disabled', { timeout: 30000 }, async () => {
+  const server = await startServer();
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    console.log(JSON.stringify({ browser: browser.version(), javaScriptEnabled: false, hashes: server.hashes }));
+    const context = await browser.newContext({ javaScriptEnabled: false });
+    const page = await context.newPage();
+    page.setDefaultTimeout(5000);
+    for (const path of routes) {
+      const response = await page.goto(server.url + path);
+      assert.equal(response.status(), 200, path);
+      assert.match(response.headers()['content-type'], /text\/html/);
+      assert.equal(new URL(page.url()).pathname, path);
+      const [, locale, section] = path.split('/');
+      const prefix = locale === 'fr' ? 'FR: ' : '';
+      assert.equal(await page.locator('html').getAttribute('lang'), locale, path);
+      assert.equal(await page.locator('html').getAttribute('data-ready'), null, path);
+      assert.equal(await page.locator('h1').textContent(), `${prefix}${section === 'checkout' ? 'Checkout' : 'Account'}`, path);
+      assert.equal(await page.locator('#message').textContent(), section === 'checkout'
+        ? `${prefix}Hello Alice; again Alice; account Élodie.`
+        : `${prefix}Account Élodie belongs to Alice and Alice.`, path);
+      assert.equal(await page.locator('#shared-message').textContent(), `${prefix}Hello Alice; again Alice; account Élodie.`, path);
+      assert.deepEqual(await page.locator('li').allTextContents(), [`${prefix}First item`, `${prefix}Nested item`, '', '  '], path);
+      assert.equal(await page.locator('#empty').textContent(), '', path);
+      assert.equal(await page.locator('#whitespace').textContent(), ' \t\n ', path);
+      assert.equal(await page.locator('#detail').textContent(), `${prefix}Café says "welcome".\nNext line.`, path);
+      assert.equal(await page.locator('[name=name]').inputValue(), defaults.name, path);
+      assert.equal(await page.locator('[name=user]').inputValue(), defaults.user.name, path);
+      assert.doesNotMatch(await page.locator('main').textContent(), /\{\{|\}\}/, path);
+    }
+    await context.close();
+  } finally {
+    if (browser) await browser.close();
+    await server.close();
+  }
+});
+
 for (const mobile of [false, true]) test(`browser ${mobile ? 'mobile' : 'desktop'}`, { timeout: 90000 }, async () => {
   const server = await startServer();
   let browser;
