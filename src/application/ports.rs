@@ -631,6 +631,23 @@ pub trait StateStore {
     ) -> Result<Option<StoredPullRequest>>;
     fn record_pr_state(&self, input: PullRequestStateInput<'_>) -> Result<i64>;
     fn record_publication_manifest(&self, input: PublicationManifestInput<'_>) -> Result<i64>;
+    fn record_publication_authorization(
+        &self,
+        _input: PublicationManifestInput<'_>,
+        _authorization_key: &str,
+    ) -> Result<i64> {
+        anyhow::bail!("publication authorizations are not supported by this state store")
+    }
+    fn transition_publication_authorization(
+        &self,
+        _repository_id: i64,
+        _locale: &str,
+        _candidate_commit: &str,
+        _authorization_key: &str,
+        _state: PublicationState,
+    ) -> Result<()> {
+        anyhow::bail!("publication authorizations are not supported by this state store")
+    }
     fn transition_publication_manifest(
         &self,
         repository_id: i64,

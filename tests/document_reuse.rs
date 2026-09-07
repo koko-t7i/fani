@@ -755,6 +755,162 @@ fn intent_binding_roundtrip_selects_current_identity_without_mutating_history() 
 }
 
 #[test]
+fn renewed_publication_retains_rejection_and_exposes_promotable_snapshot() {
+    let fixture = Fixture::new("Hello world.\n");
+    let allow = fixture.temp.path().join("allow");
+    fs::write(&allow, "allowed").unwrap();
+    let config = fs::read_to_string(&fixture.config).unwrap()
+        .replace("enabled = false", "enabled = true\npush = false")
+        .replace("[repo.quality]", &format!("[repo.documentation]\ncommands = [[\"sh\", \"-c\", \"test -f '{}'\"]]\n[repo.quality]", allow.display()));
+    fs::write(&fixture.config, config).unwrap();
+    fixture.kill_at("publication_candidate_persisted");
+    let db = fixture.db();
+    let conn = db.connect().unwrap();
+    let (repo_id, commit): (i64, String) = conn
+        .query_row(
+            "SELECT repository_id,candidate_commit FROM publication_manifests",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    fs::remove_file(&allow).unwrap();
+    fixture.sync(1);
+    assert!(
+        db.publication_snapshot(repo_id, "zh-CN", &commit)
+            .unwrap()
+            .is_empty()
+    );
+    let old_manifest: String = conn.query_row("SELECT json_array(id,run_id,source_revision,candidate_commit,policy_fingerprint,state,created_at,merged_at,authorization_key) FROM publication_manifests", [], |r| r.get(0)).unwrap();
+    let old_outbox: String = conn.query_row("SELECT json_array(id,dedupe_key,payload_json,state,completed_at) FROM publication_outbox", [], |r| r.get(0)).unwrap();
+    fs::write(&allow, "allowed").unwrap();
+    fixture.sync(0);
+    fixture.sync(0);
+    let snapshot = db.publication_snapshot(repo_id, "zh-CN", &commit).unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].content, fs::read(&fixture.target).unwrap());
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM publication_manifests WHERE state='commit_created' AND candidate_commit=?1", [&commit], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(
+        db.promote_merged_publication(repo_id, "zh-CN", &commit, "test_verified_merge")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM publication_manifests WHERE state='merged'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(conn.query_row("SELECT json_array(id,run_id,source_revision,candidate_commit,policy_fingerprint,state,created_at,merged_at,authorization_key) FROM publication_manifests WHERE id=1", [], |r| r.get::<_, String>(0)).unwrap(), old_manifest);
+    assert_eq!(conn.query_row("SELECT json_array(id,dedupe_key,payload_json,state,completed_at) FROM publication_outbox WHERE id=1", [], |r| r.get::<_, String>(0)).unwrap(), old_outbox);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM publication_outbox", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(fixture.calls(), 1);
+}
+
+#[test]
+fn published_configuration_roundtrip_keeps_independent_commit_authorizations() {
+    for cancel_b in [false, true] {
+        let fixture = Fixture::new("Hello world.\n");
+        let config_a = fs::read_to_string(&fixture.config)
+            .unwrap()
+            .replace("enabled = false", "enabled = true\npush = false");
+        fs::write(&fixture.config, &config_a).unwrap();
+        fixture.sync(0);
+        let db = fixture.db();
+        let conn = db.connect().unwrap();
+        let (repo_id, commit): (i64, String) = conn
+            .query_row(
+                "SELECT repository_id,candidate_commit FROM publication_manifests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let original: String = conn.query_row("SELECT json_array(id,run_id,source_revision,candidate_commit,policy_fingerprint,state,created_at,merged_at,authorization_key) FROM publication_manifests", [], |r| r.get(0)).unwrap();
+        let links: String = conn.query_row("SELECT json_group_array(json_array(canonical_content_version_id,translation_version_id)) FROM canonical_file_translations", [], |r| r.get(0)).unwrap();
+        fs::write(
+            &fixture.config,
+            config_a.replace("docs/**/*.md", "docs/guide.md"),
+        )
+        .unwrap();
+        if cancel_b {
+            fixture.kill_at("publication_candidate_persisted");
+        } else {
+            fixture.sync(0);
+            fixture.sync(0);
+        }
+        fs::write(&fixture.config, config_a).unwrap();
+        fixture.sync(0);
+        fixture.sync(0);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(DISTINCT run_id) FROM publication_manifests",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(DISTINCT candidate_commit) FROM publication_manifests",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM publication_manifests WHERE id=2",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            if cancel_b {
+                "superseded"
+            } else {
+                "commit_created"
+            }
+        );
+        assert_eq!(conn.query_row("SELECT json_array(id,run_id,source_revision,candidate_commit,policy_fingerprint,state,created_at,merged_at,authorization_key) FROM publication_manifests WHERE id=1", [], |r| r.get::<_, String>(0)).unwrap(), original);
+        assert_eq!(conn.query_row("SELECT json_group_array(json_array(canonical_content_version_id,translation_version_id)) FROM canonical_file_translations", [], |r| r.get::<_, String>(0)).unwrap(), links);
+        assert_eq!(
+            conn.query_row("SELECT publication_state FROM canonical_files", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "commit_created"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT publication_state FROM translation_versions LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "commit_created"
+        );
+        let snapshot = db.publication_snapshot(repo_id, "zh-CN", &commit).unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].content, fs::read(&fixture.target).unwrap());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM publication_outbox", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(fixture.calls(), 1);
+    }
+}
+
+#[test]
 fn same_revision_configuration_roundtrip_publishes_current_intent_idempotently() {
     let fixture = Fixture::new("Hello world.\n");
     let config_a = fs::read_to_string(&fixture.config).unwrap();
@@ -1813,7 +1969,9 @@ fn compatible_adopted_publication_without_links_revalidates_reordered_code() {
     payload["files"][0]["canonical_content_version_id"] = version.into();
     payload["files"][0]["content"] = proposed.into();
     payload["files"][0]["content_hash"] = hash.into();
-    conn.execute("UPDATE publication_outbox SET state='pending',owner=NULL,lease_expires_at=NULL,completed_at=NULL,available_at=0,payload_json=?2 WHERE id=?1", params![id,payload.to_string()]).unwrap();
+    // Adopted bytes need a new authorization, not a rewritten completed effect.
+    conn.execute("INSERT INTO publication_outbox(repository_id,run_id,locale,dedupe_key,payload_json,available_at,created_at) SELECT repository_id,run_id,locale,dedupe_key||':adopted',?2,0,created_at FROM publication_outbox WHERE id=?1", params![id,payload.to_string()]).unwrap();
+    let id = conn.last_insert_rowid();
     fixture.sync(0);
     let (state, raw): (String, String) = conn
         .query_row(

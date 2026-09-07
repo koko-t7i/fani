@@ -2453,18 +2453,13 @@ impl<'a> Orchestrator<'a> {
         }
         if !compatible {
             if let Some(commit) = payload.commit.as_deref() {
-                if !self
-                    .database
-                    .publication_snapshot(repository_id, language, commit)?
-                    .is_empty()
-                {
-                    self.database.transition_publication_manifest(
-                        repository_id,
-                        language,
-                        commit,
-                        PublicationState::Superseded,
-                    )?;
-                }
+                self.database.transition_publication_authorization(
+                    repository_id,
+                    language,
+                    commit,
+                    &entry.dedupe_key,
+                    PublicationState::Superseded,
+                )?;
             }
             let mut rejected = serde_json::to_value(&payload)?;
             rejected["superseded_reason"] =
@@ -2503,8 +2498,8 @@ impl<'a> Orchestrator<'a> {
             }
         }
         outcome.published = if let Some(commit) = payload.commit.as_deref() {
-            self.database
-                .record_publication_manifest(PublicationManifestInput {
+            self.database.record_publication_authorization(
+                PublicationManifestInput {
                     repository_id,
                     run_id: &payload.run_id,
                     locale: language,
@@ -2512,12 +2507,15 @@ impl<'a> Orchestrator<'a> {
                     candidate_commit: commit,
                     policy_fingerprint: &payload.policy_fingerprint,
                     files: &manifest_files,
-                })?;
+                },
+                &entry.dedupe_key,
+            )?;
             if self.repo.publish.push {
-                self.database.transition_publication_manifest(
+                self.database.transition_publication_authorization(
                     repository_id,
                     language,
                     commit,
+                    &entry.dedupe_key,
                     PublicationState::PushPending,
                 )?;
                 let mut published = self.git.publish_pending(
@@ -2559,8 +2557,8 @@ impl<'a> Orchestrator<'a> {
             )? {
                 bail!("publication outbox ownership changed before commit persistence");
             }
-            self.database
-                .record_publication_manifest(PublicationManifestInput {
+            self.database.record_publication_authorization(
+                PublicationManifestInput {
                     repository_id,
                     run_id: &payload.run_id,
                     locale: language,
@@ -2568,13 +2566,16 @@ impl<'a> Orchestrator<'a> {
                     candidate_commit: &prepared.commit,
                     policy_fingerprint: &payload.policy_fingerprint,
                     files: &manifest_files,
-                })?;
+                },
+                &entry.dedupe_key,
+            )?;
             (self.failpoint)("publication_candidate_persisted");
             if self.repo.publish.push {
-                self.database.transition_publication_manifest(
+                self.database.transition_publication_authorization(
                     repository_id,
                     language,
                     &prepared.commit,
+                    &entry.dedupe_key,
                     PublicationState::PushPending,
                 )?;
                 let pushed = self.git.publish_pending(
@@ -2657,18 +2658,20 @@ impl<'a> Orchestrator<'a> {
                         )?;
                     }
                     "open" | "draft" => {
-                        self.database.transition_publication_manifest(
+                        self.database.transition_publication_authorization(
                             repository_id,
                             language,
                             &outcome.published.commit,
+                            &entry.dedupe_key,
                             PublicationState::PrOpen,
                         )?;
                     }
                     _ => {
-                        self.database.transition_publication_manifest(
+                        self.database.transition_publication_authorization(
                             repository_id,
                             language,
                             &outcome.published.commit,
+                            &entry.dedupe_key,
                             PublicationState::Superseded,
                         )?;
                     }

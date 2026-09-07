@@ -90,7 +90,7 @@ fani adopt --repo PATH_OR_BASENAME --lang zh-CN
 
 `fani sync` writes replaceable schema-4 `report.json` and `report.md` views to the selected report directory. Reports distinguish discovered files, parse failures, deterministically verified documents, byte-identical zero-unit pass-through, and actual writes. Project checks run over the complete candidate set before canonical persistence, file writes, or publication. Zero-unit Markdown needs no model calls or translation-memory records; JSON and MDX remain explicitly disabled.
 
-SQLite at `<repo>/<data_dir>/fani.db` remains the sole fani-owned state authority. Native databases upgrade to schema 5 with a no-clobber pre-upgrade backup; stop all old processes first and follow the [upgrade/restore procedure](docs/architecture/native-i18n.md#schema-5-upgrade-and-restore).
+SQLite at `<repo>/<data_dir>/fani.db` remains the sole fani-owned state authority. Native databases upgrade to schema 6 with a no-clobber pre-upgrade backup; stop all old processes first and follow the [upgrade/restore procedure](docs/architecture/native-i18n.md#schema-6-upgrade-and-restore).
 
 ### Exit codes
 

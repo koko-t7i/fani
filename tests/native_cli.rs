@@ -468,7 +468,7 @@ repair = "fixture"
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
-    assert!(String::from_utf8_lossy(&doctor.stdout).contains("native schema 5"));
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("native schema 6"));
 
     let status = fani(&["status", "--config", config.to_str().unwrap()]);
     assert_eq!(status.status.code(), Some(0));

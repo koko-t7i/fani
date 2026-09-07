@@ -190,7 +190,7 @@ fn bind_memory_metadata(provenance: &mut UnitProvenance, key: &str) -> Result<()
 }
 
 const APPLICATION_ID: i64 = 0x4641_4e49;
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -226,6 +226,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "0005_current_intent_effects",
         sql: include_str!("../../migrations/0005_current_intent_effects.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "0006_publication_authorizations",
+        sql: include_str!("../../migrations/0006_publication_authorizations.sql"),
     },
 ];
 
@@ -379,6 +384,9 @@ fn apply_migrations_exclusive(conn: &mut Connection, migrations: &[Migration]) -
         }
         if migration.version == 4 {
             validate_canonical_content_dependents(&tx)?;
+        }
+        if migration.version == 6 {
+            validate_publication_manifest_dependents(&tx)?;
         }
         let expected_version = applied.len() as i64 + offset as i64 + 1;
         if migration.version != expected_version {
@@ -541,6 +549,40 @@ fn validate_work_item_dependents(conn: &Connection) -> Result<()> {
         [], |row| row.get(0))?;
     if extensions != 0 {
         bail!("unexpected work_items indexes or triggers; refusing table rebuild");
+    }
+    Ok(())
+}
+
+fn validate_publication_manifest_dependents(conn: &Connection) -> Result<()> {
+    let mut statement = conn.prepare(
+        "SELECT m.name,f.\"from\",f.\"to\",f.on_delete FROM sqlite_schema m JOIN pragma_foreign_key_list(m.name) f WHERE m.type='table' AND f.\"table\"='publication_manifests' ORDER BY 1,2,3,4",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if actual
+        != [(
+            "publication_manifest_files".into(),
+            "manifest_id".into(),
+            "id".into(),
+            "CASCADE".into(),
+        )]
+    {
+        bail!("unexpected publication manifest foreign keys; refusing table rebuild");
+    }
+    let extensions: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE tbl_name='publication_manifests' AND (type='trigger' OR (type='index' AND sql IS NOT NULL))",
+        [], |row| row.get(0),
+    )?;
+    if extensions != 0 {
+        bail!("unexpected publication manifest indexes or triggers; refusing table rebuild");
     }
     Ok(())
 }
@@ -2184,6 +2226,13 @@ impl Database {
                 }
             }
         }
+        let manifest_id: Option<i64> = tx.query_row(
+            "SELECT manifest_id FROM publication_manifest_files WHERE canonical_content_version_id=?1 LIMIT 1",
+            [content_version_id], |row| row.get(0),
+        ).optional()?;
+        if let Some(manifest_id) = manifest_id {
+            refresh_publication_states(&tx, manifest_id, now)?;
+        }
         tx.commit()?;
         Ok(CanonicalFile {
             id: canonical_file_id,
@@ -2249,6 +2298,18 @@ impl Database {
     }
 
     pub fn record_publication_manifest(&self, input: PublicationManifestInput<'_>) -> Result<i64> {
+        let key = format!("run:{}:{}", input.run_id, input.candidate_commit);
+        self.record_publication_authorization(input, &key)
+    }
+
+    pub fn record_publication_authorization(
+        &self,
+        input: PublicationManifestInput<'_>,
+        authorization_key: &str,
+    ) -> Result<i64> {
+        if authorization_key.is_empty() {
+            bail!("publication authorization key cannot be empty");
+        }
         let PublicationManifestInput {
             repository_id,
             run_id,
@@ -2296,8 +2357,8 @@ impl Database {
         let inserted = tx.execute(
             r#"INSERT OR IGNORE INTO publication_manifests(
                    repository_id,run_id,locale,source_revision,candidate_commit,
-                   policy_fingerprint,state,created_at)
-               VALUES (?1,?2,?3,?4,?5,?6,'commit_created',?7)"#,
+                   policy_fingerprint,state,created_at,authorization_key)
+               VALUES (?1,?2,?3,?4,?5,?6,'commit_created',?7,?8)"#,
             params![
                 repository_id,
                 run_id,
@@ -2305,17 +2366,29 @@ impl Database {
                 source_revision,
                 candidate_commit,
                 policy_fingerprint,
-                now
+                now,
+                authorization_key
             ],
         )? == 1;
-        let manifest: (i64, String, String, String) = tx.query_row(
-            r#"SELECT id,run_id,source_revision,policy_fingerprint
+        let manifest: (i64, String, String, String, String) = tx.query_row(
+            r#"SELECT id,run_id,source_revision,policy_fingerprint,candidate_commit
                FROM publication_manifests
-               WHERE repository_id=?1 AND locale=?2 AND candidate_commit=?3"#,
-            params![repository_id, locale, candidate_commit],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+               WHERE repository_id=?1 AND locale=?2 AND authorization_key=?3"#,
+            params![repository_id, locale, authorization_key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
-        if manifest.1 != run_id || manifest.2 != source_revision || manifest.3 != policy_fingerprint
+        if manifest.1 != run_id
+            || manifest.2 != source_revision
+            || manifest.3 != policy_fingerprint
+            || manifest.4 != candidate_commit
         {
             bail!("publication candidate commit conflicts with its durable manifest");
         }
@@ -2368,31 +2441,20 @@ impl Database {
         } else if stored != requested {
             bail!("publication manifest file set conflicts with durable state");
         }
-        tx.execute(
-            r#"UPDATE canonical_content_versions SET publication_state=
-                   CASE WHEN publication_state='merged' THEN 'merged' ELSE 'commit_created' END
-               WHERE id IN (SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)"#,
-            [manifest.0],
+        let conflicting: bool = tx.query_row(
+            r#"SELECT EXISTS(SELECT 1 FROM publication_manifests other
+               WHERE other.repository_id=?1 AND other.locale=?2 AND other.candidate_commit=?3 AND other.id<>?4
+                 AND (other.source_revision<>?5
+                   OR EXISTS(SELECT canonical_content_version_id,canonical_file_id,content_hash FROM publication_manifest_files WHERE manifest_id=other.id
+                             EXCEPT SELECT canonical_content_version_id,canonical_file_id,content_hash FROM publication_manifest_files WHERE manifest_id=?4)
+                   OR EXISTS(SELECT canonical_content_version_id,canonical_file_id,content_hash FROM publication_manifest_files WHERE manifest_id=?4
+                             EXCEPT SELECT canonical_content_version_id,canonical_file_id,content_hash FROM publication_manifest_files WHERE manifest_id=other.id)))"#,
+            params![repository_id,locale,candidate_commit,manifest.0,source_revision], |row| row.get(0),
         )?;
-        tx.execute(
-            r#"UPDATE canonical_files SET publication_state=
-                   CASE WHEN publication_state='merged' THEN 'merged' ELSE 'commit_created' END,
-                   updated_at=?2
-               WHERE current_content_version_id IN (
-                   SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)"#,
-            params![manifest.0, now],
-        )?;
-        tx.execute(
-            r#"UPDATE translation_versions SET publication_state=
-                   CASE WHEN publication_state='merged' THEN 'merged' ELSE 'commit_created' END
-               WHERE id IN (
-                   SELECT cft.translation_version_id
-                   FROM publication_manifest_files pmf
-                   JOIN canonical_file_translations cft
-                     ON cft.canonical_content_version_id=pmf.canonical_content_version_id
-                   WHERE pmf.manifest_id=?1)"#,
-            [manifest.0],
-        )?;
+        if conflicting {
+            bail!("publication commit snapshot conflicts with another authorization");
+        }
+        refresh_publication_states(&tx, manifest.0, now)?;
         tx.commit()?;
         Ok(manifest.0)
     }
@@ -2404,6 +2466,23 @@ impl Database {
         candidate_commit: &str,
         state: PublicationState,
     ) -> Result<()> {
+        self.transition_publication_authorization(
+            repository_id,
+            locale,
+            candidate_commit,
+            None,
+            state,
+        )
+    }
+
+    pub fn transition_publication_authorization(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        candidate_commit: &str,
+        authorization_key: Option<&str>,
+        state: PublicationState,
+    ) -> Result<()> {
         let state = state.as_str();
         if !matches!(
             state,
@@ -2413,14 +2492,19 @@ impl Database {
         }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let manifest: (i64, String) = tx
+        let manifest: Option<(i64, String)> = tx
             .query_row(
-                "SELECT id,state FROM publication_manifests WHERE repository_id=?1 AND locale=?2 AND candidate_commit=?3",
-                params![repository_id, locale, candidate_commit],
+                "SELECT id,state FROM publication_manifests WHERE repository_id=?1 AND locale=?2 AND candidate_commit=?3 AND (?4 IS NULL OR authorization_key=?4) ORDER BY state='superseded',state='merged' DESC,id DESC LIMIT 1",
+                params![repository_id, locale, candidate_commit, authorization_key],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?
-            .ok_or_else(|| anyhow!("publication manifest for commit {candidate_commit} does not exist"))?;
+            .optional()?;
+        let Some(manifest) = manifest else {
+            if authorization_key.is_some() && state == "superseded" {
+                return Ok(());
+            }
+            bail!("publication manifest for commit {candidate_commit} does not exist");
+        };
         let effective = if manifest.1 == "merged"
             || manifest.1 == "superseded"
             || publication_rank(&manifest.1) >= publication_rank(state)
@@ -2434,32 +2518,7 @@ impl Database {
             "UPDATE publication_manifests SET state=?2 WHERE id=?1",
             params![manifest.0, effective],
         )?;
-        tx.execute(
-            r#"UPDATE canonical_content_versions SET publication_state=?2
-               WHERE id IN (SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)
-                 AND publication_state<>'merged'"#,
-            params![manifest.0, effective],
-        )?;
-        tx.execute(
-            r#"UPDATE canonical_files SET
-                   state=CASE WHEN ?2='pr_open' THEN 'published' ELSE state END,
-                   publication_state=?2,updated_at=?3
-               WHERE current_content_version_id IN (
-                   SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)
-                 AND publication_state<>'merged'"#,
-            params![manifest.0, effective, now],
-        )?;
-        tx.execute(
-            r#"UPDATE translation_versions SET publication_state=?2
-               WHERE id IN (
-                   SELECT cft.translation_version_id
-                   FROM publication_manifest_files pmf
-                   JOIN canonical_file_translations cft
-                     ON cft.canonical_content_version_id=pmf.canonical_content_version_id
-                   WHERE pmf.manifest_id=?1)
-                 AND publication_state<>'merged'"#,
-            params![manifest.0, effective],
-        )?;
+        refresh_publication_states(&tx, manifest.0, now)?;
         tx.commit()?;
         Ok(())
     }
@@ -2491,7 +2550,7 @@ impl Database {
         commit: &str,
     ) -> Result<Vec<crate::application::ports::CanonicalSnapshot>> {
         let conn = self.connect()?;
-        let mut statement = conn.prepare("SELECT cv.id,cv.source_revision,cf.path,cv.content FROM publication_manifests pm JOIN publication_manifest_files pmf ON pmf.manifest_id=pm.id JOIN canonical_content_versions cv ON cv.id=pmf.canonical_content_version_id JOIN canonical_files cf ON cf.id=cv.canonical_file_id WHERE pm.repository_id=?1 AND pm.locale=?2 AND pm.candidate_commit=?3 AND pm.state<>'superseded' ORDER BY cf.path")?;
+        let mut statement = conn.prepare("SELECT cv.id,cv.source_revision,cf.path,cv.content FROM publication_manifests pm JOIN publication_manifest_files pmf ON pmf.manifest_id=pm.id JOIN canonical_content_versions cv ON cv.id=pmf.canonical_content_version_id JOIN canonical_files cf ON cf.id=cv.canonical_file_id WHERE pm.id=(SELECT id FROM publication_manifests WHERE repository_id=?1 AND locale=?2 AND candidate_commit=?3 AND state<>'superseded' ORDER BY state='merged' DESC,id DESC LIMIT 1) ORDER BY cf.path")?;
         Ok(statement
             .query_map(params![repository_id, locale, commit], |row| {
                 Ok(crate::application::ports::CanonicalSnapshot {
@@ -2515,7 +2574,7 @@ impl Database {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let manifest_id: i64 = tx
             .query_row(
-                "SELECT id FROM publication_manifests WHERE repository_id=?1 AND locale=?2 AND candidate_commit=?3 AND state<>'superseded'",
+                "SELECT id FROM publication_manifests WHERE repository_id=?1 AND locale=?2 AND candidate_commit=?3 AND state<>'superseded' ORDER BY state='merged' DESC,id DESC LIMIT 1",
                 params![repository_id, locale, candidate_commit],
                 |row| row.get(0),
             )
@@ -2562,6 +2621,7 @@ impl Database {
                     "UPDATE publication_manifests SET state='superseded' WHERE id=?1",
                     [manifest_id],
                 )?;
+                refresh_publication_states(&tx, manifest_id, now_ms())?;
                 tx.commit()?;
                 return Ok(0);
             }
@@ -3132,6 +3192,39 @@ fn dead_process_owner(owner: &str) -> bool {
     process_owner_is_dead(parts.next(), parts.next())
 }
 
+fn refresh_publication_states(conn: &Connection, manifest_id: i64, now: i64) -> Result<()> {
+    // Shared content keeps the strongest remaining authorization, not the last cancelled effect.
+    conn.execute(
+        r#"UPDATE canonical_content_versions AS cv SET publication_state=(
+             SELECT pm.state FROM publication_manifests pm JOIN publication_manifest_files f ON f.manifest_id=pm.id
+             WHERE f.canonical_content_version_id=cv.id
+             ORDER BY CASE pm.state WHEN 'merged' THEN 5 WHEN 'pr_open' THEN 4 WHEN 'push_pending' THEN 3 WHEN 'commit_created' THEN 2 ELSE 1 END DESC,pm.id DESC LIMIT 1)
+           WHERE cv.id IN (SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)
+             AND cv.publication_state<>'merged'"#,
+        [manifest_id],
+    )?;
+    conn.execute(
+        r#"UPDATE canonical_files AS cf SET
+             publication_state=(SELECT publication_state FROM canonical_content_versions WHERE id=cf.current_content_version_id),
+             state=CASE WHEN (SELECT publication_state FROM canonical_content_versions WHERE id=cf.current_content_version_id)='pr_open' THEN 'published' ELSE state END,
+             updated_at=?2
+           WHERE current_content_version_id IN (SELECT canonical_content_version_id FROM publication_manifest_files WHERE manifest_id=?1)
+             AND publication_state<>'merged'"#,
+        params![manifest_id,now],
+    )?;
+    conn.execute(
+        r#"UPDATE translation_versions AS tv SET publication_state=(
+             SELECT pm.state FROM publication_manifests pm JOIN publication_manifest_files f ON f.manifest_id=pm.id
+             JOIN canonical_file_translations cft ON cft.canonical_content_version_id=f.canonical_content_version_id
+             WHERE cft.translation_version_id=tv.id
+             ORDER BY CASE pm.state WHEN 'merged' THEN 5 WHEN 'pr_open' THEN 4 WHEN 'push_pending' THEN 3 WHEN 'commit_created' THEN 2 ELSE 1 END DESC,pm.id DESC LIMIT 1)
+           WHERE tv.id IN (SELECT cft.translation_version_id FROM publication_manifest_files f JOIN canonical_file_translations cft ON cft.canonical_content_version_id=f.canonical_content_version_id WHERE f.manifest_id=?1)
+             AND tv.publication_state<>'merged'"#,
+        [manifest_id],
+    )?;
+    Ok(())
+}
+
 fn outbox_table(kind: OutboxKind) -> &'static str {
     match kind {
         OutboxKind::Materialization => "materialization_outbox",
@@ -3641,11 +3734,21 @@ impl StateStore for Database {
             let Some((id, state, payload)) = row else {
                 return Ok(key);
             };
-            let superseded = serde_json::from_str::<serde_json::Value>(&payload)?
-                .get("superseded_reason")
-                .is_some();
-            if state != "done" || (matches!(kind, OutboxKind::Publication) && !superseded) {
+            if state != "done" {
                 return Ok(key);
+            }
+            if matches!(kind, OutboxKind::Publication) {
+                let payload: serde_json::Value = serde_json::from_str(&payload)?;
+                let mut authorized = payload.get("superseded_reason").is_none();
+                if let Some(commit) = payload.get("commit").and_then(|value| value.as_str()) {
+                    authorized &= conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM publication_manifests m JOIN publication_outbox o ON o.repository_id=m.repository_id AND o.locale=m.locale AND o.dedupe_key=m.authorization_key WHERE o.id=?1 AND m.candidate_commit=?2 AND m.state<>'superseded')",
+                        params![id,commit], |row| row.get::<_, bool>(0),
+                    )?;
+                }
+                if authorized {
+                    return Ok(key);
+                }
             }
             key = format!("{base}:after:{id}");
         }
@@ -3779,6 +3882,32 @@ impl StateStore for Database {
 
     fn record_publication_manifest(&self, input: PublicationManifestInput<'_>) -> Result<i64> {
         Database::record_publication_manifest(self, input)
+    }
+
+    fn record_publication_authorization(
+        &self,
+        input: PublicationManifestInput<'_>,
+        authorization_key: &str,
+    ) -> Result<i64> {
+        Database::record_publication_authorization(self, input, authorization_key)
+    }
+
+    fn transition_publication_authorization(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        candidate_commit: &str,
+        authorization_key: &str,
+        state: PublicationState,
+    ) -> Result<()> {
+        Database::transition_publication_authorization(
+            self,
+            repository_id,
+            locale,
+            candidate_commit,
+            Some(authorization_key),
+            state,
+        )
     }
 
     fn transition_publication_manifest(
@@ -3996,7 +4125,106 @@ mod tests {
                 .contains("unknown migration 3")
         );
         apply_migrations(&mut conn, MIGRATIONS).unwrap();
-        assert_eq!(rows(&conn, "schema_migrations").len(), 5);
+        assert_eq!(rows(&conn, "schema_migrations").len(), 6);
+    }
+
+    #[test]
+    fn publication_authorization_upgrade_preserves_snapshots_and_rolls_back_faults() {
+        for old_version in 2..=5 {
+            for fault in [
+                None,
+                Some(
+                    "CREATE TRIGGER reject_authorization_upgrade BEFORE UPDATE ON state_schema WHEN NEW.version=6 BEGIN SELECT RAISE(ABORT,'injected authorization failure'); END;",
+                ),
+                Some(
+                    "CREATE TRIGGER corrupt_authorization_marker AFTER UPDATE ON state_schema WHEN NEW.version=6 BEGIN UPDATE state_schema SET version=5 WHERE singleton=1; END;",
+                ),
+                Some(
+                    "CREATE TRIGGER corrupt_authorization_ledger AFTER INSERT ON schema_migrations WHEN NEW.version=6 BEGIN UPDATE schema_migrations SET checksum=lower(hex(zeroblob(32))) WHERE version=1; END;",
+                ),
+                Some(
+                    "CREATE TRIGGER corrupt_authorization_fk AFTER UPDATE ON state_schema WHEN NEW.version=6 BEGIN UPDATE publication_manifest_files SET canonical_content_version_id=9999; END;",
+                ),
+                Some(
+                    "CREATE TABLE custom_manifest_child(id INTEGER REFERENCES publication_manifests(id));",
+                ),
+                Some("CREATE INDEX custom_manifest_index ON publication_manifests(state);"),
+                Some(
+                    "CREATE TRIGGER custom_manifest_trigger AFTER UPDATE ON publication_manifests BEGIN SELECT 1; END;",
+                ),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("old.db");
+                let mut conn = schema_two_fixture(&path);
+                apply_migrations(&mut conn, &MIGRATIONS[..old_version]).unwrap();
+                conn.execute_batch("INSERT INTO publication_manifests VALUES (151,11,'old-run','fr','rev','commit',lower(hex(zeroblob(32))),'commit_created',1,NULL); INSERT INTO publication_manifest_files VALUES (151,141,131,'hash'); UPDATE publication_outbox SET payload_json='{\"commit\":\"commit\",\"run_id\":\"old-run\"}' WHERE id=91;").unwrap();
+                if let Some(sql) = fault {
+                    conn.execute_batch(sql).unwrap();
+                }
+                let schema = rows(&conn, "sqlite_schema");
+                let tables = conn
+                    .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let before = tables
+                    .iter()
+                    .map(|table| rows(&conn, table))
+                    .collect::<Vec<_>>();
+                let result = apply_migrations(&mut conn, MIGRATIONS);
+                if fault.is_some() {
+                    assert!(result.is_err(), "schema {old_version}: {fault:?}");
+                    validate_connection_version(&conn, &MIGRATIONS[..old_version]).unwrap();
+                    assert_eq!(rows(&conn, "sqlite_schema"), schema);
+                } else {
+                    result.unwrap();
+                    validate_existing_connection(&conn).unwrap();
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT authorization_key FROM publication_manifests WHERE id=151",
+                            [],
+                            |r| r.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                        "publish"
+                    );
+                    let error = conn.execute("UPDATE publication_manifest_files SET content_hash='wrong-hash' WHERE manifest_id=151", []).unwrap_err();
+                    assert!(error.to_string().contains("FOREIGN KEY"), "{error}");
+                }
+                let backup = Connection::open(
+                    temp.path()
+                        .join(format!("old.db.pre-schema-{old_version}.bak")),
+                )
+                .unwrap();
+                validate_connection_version(&backup, &MIGRATIONS[..old_version]).unwrap();
+                for (table, expected) in tables.iter().zip(before) {
+                    assert_eq!(rows(&backup, table), expected, "backup {table}");
+                    if fault.is_some()
+                        || !matches!(table.as_str(), "schema_migrations" | "state_schema")
+                    {
+                        let mut actual = rows(&conn, table);
+                        if fault.is_none() && table == "publication_manifests" {
+                            for row in &mut actual {
+                                row.pop();
+                            }
+                        }
+                        if fault.is_none() && old_version == 2 && table == "work_items" {
+                            for row in &mut actual {
+                                row.remove(3);
+                            }
+                        }
+                        assert_eq!(actual, expected, "schema {old_version}: {table}");
+                    }
+                }
+                assert_eq!(
+                    conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+            }
+        }
     }
 
     #[test]

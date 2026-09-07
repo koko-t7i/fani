@@ -312,15 +312,25 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
                 )
             ),
         ),
+        (
+            6,
+            "0006_publication_authorizations".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    include_str!("../migrations/0006_publication_authorizations.sql").as_bytes()
+                )
+            ),
+        ),
     ];
     assert_eq!(application_id, 0x4641_4e49);
-    assert_eq!(user_version, 5);
+    assert_eq!(user_version, 6);
     assert_eq!(migrations, expected);
     drop(conn);
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 5);
+    assert_eq!(reopened.schema_version().unwrap(), 6);
     let count: i64 = reopened
         .connect()
         .unwrap()
@@ -328,7 +338,7 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 5);
+    assert_eq!(count, 6);
 }
 
 #[test]
@@ -366,7 +376,7 @@ fn version_one_database_upgrades_transactionally_to_latest() {
     drop(conn);
 
     let upgraded = Database::open(&path).unwrap();
-    assert_eq!(upgraded.schema_version().unwrap(), 5);
+    assert_eq!(upgraded.schema_version().unwrap(), 6);
     let conn = upgraded.connect().unwrap();
     assert!(conn
         .query_row(
@@ -866,6 +876,60 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
             .unwrap()
             .as_deref(),
         Some("人工认可译文")
+    );
+}
+
+#[test]
+fn completed_commit_without_authorization_requires_a_new_checked_effect() {
+    use fani::application::ports::StateStore;
+    let fixture = fixture();
+    let key = "publish:orphaned-authorization";
+    let id = fixture
+        .db
+        .enqueue_publication(
+            fixture.repository_id,
+            Some(&fixture.run_id),
+            "zh-CN",
+            key,
+            r#"{"commit":"historical"}"#,
+        )
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    fixture
+        .db
+        .claim_outbox(OutboxKind::Publication, "publisher", now, 1000)
+        .unwrap()
+        .unwrap();
+    fixture
+        .db
+        .complete_outbox(OutboxKind::Publication, id, "publisher")
+        .unwrap();
+    let renewed = fixture.db.effect_key(OutboxKind::Publication, key).unwrap();
+    assert_ne!(renewed, key);
+    assert_eq!(
+        fixture.db.effect_key(OutboxKind::Publication, key).unwrap(),
+        renewed
+    );
+    assert!(
+        fixture
+            .db
+            .publication_snapshot(fixture.repository_id, "zh-CN", "historical")
+            .unwrap()
+            .is_empty()
+    );
+    let retained: (String, String) = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state,payload_json FROM publication_outbox WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        retained,
+        ("done".into(), r#"{"commit":"historical"}"#.into())
     );
 }
 
@@ -1869,6 +1933,148 @@ fn merged_tm_uses_immutable_source_version_after_live_source_mutation() {
             "abc123".into(),
             fani::domain::markdown::extract_units("Introduction")[0].memory_context_key("guide.md")
         )
+    );
+}
+
+#[test]
+fn publication_authorizations_bind_run_effect_and_exact_commit_snapshot() {
+    let fixture = fixture();
+    let fingerprint = prompts::policy_fingerprint();
+    let (file, version) = canonical_version(&fixture, "zh-CN/first.md", "first-hash");
+    let (other_file, other_version) = canonical_version(&fixture, "zh-CN/other.md", "other-hash");
+    let files = [PublicationManifestFile {
+        canonical_content_version_id: version,
+        canonical_file_id: file,
+        content_hash: "first-hash".into(),
+    }];
+    let other_files = [PublicationManifestFile {
+        canonical_content_version_id: other_version,
+        canonical_file_id: other_file,
+        content_hash: "other-hash".into(),
+    }];
+    let second_run = fixture
+        .db
+        .begin_run(
+            fixture.repository_id,
+            "second-publication-run",
+            std::path::Path::new("fani.toml"),
+            "{}",
+            &fingerprint,
+        )
+        .unwrap();
+    let input = |run, commit, files| PublicationManifestInput {
+        repository_id: fixture.repository_id,
+        run_id: run,
+        locale: "zh-CN",
+        source_revision: "abc123",
+        candidate_commit: commit,
+        policy_fingerprint: &fingerprint,
+        files,
+    };
+    let first = fixture
+        .db
+        .record_publication_authorization(input(&fixture.run_id, "shared", &files), "effect-a")
+        .unwrap();
+    let second = fixture
+        .db
+        .record_publication_authorization(input(&second_run, "shared", &files), "effect-b")
+        .unwrap();
+    assert_ne!(first, second);
+    assert!(
+        fixture
+            .db
+            .transition_publication_authorization(
+                fixture.repository_id,
+                "zh-CN",
+                "shared",
+                Some("missing-effect"),
+                PublicationState::PushPending
+            )
+            .is_err()
+    );
+    fixture
+        .db
+        .transition_publication_authorization(
+            fixture.repository_id,
+            "zh-CN",
+            "shared",
+            Some("missing-effect"),
+            PublicationState::Superseded,
+        )
+        .unwrap();
+    assert!(
+        fixture
+            .db
+            .record_publication_authorization(
+                input(&second_run, "shared", &other_files),
+                "effect-c"
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .db
+            .record_publication_authorization(input(&fixture.run_id, "shared", &files), "effect-b")
+            .is_err()
+    );
+    assert!(
+        fixture
+            .db
+            .record_publication_authorization(
+                input(&second_run, "different-commit", &files),
+                "effect-b"
+            )
+            .is_err()
+    );
+    fixture
+        .db
+        .transition_publication_authorization(
+            fixture.repository_id,
+            "zh-CN",
+            "shared",
+            Some("effect-b"),
+            PublicationState::Superseded,
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .record_publication_authorization(input(&second_run, "shared", &files), "effect-b")
+            .unwrap(),
+        second
+    );
+    let conn = fixture.db.connect().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM publication_manifests", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM publication_manifests WHERE id=?1",
+            [first],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "commit_created"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM publication_manifests WHERE id=?1",
+            [second],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "superseded"
+    );
+    assert_eq!(
+        fixture
+            .db
+            .publication_snapshot(fixture.repository_id, "zh-CN", "shared")
+            .unwrap()
+            .len(),
+        1
     );
 }
 
