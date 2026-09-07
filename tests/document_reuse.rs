@@ -219,6 +219,256 @@ fn json_fixture(source: &str) -> Fixture {
 }
 
 #[test]
+fn json_current_candidate_history_is_stable_and_prior_output_is_context_only() {
+    for corrupt in [false, true] {
+        let fixture = json_fixture(r#"{"message":"Hello {{name}}"}"#);
+        fixture.sync(0);
+        let conn = fixture.db().connect().unwrap();
+        let counts = || -> Vec<i64> {
+            [
+                "unit_versions",
+                "translation_versions",
+                "translation_memory_entries",
+                "attempts",
+                "canonical_content_versions",
+            ]
+            .iter()
+            .map(|table| {
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+            })
+            .collect()
+        };
+        assert_eq!(counts(), vec![1; 5]);
+        for _ in 0..3 {
+            fixture.sync(0);
+            assert_eq!(counts(), vec![1; 5]);
+        }
+        assert_eq!(fixture.calls(), 1);
+        if corrupt {
+            conn.execute("UPDATE attempts SET response_json=json_set(response_json,'$.output','invalid candidate')", []).unwrap();
+        }
+        fs::write(
+            fixture.repo.join("docs/guide.json"),
+            r#"{"message":"Entirely new {{name}}"}"#,
+        )
+        .unwrap();
+        fixture.commit();
+        fixture.status(1, 0);
+        fixture.sync(0);
+        assert_eq!(fixture.calls(), 2);
+        let calls = fs::read_to_string(fixture.temp.path().join("calls")).unwrap();
+        let request: Value = serde_json::from_str(calls.lines().last().unwrap()).unwrap();
+        assert_eq!(request["task"]["previous_source"], "Hello {{name}}");
+        if corrupt {
+            assert!(request["task"]["previous_translation"].is_null());
+            assert_eq!(request["prompt"]["resource"], "translate");
+        } else {
+            assert_eq!(
+                request["task"]["previous_translation"],
+                "Bonjour @@FANI_JSON_0@@"
+            );
+            assert_eq!(request["prompt"]["resource"], "revise");
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM translation_memory_entries WHERE tier='trusted'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT source_text FROM unit_versions ORDER BY id LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "Hello {{name}}"
+        );
+    }
+}
+
+#[test]
+fn json_zero_unit_merge_reconciles_without_translation_history() {
+    use fani::application::ports::{PullRequestStateInput, StateStore};
+    for scenario in [
+        "observed",
+        "published",
+        "markdown",
+        "blocked",
+        "malformed",
+        "missing_links",
+        "invalid_links",
+        "empty_manifest",
+    ] {
+        let fixture = if scenario == "markdown" {
+            Fixture::new("<!-- pass-through -->\n")
+        } else if matches!(scenario, "missing_links" | "invalid_links") {
+            json_fixture(r#"{"message":"Hello"}"#)
+        } else {
+            json_fixture(r#"{"empty":"","scalars":[1,true,null]}"#)
+        };
+        let config = fs::read_to_string(&fixture.config)
+            .unwrap()
+            .replace("enabled = false", "enabled = true");
+        fs::write(&fixture.config, &config).unwrap();
+        fixture.sync(0);
+        let db = fixture.db();
+        let conn = db.connect().unwrap();
+        let (manifest, repository, commit): (i64, i64, String) = conn
+            .query_row(
+                "SELECT id,repository_id,candidate_commit FROM publication_manifests LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let contents: Vec<i64> = db
+            .publication_snapshot(repository, "zh-CN", &commit)
+            .unwrap()
+            .iter()
+            .map(|file| file.content_version_id)
+            .collect();
+        if scenario == "empty_manifest" {
+            conn.execute(
+                "DELETE FROM publication_manifest_files WHERE manifest_id=?1",
+                [manifest],
+            )
+            .unwrap();
+            assert!(
+                StateStore::promote_merged_publication(
+                    &db, repository, "zh-CN", &commit, "verified", &contents
+                )
+                .is_err()
+            );
+            continue;
+        }
+        if scenario == "invalid_links" {
+            conn.execute(
+                "UPDATE translation_versions SET validation_state='failed'",
+                [],
+            )
+            .unwrap();
+            assert!(
+                StateStore::promote_merged_publication(
+                    &db, repository, "zh-CN", &commit, "verified", &contents
+                )
+                .is_err()
+            );
+            continue;
+        }
+        if scenario == "missing_links" {
+            conn.execute("DELETE FROM canonical_file_translations", [])
+                .unwrap();
+        }
+        assert!(
+            db.promote_merged_publication(repository, "zh-CN", &commit, "unverified_empty")
+                .is_err()
+        );
+        let bin = fixture.temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let response = fixture.temp.path().join("pull.json");
+        fs::write(&response, serde_json::json!({"number":1,"url":"https://example.invalid/pull/1","state":"MERGED","headRefName":"i18n/zh-CN","baseRefName":"main","isDraft":false,"title":"fixture","body":"fixture","headRefOid":commit}).to_string()).unwrap();
+        let gh = bin.join("gh");
+        fs::write(&gh, format!("#!/bin/sh\nset -eu\ncase \"$1 $2\" in\n'pr list') printf '[]\\n';;\n'pr create') printf 'https://example.invalid/pull/1\\n';;\n'pr view') cat '{}';;\n'pr edit') :;;\n*) exit 1;;\nesac\n", response.display())).unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = config.replace("[agents.fixture]", "[repo.publish.github]\nenabled = true\nrepository = \"fixture/project\"\nbase = \"main\"\n[agents.fixture]");
+        config = config.replace(
+            "source_ref = \"HEAD\"",
+            "source_ref = \"HEAD\"\npush = true",
+        );
+        if scenario == "published" {
+            let remote = fixture.temp.path().join("remote.git");
+            fixture.git(&["init", "--bare", "-q", remote.to_str().unwrap()]);
+            fixture.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+            conn.execute("UPDATE publication_outbox SET state='pending',owner=NULL,lease_expires_at=NULL,completed_at=NULL,available_at=0", []).unwrap();
+        } else {
+            db.record_pr_state(PullRequestStateInput {
+                repository_id: repository,
+                provider: "github",
+                external_id: "1",
+                number: Some(1),
+                branch: "i18n/zh-CN",
+                url: Some("https://example.invalid/pull/1"),
+                state: "open",
+                head_revision: Some(&commit),
+                event_key: "fixture",
+                payload_json: "{}",
+            })
+            .unwrap();
+        }
+        if scenario == "blocked" {
+            config = config.replace(
+                "[repo.quality]",
+                "[repo.documentation]\ncommands = [[\"sh\",\"-c\",\"exit 1\"]]\n[repo.quality]",
+            );
+        }
+        if scenario == "malformed" {
+            fs::write(fixture.repo.join("docs/guide.json"), "{malformed}").unwrap();
+            fixture.commit();
+        }
+        fs::write(&fixture.config, config).unwrap();
+        fixture.sync(match scenario {
+            "missing_links" => 2,
+            "blocked" | "malformed" => 1,
+            _ => 0,
+        });
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM publication_manifests WHERE id=?1",
+                [manifest],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if matches!(scenario, "observed" | "published" | "markdown") {
+            assert_eq!(state, "merged", "{scenario}");
+            fixture.sync(0);
+            for table in [
+                "units",
+                "unit_versions",
+                "translation_versions",
+                "translation_memory_entries",
+                "attempts",
+                "canonical_file_translations",
+            ] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0,
+                    "{scenario}: {table}"
+                );
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT publication_state FROM canonical_content_versions LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "merged"
+            );
+            assert_eq!(fixture.calls(), 0);
+        } else {
+            assert_ne!(state, "merged", "{scenario}");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM translation_memory_entries WHERE tier='trusted'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
 fn json_lifecycle_pointer_reuse_changed_source_and_human_adoption() {
     let fixture = json_fixture(r#"{"title":"Hello","arg":"Hello {{name}}"}"#);
     fixture.status(2, 0);

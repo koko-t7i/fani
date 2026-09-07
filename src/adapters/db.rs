@@ -1057,7 +1057,7 @@ impl Database {
             })))?;
         let original = crate::domain::document::compatible_metadata(&bound)
             .ok_or_else(|| anyhow!("incompatible immutable unit context"))?;
-        if original.parser_source.is_none() {
+        if original.needs_markdown_snapshot_upgrade() {
             let current: Option<String> = tx.query_row("SELECT u.context_json FROM units u JOIN documents d ON d.id=u.document_id WHERE u.id=?1 AND u.source_text=?2 AND d.source_revision=?3", params![unit_id,bound.source,bound.source_revision], |row| row.get(0)).optional()?;
             if let Some(current) = current {
                 let mut snapshot = bound.clone();
@@ -1620,7 +1620,7 @@ impl Database {
         if let Some(attempt) = source_attempt_id {
             if let Some(provenance) = attempt_provenance(&self.connect()?, attempt)? {
                 if crate::domain::document::compatible_metadata(&provenance)
-                    .is_some_and(|metadata| metadata.parser_source.is_none())
+                    .is_some_and(|metadata| metadata.needs_markdown_snapshot_upgrade())
                 {
                     self.revalidate_candidate(
                         unit_id,
@@ -2570,6 +2570,17 @@ impl Database {
         candidate_commit: &str,
         provenance: &str,
     ) -> Result<usize> {
+        self.promote_publication(repository_id, locale, candidate_commit, provenance, &[])
+    }
+
+    fn promote_publication(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        candidate_commit: &str,
+        provenance: &str,
+        verified_zero_unit_contents: &[i64],
+    ) -> Result<usize> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let manifest_id: i64 = tx
@@ -2609,7 +2620,22 @@ impl Database {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         if translations.is_empty() {
-            bail!("publication manifest contains no exact translation versions");
+            let mut statement = tx.prepare("SELECT pmf.canonical_content_version_id,COUNT(cft.translation_version_id) FROM publication_manifest_files pmf LEFT JOIN canonical_file_translations cft ON cft.canonical_content_version_id=pmf.canonical_content_version_id WHERE pmf.manifest_id=?1 GROUP BY pmf.canonical_content_version_id ORDER BY pmf.canonical_content_version_id")?;
+            let contents = statement
+                .query_map([manifest_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut verified = verified_zero_unit_contents.to_vec();
+            verified.sort_unstable();
+            if contents.is_empty()
+                || contents.iter().any(|(_, links)| *links != 0)
+                || contents.iter().map(|(id, _)| *id).collect::<Vec<_>>() != verified
+            {
+                bail!(
+                    "publication manifest contains no exact translation versions or verified zero-unit documents"
+                );
+            }
         }
         for translation in &mut translations {
             let bound = version_provenance(&tx, translation.0);
@@ -3388,6 +3414,11 @@ impl StateStore for Database {
         locale: &str,
         candidate: &TranslationCandidate,
     ) -> Result<()> {
+        let metadata = crate::domain::document::compatible_metadata(&candidate.provenance)
+            .ok_or_else(|| anyhow!("incompatible candidate metadata"))?;
+        if !metadata.needs_markdown_snapshot_upgrade() {
+            return Ok(());
+        }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (version_id, source_hash, bound): (i64,String,UnitProvenance) = tx.query_row(
@@ -3963,13 +3994,14 @@ impl StateStore for Database {
         locale: &str,
         candidate_commit: &str,
         provenance: &str,
+        verified_zero_unit_contents: &[i64],
     ) -> Result<usize> {
-        Database::promote_merged_publication(
-            self,
+        self.promote_publication(
             repository_id,
             locale,
             candidate_commit,
             provenance,
+            verified_zero_unit_contents,
         )
     }
 }

@@ -198,6 +198,9 @@ pub fn validate(
         if schema(unit) != schema(&candidate) || restored.trim().is_empty() {
             return Err(unsupported());
         }
+        if restored != unit.source {
+            encoded_literal_len(&restored)?;
+        }
         Ok(restored)
     };
     check().map_err(|_| {
@@ -206,6 +209,22 @@ pub fn validate(
             message: "JSON message or placeholder contract changed".into(),
         }]
     })
+}
+
+fn encoded_literal_len(text: &str) -> Result<usize, DocumentError> {
+    let mut length = 2usize;
+    for byte in text.bytes() {
+        let width = match byte {
+            b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 2,
+            0..=31 => 6,
+            _ => 1,
+        };
+        length = length
+            .checked_add(width)
+            .filter(|length| *length <= MAX_STRING)
+            .ok_or_else(|| DocumentError::ResourceLimit("JSON string bytes".into()))?;
+    }
+    Ok(length)
 }
 
 fn schema(unit: &TranslatableUnit) -> BTreeMap<String, usize> {
@@ -414,8 +433,13 @@ pub fn assemble(
         .iter()
         .map(|unit| (unit.id.as_str(), unit))
         .collect();
+    if document.source.len() > MAX_BYTES {
+        return Err(DocumentError::ResourceLimit("JSON document bytes".into()));
+    }
     let mut replacements = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut untouched = document.source.len();
+    let mut encoded = 0usize;
     for translation in translations {
         if !seen.insert(&translation.id) {
             return Err(DocumentError::Structure);
@@ -423,21 +447,43 @@ pub fn assemble(
         let unit = units
             .get(translation.id.as_str())
             .ok_or(DocumentError::Structure)?;
+        if document.source.get(unit.range.clone()).is_none() {
+            return Err(DocumentError::InvalidRange(unit.range.clone()));
+        }
         let decoded = validate(unit, &translation.text).map_err(DocumentError::Token)?;
         if decoded != unit.source {
-            replacements.push((
-                unit.range.clone(),
-                serde_json::to_string(&decoded).map_err(|_| invalid())?,
-            ));
+            untouched = untouched
+                .checked_sub(unit.range.len())
+                .ok_or(DocumentError::Structure)?;
+            encoded = encoded
+                .checked_add(encoded_literal_len(&decoded)?)
+                .filter(|length| *length <= MAX_BYTES)
+                .ok_or_else(|| DocumentError::ResourceLimit("JSON document bytes".into()))?;
+            replacements.push((unit.range.clone(), *unit, translation.text.as_str()));
         }
     }
-    replacements.sort_by_key(|(range, _)| range.start);
-    let mut output = document.source.clone();
-    for (range, literal) in replacements.into_iter().rev() {
-        if output.get(range.clone()).is_none() {
-            return Err(DocumentError::InvalidRange(range));
+    replacements.sort_by_key(|(range, _, _)| range.start);
+    for pair in replacements.windows(2) {
+        if pair[0].0.end > pair[1].0.start {
+            return Err(DocumentError::OverlappingRanges {
+                first: pair[0].0.clone(),
+                second: pair[1].0.clone(),
+            });
         }
-        output.replace_range(range, &literal);
     }
+    let length = untouched
+        .checked_add(encoded)
+        .filter(|length| *length <= MAX_BYTES)
+        .ok_or_else(|| DocumentError::ResourceLimit("JSON document bytes".into()))?;
+    // Preflight retains references only; encoding and output allocation follow the aggregate bound.
+    let mut output = String::with_capacity(length);
+    let mut cursor = 0;
+    for (range, unit, text) in replacements {
+        output.push_str(&document.source[cursor..range.start]);
+        let decoded = validate(unit, text).map_err(DocumentError::Token)?;
+        output.push_str(&serde_json::to_string(&decoded).map_err(|_| invalid())?);
+        cursor = range.end;
+    }
+    output.push_str(&document.source[cursor..]);
     Ok(output)
 }

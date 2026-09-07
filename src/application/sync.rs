@@ -226,7 +226,18 @@ struct UnitContext {
     contract: Option<crate::domain::document::FormatContract>,
 }
 
-fn previous_units(rows: &[crate::application::ports::UnitHistory]) -> Vec<PreviousUnit> {
+fn previous_units(
+    rows: &[crate::application::ports::UnitHistory],
+    candidates: &[crate::application::ports::TranslationCandidate],
+    path: &str,
+) -> Vec<PreviousUnit> {
+    let mut by_unit = HashMap::<_, Vec<_>>::new();
+    for candidate in candidates {
+        by_unit
+            .entry(candidate.unit_id)
+            .or_default()
+            .push(candidate);
+    }
     rows.iter()
         .filter_map(|row| {
             let stored = serde_json::from_str::<UnitContext>(&row.context_json).ok()?;
@@ -240,13 +251,31 @@ fn previous_units(rows: &[crate::application::ports::UnitHistory]) -> Vec<Previo
                     == Some(contract)
             });
             let kind = stored.kind;
+            let mut translation = row.translation.clone();
+            if translation.is_none() && context.format == DocumentFormat::Json {
+                if let Some(candidates) = by_unit.get(&row.id) {
+                    translation = candidates.iter().find_map(|candidate| {
+                        let bound = crate::domain::document::UnitProvenance {
+                            document_path: path.into(),
+                            source: row.source_text.clone(),
+                            source_revision: candidate.provenance.source_revision.clone(),
+                            context_json: row.context_json.clone(),
+                            policy_fingerprint: candidate.provenance.policy_fingerprint.clone(),
+                        };
+                        let previous = crate::domain::document::stored_unit(&bound)?;
+                        validate_provenance(path, &previous, &candidate.provenance, &candidate.text)
+                            .is_ok()
+                            .then(|| candidate.text.clone())
+                    });
+                }
+            }
             Some(PreviousUnit {
                 stable_id: row.unit_key.clone(),
                 kind,
                 context,
                 ordinal: row.ordinal,
                 source: row.source_text.clone(),
-                translation: row.translation.clone().unwrap_or_default(),
+                translation: translation.unwrap_or_default(),
                 trusted: row.trusted && compatible,
             })
         })
@@ -476,8 +505,11 @@ impl<'a> Orchestrator<'a> {
                     ),
                     None => (Vec::new(), Vec::new()),
                 };
-            let matched =
-                match_units_with_stable_ids(&previous_units(&history), units, &stable_hints);
+            let matched = match_units_with_stable_ids(
+                &previous_units(&history, &candidates, &document.path),
+                units,
+                &stable_hints,
+            );
             for (ordinal, (unit, matched)) in units.iter().zip(matched).enumerate() {
                 match matched.kind {
                     MatchKind::Ambiguous => conflicts += 1,
@@ -607,7 +639,7 @@ impl<'a> Orchestrator<'a> {
                     None => (Vec::new(), Vec::new()),
                 };
             let matched = match_units_with_stable_ids(
-                &previous_units(&history),
+                &previous_units(&history, &candidates, &document.path),
                 document_units,
                 &stable_hints,
             );
@@ -686,7 +718,7 @@ impl<'a> Orchestrator<'a> {
                 };
                 if let Some(candidate) = reusable.filter(|candidate| !candidate.trusted) {
                     if crate::domain::document::compatible_metadata(&candidate.provenance)
-                        .is_some_and(|metadata| metadata.parser_source.is_none())
+                        .is_some_and(|metadata| metadata.needs_markdown_snapshot_upgrade())
                     {
                         self.database
                             .revalidate_candidate(database_id, language, candidate)?;
@@ -2222,6 +2254,7 @@ impl<'a> Orchestrator<'a> {
         }
         let revision = self.git.resolve_source_revision(self.repo)?;
         let current_sources = self.git.discover(self.repo, &revision)?;
+        let mut verified_zero_unit_contents = Vec::new();
         for file in &snapshot {
             let stored = self
                 .database
@@ -2233,6 +2266,9 @@ impl<'a> Orchestrator<'a> {
                 .find(|document| document.target_path(language).to_string_lossy() == file.path);
             compatible &= match (stored.as_ref(), current) {
                 (Some(stored), Some(current)) => current.parse().is_ok_and(|parsed| {
+                    if parsed.units.is_empty() && current.bytes == file.content {
+                        verified_zero_unit_contents.push(file.content_version_id);
+                    }
                     stored.source_revision == file.source_revision
                         && compatible_document_identity(
                             stored,
@@ -2251,6 +2287,7 @@ impl<'a> Orchestrator<'a> {
                 language,
                 candidate_commit,
                 "github_merged",
+                &verified_zero_unit_contents,
             )?;
         } else if !snapshot.is_empty() {
             self.database.transition_publication_manifest(
@@ -3084,8 +3121,11 @@ pub fn adopt_human_edit(
             Some(document_id) => database.unit_history(document_id, language)?,
             None => Vec::new(),
         };
-        let matched =
-            match_units_with_stable_ids(&previous_units(&history), source_units, &stable_hints);
+        let matched = match_units_with_stable_ids(
+            &previous_units(&history, &[], &document.path),
+            source_units,
+            &stable_hints,
+        );
         if matched
             .iter()
             .any(|matched| matched.kind == MatchKind::Ambiguous)

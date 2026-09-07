@@ -678,5 +678,6 @@ pub trait StateStore {
         locale: &str,
         candidate_commit: &str,
         provenance: &str,
+        verified_zero_unit_contents: &[i64],
     ) -> Result<usize>;
 }

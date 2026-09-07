@@ -125,6 +125,16 @@ pub struct StoredUnitContext {
     pub parser_source: Option<String>,
 }
 
+impl StoredUnitContext {
+    pub fn needs_markdown_snapshot_upgrade(&self) -> bool {
+        self.parser_source.is_none()
+            && self
+                .context
+                .as_ref()
+                .is_none_or(|context| context.format == DocumentFormat::Markdown)
+    }
+}
+
 pub fn unit_metadata(unit: &TranslatableUnit, document_path: &str) -> String {
     serde_json::to_string(&StoredUnitContext {
         kind: unit.kind.clone(),
