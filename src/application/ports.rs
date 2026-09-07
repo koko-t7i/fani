@@ -453,6 +453,17 @@ pub trait StateStore {
         priority: i64,
         input_json: &str,
     ) -> Result<i64>;
+    fn enqueue_document_work_item(
+        &self,
+        _run_id: &str,
+        _document_id: i64,
+        _locale: &str,
+        _kind: &str,
+        _priority: i64,
+        _input_json: &str,
+    ) -> Result<i64> {
+        anyhow::bail!("document-scoped work is not supported by this state store")
+    }
     fn successful_attempt(
         &self,
         work_item_id: i64,

@@ -61,7 +61,19 @@ Stable process outcomes are `0 ok`, `1 needs_human`, `2 error`, and `3 partial`.
 
 ## SQLite contract
 
-The schema is intentionally destructive for 0.3. Opening a file with an unsupported application ID or schema version fails with reset guidance; no compatibility migration runs.
+Native schemas 1 and 2 upgrade transactionally to schema 3; pre-native databases and unknown/newer migration ledgers are rejected. Existing migration SQL and SHA-256 checksums are immutable.
+
+### Schema 3 upgrade and restore
+
+Stop **all** fani processes (including idle older binaries) before upgrading, and keep them stopped until the upgrade completes. Migration takes a SQLite `BEGIN EXCLUSIVE` lock, refuses application leases except repository owners proven dead by PID/start-time identity, and holds the lock through backup, rebuild, validation, and commit. Processing outbox owners must also be proven dead, even without a repository lease. Lease expiry alone is not proof that an application stopped. The lock prevents database access during migration, not an already-running old binary from resuming afterward; mixed-version operation is unsupported.
+
+Before modifying an existing schema, the upgrader validates its own version's ledger, marker, integrity, and foreign keys, then writes `<database>.pre-schema-<version>.bak`. This is a synced, validated, no-clobber copy made under the exclusive lock in DELETE journal mode before any migration writes. The destination directory is synced too. An existing backup blocks another upgrade attempt: retain it under another name before retrying rather than overwriting recovery evidence. Fresh databases need no backup.
+
+Migration 0003 checks the complete recursive reverse-FK graph rooted at `work_items` and rejects unexpected dependencies or custom work-item indexes/triggers. It temporarily disables FK enforcement outside the transaction so dropping the old parent cannot cascade-delete children or null historical attempt links. All old work IDs and fields remain unit-scoped, regardless of kind; attempts, findings, both outboxes, candidate/translation histories, memory links, and canonical-file links remain unchanged. The rebuilt table has nullable `unit_id` and `document_id` with an XOR check and a document FK. Separate partial unique indexes support correctly predicated unit/document upserts. Integrity and FK checks run before commit; failure rolls back the schema, data, ledger, and header, and FK enforcement is restored.
+
+For rollback to an old binary, stop all processes, retain the failed/upgraded database separately, and copy the validated pre-upgrade backup back to the original database path with its original permissions. Do not combine a restored database with `-wal`, `-shm`, or `-journal` files from another database: retain those alongside the displaced database while all processes are stopped. Sync the restored file and directory, then run the **matching old binary's** doctor/integrity checks. Do not use the new binary's `Database::restore` for a downgrade: it expects the current schema and opening an old database performs an upgrade. Older binaries reject the new ledger's unknown migration; no down migration or destructive reset is part of this procedure.
+
+`StateStore::enqueue_document_work_item` supports `assembly`, `materialization`, and `project_check`; unit enqueue signatures remain unchanged. Document work creates no units, attempts, translation memory, or AI provenance. This database foundation does not connect zero-unit candidates to the pipeline or change existing outbox recovery: candidate checks, explicit supersession/replanning, and document completion belong to the pipeline integration.
 
 The model covers repositories and languages, source revisions, documents and unit occurrences, translation versions and trusted memory, runs and work items, completed attempts, findings and transitions, canonical candidate blobs, materialization/publication outboxes, pull-request lifecycle, and renewable leases.
 
