@@ -1,0 +1,5 @@
+{
+  "checkout": { "title": "Checkout", "message": "Hello {{name}}; again {{ name }}; account {{ user.name }}." },
+  "account": { "title": "Account", "message": "Account {{user.name}} belongs to {{ name }} and {{name}}." },
+  "shared": { "empty": "", "whitespace": " \t\n ", "detail": "Café says \"welcome\".\nNext line.", "items": ["First item", { "label": "Nested item" }, "", "  ", 7, true, null], "count": 42, "enabled": false, "nothing": null }
+}
