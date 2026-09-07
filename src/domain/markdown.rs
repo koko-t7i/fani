@@ -588,8 +588,11 @@ pub(crate) fn document_signature(markdown: &str) -> Vec<String> {
     if let Ok(units) = extract_units_checked(markdown) {
         let mut end = 0;
         for unit in units {
-            signature.push(format!("immutable:{}", &markdown[end..unit.range.start]));
-            end = unit.range.end;
+            if unit.range.start >= end {
+                signature.push(format!("immutable:{}", &markdown[end..unit.range.start]));
+            }
+            // Nested definition units can overlap their containing unit.
+            end = end.max(unit.range.end);
         }
         signature.push(format!("immutable:{}", &markdown[end..]));
     }

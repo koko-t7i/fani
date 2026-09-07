@@ -83,6 +83,78 @@ fn unused_reference_definitions_and_nontranslatable_bytes_are_immutable() {
 }
 
 #[test]
+fn nested_definition_ranges_do_not_panic_or_weaken_immutable_gaps() {
+    let source = "Term\n: Definition.\n\n  Second paragraph.\n";
+    let document =
+        std::panic::catch_unwind(|| parse_document(DocumentFormat::Markdown, source.as_bytes()))
+            .expect("nested definition parsing must not panic")
+            .unwrap();
+    assert_eq!(
+        document
+            .units
+            .iter()
+            .map(|unit| unit.range.clone())
+            .collect::<Vec<_>>(),
+        vec![0..4, 5..39, 7..18, 22..39]
+    );
+    std::panic::catch_unwind(|| verify_document(&document, source))
+        .expect("nested definition verification must not panic")
+        .unwrap();
+    let translations = document
+        .units
+        .iter()
+        .map(|unit| UnitTranslation {
+            id: unit.id.clone(),
+            text: unit.protected_source.clone(),
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        assemble_document(&document, &translations),
+        Err(DocumentError::Markdown(fani::domain::markdown::MarkdownError::OverlappingRanges { first, second }))
+            if first == (5..39) && second == (7..18)
+    ));
+
+    for body in [
+        source,
+        "Term\n: Definition.\n\n  > Nested quote.\n",
+        "Term\n: Definition.\n\n  - Nested item.\n  - Second item.\n",
+        "Term\n: Definition.\n\n  Second paragraph.\n\nOther\n: Another definition.\n\n  Last paragraph.\n",
+    ] {
+        let source = format!(
+            "<!-- stable -->\n\n{body}\n[unused]: https://example.com/stable\n\n<!-- trailing -->\n"
+        );
+        let document = std::panic::catch_unwind(|| {
+            parse_document(DocumentFormat::Markdown, source.as_bytes())
+        })
+        .expect("nested definition parsing must not panic")
+        .unwrap();
+        assert_eq!(document.units, extract_units(&source));
+        assert!(
+            document
+                .units
+                .windows(2)
+                .any(|units| units[0].range.end > units[1].range.start)
+        );
+        for target in [source.clone(), source.replace("Definition.", "Définition.")] {
+            std::panic::catch_unwind(|| verify_document(&document, &target))
+                .expect("nested definition verification must not panic")
+                .unwrap();
+        }
+        for changed in [
+            source.replace("<!-- stable -->", "<!-- changed -->"),
+            source.replace("example.com/stable", "example.com/changed"),
+            source.replace("<!-- trailing -->", "<!-- changed -->"),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| verify_document(&document, &changed))
+                    .expect("immutable-gap verification must not panic")
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn markdown_identity_and_unit_ids_remain_compatible() {
     assert_eq!(
         extract_units("Hello world.\n")[0].id,
