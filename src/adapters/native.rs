@@ -520,9 +520,14 @@ fn reconcile(
         let git = NativeGitPublisher;
         for language in languages(repo, args.language.as_deref())? {
             count += match mode {
-                ReconcileMode::Adopt => {
-                    adopt_human_edit(repo, &database, &materializer, &git, &language)?
-                }
+                ReconcileMode::Adopt => adopt_human_edit(
+                    repo,
+                    &database,
+                    &materializer,
+                    &git,
+                    &NativeDocumentationChecker,
+                    &language,
+                )?,
                 ReconcileMode::Discard => {
                     discard_human_edit(repo, &database, &materializer, &git, &language)?
                 }

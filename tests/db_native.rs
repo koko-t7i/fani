@@ -40,7 +40,10 @@ fn fixture() -> Fixture {
             0,
             "Introduction",
             "source-hash",
-            "{}",
+            &fani::domain::document::unit_metadata(
+                &fani::domain::markdown::extract_units("Introduction")[0],
+                "guide.md",
+            ),
         )
         .unwrap();
     let run_id = db
@@ -660,7 +663,13 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
     assert_eq!(
         fixture
             .db
-            .trusted_translation(fixture.repository_id, "zh-CN", "source-hash", "heading")
+            .trusted_translation(
+                fixture.repository_id,
+                "zh-CN",
+                "source-hash",
+                &fani::domain::markdown::extract_units("Introduction")[0]
+                    .memory_context_key("guide.md")
+            )
             .unwrap(),
         None
     );
@@ -672,7 +681,8 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
             unit_id: Some(fixture.unit_id),
             locale: "zh-CN",
             source_hash: "source-hash",
-            context_key: "heading",
+            context_key: &fani::domain::markdown::extract_units("Introduction")[0]
+                .memory_context_key("guide.md"),
             target_text: "人工认可译文",
             provenance: "human_adopted",
             policy_fingerprint: &prompts::policy_fingerprint(),
@@ -681,7 +691,13 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
     assert_eq!(
         fixture
             .db
-            .trusted_translation(fixture.repository_id, "zh-CN", "source-hash", "heading")
+            .trusted_translation(
+                fixture.repository_id,
+                "zh-CN",
+                "source-hash",
+                &fani::domain::markdown::extract_units("Introduction")[0]
+                    .memory_context_key("guide.md")
+            )
             .unwrap()
             .as_deref(),
         Some("人工认可译文")
@@ -963,7 +979,10 @@ fn merged_publication_promotes_only_exact_manifest_translation_versions() {
             0,
             "Other",
             "other-source-hash",
-            "{}",
+            &fani::domain::document::unit_metadata(
+                &fani::domain::markdown::extract_units("Other")[0],
+                "other.md",
+            ),
         )
         .unwrap();
     let other_work_item_id = fixture
@@ -1176,7 +1195,8 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
             unit_id: Some(fixture.unit_id),
             locale: "zh-CN",
             source_hash: "source-hash",
-            context_key: "heading",
+            context_key: &fani::domain::markdown::extract_units("Introduction")[0]
+                .memory_context_key("guide.md"),
             target_text: "介绍",
             provenance: "reviewed",
             policy_fingerprint: &prompts::policy_fingerprint(),
@@ -1189,14 +1209,26 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
             unit_id: Some(fixture.unit_id),
             locale: "zh-CN",
             source_hash: "source-hash",
-            context_key: "heading",
+            context_key: &fani::domain::markdown::extract_units("Introduction")[0]
+                .memory_context_key("guide.md"),
             target_text: "简介",
             provenance: "approved",
             policy_fingerprint: &prompts::policy_fingerprint(),
         })
         .unwrap();
 
-    assert_eq!(first_tm, replay_tm);
+    assert_ne!(first_tm, replay_tm);
+    let old_tier: String = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT tier FROM translation_memory_entries WHERE id=?1 AND superseded_at IS NOT NULL",
+            [first_tm],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_tier, "history");
     let conn = fixture.db.connect().unwrap();
     let selected: (i64, String) = conn
         .query_row(
@@ -1208,7 +1240,7 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
     assert_eq!(selected, (1, "简介".into()));
     let tm: (i64, String, String) = conn
         .query_row(
-            "SELECT COUNT(*),target_text,provenance FROM translation_memory_entries WHERE repository_id=?1 AND locale='zh-CN' AND tier='trusted' AND superseded_at IS NULL",
+            "SELECT COUNT(*),target_text,json_extract(provenance,'$.origin') FROM translation_memory_entries WHERE repository_id=?1 AND locale='zh-CN' AND tier='trusted' AND superseded_at IS NULL",
             [fixture.repository_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -1282,7 +1314,7 @@ fn canonical_content_links_trusted_assembled_text_not_stale_selected_candidate()
             unit_id: Some(fixture.unit_id),
             locale: "zh-CN",
             source_hash: "source-hash",
-            context_key: "",
+            context_key: "Paragraph",
             target_text: "可信组装译文",
             provenance: "reviewed",
             policy_fingerprint: &fingerprint,
@@ -1462,7 +1494,14 @@ fn merged_tm_uses_immutable_source_version_after_live_source_mutation() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(tm, ("source-hash".into(), "abc123".into(), "".into()));
+    assert_eq!(
+        tm,
+        (
+            "source-hash".into(),
+            "abc123".into(),
+            fani::domain::markdown::extract_units("Introduction")[0].memory_context_key("guide.md")
+        )
+    );
 }
 
 #[test]

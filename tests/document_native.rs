@@ -5,7 +5,89 @@ use fani::domain::document::{
 use fani::domain::markdown::extract_units;
 
 #[test]
+fn parsing_rejects_token_collisions_and_partial_protection_overlap() {
+    let token = extract_units("Use `code`.")[0].protected[0].token.clone();
+    let collision = format!("Use `code` and {token}.");
+    assert!(parse_document(DocumentFormat::Markdown, collision.as_bytes()).is_err());
+    assert!(parse_document(DocumentFormat::Markdown, b"Use `a {{b` c}}.\n").is_err());
+    let contained = "Use `{{value}}` and [label](https://example.com/{{value}}).\n";
+    let document = parse_document(DocumentFormat::Markdown, contained.as_bytes()).unwrap();
+    let translations = document
+        .units
+        .iter()
+        .map(|unit| UnitTranslation {
+            id: unit.id.clone(),
+            text: unit.protected_source.clone(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assemble_document(&document, &translations).unwrap(),
+        contained
+    );
+}
+
+#[test]
+fn metadata_and_heading_attributes_are_immutable() {
+    for source in [
+        "---\nslug: native-guide\n---\n\n# Title\n",
+        "+++\nslug = 'native-guide'\n+++\n\n# Title\n",
+    ] {
+        let document = parse_document(DocumentFormat::Markdown, source.as_bytes()).unwrap();
+        assert!(verify_document(&document, &source.replace("native-guide", "different")).is_err());
+    }
+    let source = "# Title {#stable .visible key=value}\n";
+    let document = parse_document(DocumentFormat::Markdown, source.as_bytes()).unwrap();
+    let unit = &document.units[0];
+    for changed in [
+        unit.protected_source.replace("stable", "different"),
+        unit.protected_source.replace("visible", "hidden"),
+        unit.protected_source.replace("value", "other"),
+    ] {
+        assert!(
+            assemble_document(
+                &document,
+                &[UnitTranslation {
+                    id: unit.id.clone(),
+                    text: changed
+                }]
+            )
+            .is_err()
+        );
+    }
+    let output = assemble_document(
+        &document,
+        &[UnitTranslation {
+            id: unit.id.clone(),
+            text: unit.protected_source.replace("Title", "Titre"),
+        }],
+    )
+    .unwrap();
+    assert_eq!(output, "# Titre {#stable .visible key=value}\n");
+}
+
+#[test]
+fn unused_reference_definitions_and_nontranslatable_bytes_are_immutable() {
+    for source in [
+        "Hello.\n\n[unused]: https://example.com/stable \"Title\"\n",
+        "Hello.\n\n[used]: https://example.com/stable\n[used]: https://example.com/duplicate\n",
+        "Hello.\n\n<!-- stable -->\n",
+    ] {
+        let document = parse_document(DocumentFormat::Markdown, source.as_bytes()).unwrap();
+        verify_document(&document, &source.replace("Hello", "Bonjour")).unwrap();
+        assert!(verify_document(&document, &source.replace("stable", "changed")).is_err());
+        assert!(
+            verify_document(&document, &source.replace("duplicate", "changed")).is_err()
+                || !source.contains("duplicate")
+        );
+    }
+}
+
+#[test]
 fn markdown_identity_and_unit_ids_remain_compatible() {
+    assert_eq!(
+        extract_units("Hello world.\n")[0].id,
+        "md-f531bb73b1a3c75e-00"
+    );
     for source in [
         include_str!("fixtures/markdown-corpus/rich-gfm.md"),
         include_str!("fixtures/markdown-corpus/edge-commonmark.md"),

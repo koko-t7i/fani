@@ -9,7 +9,8 @@ use crate::application::ports::{
 use crate::application::settings::RepoConfig;
 use crate::domain::document::{
     DocumentFormat, ParsedDocument, TranslatableUnit, UnitTranslation, assemble_document,
-    parse_document, repair_leading_strong_separator, validate_unit, verify_document,
+    parse_document, repair_leading_strong_separator, unit_metadata, validate_provenance,
+    validate_unit, verify_document,
 };
 use crate::domain::matching::{MatchKind, PreviousUnit, match_units_with_stable_ids};
 use crate::domain::model::{
@@ -62,8 +63,44 @@ fn target_path(repo: &RepoConfig, language: &str, source_path: &str) -> Result<P
     Ok(path)
 }
 
-fn kind_name(unit: &TranslatableUnit) -> String {
-    unit.kind.as_str().to_owned()
+fn reusable_candidate(
+    path: &str,
+    unit: &TranslatableUnit,
+    candidate: &crate::application::ports::TranslationCandidate,
+    allow_candidate: bool,
+) -> bool {
+    !candidate.text.is_empty()
+        && (candidate.trusted
+            || (allow_candidate
+                && candidate.provenance.policy_fingerprint == prompts::policy_fingerprint()
+                && candidate
+                    .deterministic_model
+                    .as_deref()
+                    .is_none_or(|model| model == LEADING_STRONG_SEPARATOR_VERSION)))
+        && validate_provenance(path, unit, &candidate.provenance, &candidate.text).is_ok()
+}
+
+#[derive(Deserialize)]
+struct StoredReviewRequest {
+    task: AgentTask,
+}
+
+fn compatible_review_request(
+    receipt: &crate::application::ports::RecoveredAttempt,
+    stage: &str,
+    unit: &TranslatableUnit,
+    translated: &str,
+) -> bool {
+    let Ok(request) = serde_json::from_str::<StoredReviewRequest>(&receipt.request_json) else {
+        return false;
+    };
+    let task = request.task;
+    task.stage.as_str() == stage
+        && task.source == unit.protected_source
+        && (task.previous_translation.as_deref() == Some(translated)
+            || (stage == "revision"
+                && !receipt.output.trim().eq_ignore_ascii_case("OK")
+                && receipt.output == translated))
 }
 
 fn stable_unit_id(path: &str, unit: &TranslatableUnit, ordinal: usize) -> String {
@@ -302,9 +339,13 @@ impl<'a> Orchestrator<'a> {
         let mut reused = 0;
         let mut conflicts = 0;
         for document in &documents {
-            let text = std::str::from_utf8(&document.bytes)
-                .with_context(|| format!("{} is not UTF-8", document.path))?;
-            let parsed = parse_document(DocumentFormat::Markdown, text.as_bytes())?;
+            let parsed = match parse_document(DocumentFormat::Markdown, &document.bytes) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    conflicts += 1;
+                    continue;
+                }
+            };
             let units = &parsed.units;
             let stable_ids = units
                 .iter()
@@ -318,27 +359,21 @@ impl<'a> Orchestrator<'a> {
                 &document.content_hash,
                 &stable_ids,
             )?;
-            let history = match self.database.document_id(repository_id, &document.path)? {
-                Some(document_id) => self.database.unit_history(document_id, language)?,
-                None => Vec::new(),
-            };
+            let (history, candidates) =
+                match self.database.document_id(repository_id, &document.path)? {
+                    Some(document_id) => (
+                        self.database.unit_history(document_id, language)?,
+                        self.database
+                            .translation_candidates(document_id, language)?,
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
             let matched =
                 match_units_with_stable_ids(&previous_units(&history), units, &stable_hints);
             for (ordinal, (unit, matched)) in units.iter().zip(matched).enumerate() {
                 match matched.kind {
                     MatchKind::Ambiguous => conflicts += 1,
-                    MatchKind::Exact | MatchKind::Moved
-                        if matched.trusted_reuse
-                            && matched.previous_translation.as_ref().is_some_and(|text| {
-                                !text.is_empty() && validate_unit(unit, text).is_ok()
-                            })
-                            && matched.previous_source.as_deref() == Some(unit.source.as_str()) =>
-                    {
-                        reused += 1
-                    }
                     _ => {
-                        let context = kind_name(unit);
-                        let source_hash = hash(&[unit.source.as_bytes()]);
                         let stable_id = matched.stable_id.as_deref().or_else(|| {
                             (!stable_hints[ordinal].is_empty())
                                 .then_some(stable_hints[ordinal].as_str())
@@ -349,38 +384,28 @@ impl<'a> Orchestrator<'a> {
                                 .find(|row| row.unit_key == stable_id)
                                 .map(|row| row.id)
                         });
-                        let trusted = self.database.trusted_translation(
-                            repository_id,
-                            language,
-                            &source_hash,
-                            &context,
-                        )?;
-                        let candidate = match database_id {
-                            Some(database_id) => self.database.recoverable_invocation_candidate(
-                                &invocation,
-                                database_id,
+                        let candidate = candidates.iter().find(|candidate| {
+                            reusable_candidate(
+                                &document.path,
+                                unit,
+                                candidate,
+                                Some(candidate.unit_id) == database_id
+                                    && (candidate.invocation_key.as_deref()
+                                        == Some(invocation.as_str())
+                                        || !stable_hints[ordinal].is_empty()),
+                            )
+                        });
+                        let compatible = match candidate {
+                            Some(candidate) => self.reviews_compatible(
+                                &document.path,
+                                unit,
+                                candidate,
                                 language,
-                                &policy_fingerprint,
-                                LEADING_STRONG_SEPARATOR_VERSION,
+                                &invocation,
                             )?,
-                            None => None,
+                            None => false,
                         };
-                        let prior_candidate = match database_id {
-                            Some(database_id) if !stable_hints[ordinal].is_empty() => {
-                                self.database.recoverable_unit_candidate(
-                                    database_id,
-                                    language,
-                                    &policy_fingerprint,
-                                    LEADING_STRONG_SEPARATOR_VERSION,
-                                )?
-                            }
-                            _ => None,
-                        };
-                        if [trusted, candidate, prior_candidate]
-                            .into_iter()
-                            .flatten()
-                            .any(|text| !text.is_empty() && validate_unit(unit, &text).is_ok())
-                        {
+                        if compatible {
                             reused += 1;
                         } else {
                             pending += 1;
@@ -415,9 +440,18 @@ impl<'a> Orchestrator<'a> {
         let policy_fingerprint = prompts::policy_fingerprint();
         let documents = self.git.discover(self.repo, source_revision)?;
         for document in documents {
-            let source_text = String::from_utf8(document.bytes)
-                .with_context(|| format!("{} is not UTF-8", document.path))?;
-            let parsed = parse_document(DocumentFormat::Markdown, source_text.as_bytes())?;
+            let parsed = match parse_document(DocumentFormat::Markdown, &document.bytes) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    conflicts.push(finding(
+                        &document.path,
+                        None,
+                        "DOCUMENT-PARSE",
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
             let document_units = &parsed.units;
             let stable_ids = document_units
                 .iter()
@@ -431,10 +465,15 @@ impl<'a> Orchestrator<'a> {
                 &document.content_hash,
                 &stable_ids,
             )?;
-            let history = match self.database.document_id(repository_id, &document.path)? {
-                Some(document_id) => self.database.unit_history(document_id, language)?,
-                None => Vec::new(),
-            };
+            let (history, candidates) =
+                match self.database.document_id(repository_id, &document.path)? {
+                    Some(document_id) => (
+                        self.database.unit_history(document_id, language)?,
+                        self.database
+                            .translation_candidates(document_id, language)?,
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
             let matched = match_units_with_stable_ids(
                 &previous_units(&history),
                 document_units,
@@ -469,6 +508,8 @@ impl<'a> Orchestrator<'a> {
                     &json!({"format": parsed.format, "contract": parsed.contract}),
                 )?,
             )?;
+            self.database
+                .quarantine_incompatible_translations(document_id, language)?;
             let mut units = Vec::new();
             for (ordinal, (unit, matched)) in
                 document_units.iter().cloned().zip(matched).enumerate()
@@ -478,47 +519,60 @@ impl<'a> Orchestrator<'a> {
                     .clone()
                     .unwrap_or_else(|| stable_ids[ordinal].clone());
                 let source_hash = hash(&[unit.source.as_bytes()]);
-                let context = kind_name(&unit);
+                let context = unit.memory_context_key(&document.path);
                 let database_id = self.database.upsert_unit(
                     document_id,
                     &stable_id,
                     ordinal as i64,
                     &unit.source,
                     &source_hash,
-                    &serde_json::to_string(&json!({"kind": context, "context": unit.context, "contract": parsed.contract}))?,
+                    &unit_metadata(&unit, &document.path),
                 )?;
-                let candidate = self.database.recoverable_candidate(
-                    run_id,
-                    database_id,
-                    language,
-                    &policy_fingerprint,
-                    LEADING_STRONG_SEPARATOR_VERSION,
-                )?;
-                let prior_candidate = if stable_hints[ordinal].is_empty() {
-                    None
-                } else {
-                    self.database.recoverable_unit_candidate(
-                        database_id,
-                        language,
-                        &policy_fingerprint,
-                        LEADING_STRONG_SEPARATOR_VERSION,
-                    )?
+                let reusable = candidates.iter().find(|candidate| {
+                    reusable_candidate(
+                        &document.path,
+                        &unit,
+                        candidate,
+                        candidate.unit_id == database_id
+                            && (candidate.run_id.as_deref() == Some(run_id)
+                                || !stable_hints[ordinal].is_empty()),
+                    )
+                });
+                let reusable = match reusable {
+                    Some(candidate)
+                        if self.reviews_compatible(
+                            &document.path,
+                            &unit,
+                            candidate,
+                            language,
+                            run_id,
+                        )? =>
+                    {
+                        Some(candidate)
+                    }
+                    _ => None,
                 };
-                let trusted = self.database.trusted_translation(
-                    repository_id,
-                    language,
-                    &source_hash,
-                    &context,
-                )?;
-                let historical = (matched.trusted_reuse
-                    && matches!(matched.kind, MatchKind::Exact | MatchKind::Moved)
-                    && matched.previous_source.as_deref() == Some(unit.source.as_str()))
-                .then_some(matched.previous_translation.clone())
-                .flatten();
-                let reusable = [trusted, candidate, prior_candidate, historical]
-                    .into_iter()
-                    .flatten()
-                    .find(|text| !text.is_empty() && validate_unit(&unit, text).is_ok());
+                if let Some(candidate) = reusable.filter(|candidate| !candidate.trusted) {
+                    if crate::domain::document::compatible_metadata(&candidate.provenance)
+                        .is_some_and(|metadata| metadata.parser_source.is_none())
+                    {
+                        self.database
+                            .revalidate_candidate(database_id, language, candidate)?;
+                    }
+                }
+                if let Some(candidate) = reusable.filter(|candidate| candidate.trusted) {
+                    self.database.trust_translation(TrustTranslationInput {
+                        repository_id,
+                        unit_id: Some(database_id),
+                        locale: language,
+                        source_hash: &source_hash,
+                        context_key: &context,
+                        target_text: &candidate.text,
+                        provenance: "compatible_memory",
+                        policy_fingerprint: &policy_fingerprint,
+                    })?;
+                }
+                let reusable = reusable.map(|candidate| candidate.text.clone());
                 let mut planned = PlannedUnit {
                     unit,
                     database_id,
@@ -604,6 +658,73 @@ impl<'a> Orchestrator<'a> {
         Ok((planned_documents, conflicts, reused, scheduled))
     }
 
+    fn reviews_compatible(
+        &self,
+        path: &str,
+        unit: &TranslatableUnit,
+        candidate: &crate::application::ports::TranslationCandidate,
+        language: &str,
+        run_or_invocation: &str,
+    ) -> Result<bool> {
+        if !self.repo.quality.revision && !self.repo.quality.proofread {
+            return Ok(true);
+        }
+        for receipt in
+            self.database
+                .review_attempts(candidate.unit_id, language, run_or_invocation)?
+        {
+            let stage = receipt.dedupe_key.rsplit(':').next().unwrap_or("");
+            if (stage == "revision" && !self.repo.quality.revision)
+                || (stage == "proofread" && !self.repo.quality.proofread)
+            {
+                continue;
+            }
+            if !compatible_review_request(&receipt, stage, unit, &candidate.text)
+                || !receipt.provenance.as_ref().is_some_and(|bound| {
+                    bound.policy_fingerprint == prompts::policy_fingerprint()
+                        && validate_provenance(path, unit, bound, &unit.protected_source).is_ok()
+                })
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn recovered_attempt(
+        &self,
+        work_item_id: i64,
+        key: &str,
+        path: &str,
+        unit: &TranslatableUnit,
+        translation: bool,
+        reviewed_translation: Option<&str>,
+    ) -> Result<Option<crate::application::ports::RecoveredAttempt>> {
+        let Some(receipt) = self.database.successful_attempt(work_item_id, key)? else {
+            return Ok(None);
+        };
+        let approval =
+            key.ends_with(":revision") && receipt.output.trim().eq_ignore_ascii_case("OK");
+        let text = if translation && !approval {
+            receipt.output.as_str()
+        } else {
+            unit.protected_source.as_str()
+        };
+        let review_matches = reviewed_translation.is_none_or(|text| {
+            compatible_review_request(&receipt, key.rsplit(':').next().unwrap_or(""), unit, text)
+        });
+        if review_matches
+            && receipt.provenance.as_ref().is_some_and(|provenance| {
+                provenance.policy_fingerprint == prompts::policy_fingerprint()
+                    && validate_provenance(path, unit, provenance, text).is_ok()
+            })
+        {
+            return Ok(Some(receipt));
+        }
+        self.database.retire_attempt(receipt.id)?;
+        Ok(None)
+    }
+
     fn dispatch(
         &self,
         run_id: &str,
@@ -620,10 +741,14 @@ impl<'a> Orchestrator<'a> {
                     continue;
                 }
                 let dedupe_key = format!("{}:translate", unit.stable_id);
-                if let Some(recovered) = self
-                    .database
-                    .successful_attempt(work_item_id, &dedupe_key)?
-                {
+                if let Some(recovered) = self.recovered_attempt(
+                    work_item_id,
+                    &dedupe_key,
+                    &document.source_path,
+                    &unit.unit,
+                    true,
+                    None,
+                )? {
                     validate_unit(&unit.unit, &recovered.output).map_err(|findings| {
                         anyhow!(
                             "durable Agent output for {} failed validation: {findings:?}",
@@ -820,10 +945,14 @@ impl<'a> Orchestrator<'a> {
                     "{}:repair:{REPAIR_CONTEXT_VERSION}:{LEADING_STRONG_SEPARATOR_VERSION}",
                     unit.stable_id
                 );
-                if let Some(recovered) = self
-                    .database
-                    .successful_attempt(work_item_id, &deterministic_key)?
-                {
+                if let Some(recovered) = self.recovered_attempt(
+                    work_item_id,
+                    &deterministic_key,
+                    &document.source_path,
+                    &unit.unit,
+                    true,
+                    None,
+                )? {
                     self.database.select_canonical_candidate(
                         unit.database_id,
                         language,
@@ -900,10 +1029,14 @@ impl<'a> Orchestrator<'a> {
                     };
                     let dedupe_key =
                         format!("{}:repair:{REPAIR_CONTEXT_VERSION}:{round}", unit.stable_id);
-                    if let Some(recovered) = self
-                        .database
-                        .successful_attempt(work_item_id, &dedupe_key)?
-                    {
+                    if let Some(recovered) = self.recovered_attempt(
+                        work_item_id,
+                        &dedupe_key,
+                        &document.source_path,
+                        &unit.unit,
+                        true,
+                        None,
+                    )? {
                         validate_unit(&unit.unit, &recovered.output).map_err(|findings| {
                             anyhow!(
                                 "durable repair output for {} failed validation: {findings:?}",
@@ -1125,10 +1258,14 @@ impl<'a> Orchestrator<'a> {
                         continue;
                     };
                     let dedupe_key = format!("{}:{stage_name}", unit.stable_id);
-                    if let Some(recovered) = self
-                        .database
-                        .successful_attempt(work_item_id, &dedupe_key)?
-                    {
+                    if let Some(recovered) = self.recovered_attempt(
+                        work_item_id,
+                        &dedupe_key,
+                        &document.source_path,
+                        &unit.unit,
+                        blocking,
+                        unit.translation.as_deref(),
+                    )? {
                         if recovered.output.trim().eq_ignore_ascii_case("OK") {
                             continue;
                         }
@@ -1688,14 +1825,113 @@ impl<'a> Orchestrator<'a> {
                 .head_revision
                 .as_deref()
                 .ok_or_else(|| anyhow!("stored pull request has no candidate head revision"))?;
+            self.promote_verified_publication(repository_id, language, candidate_commit)?;
+        }
+        Ok(())
+    }
+
+    fn promote_verified_publication(
+        &self,
+        repository_id: i64,
+        language: &str,
+        candidate_commit: &str,
+    ) -> Result<()> {
+        let snapshot =
+            self.database
+                .publication_snapshot(repository_id, language, candidate_commit)?;
+        let files = snapshot
+            .iter()
+            .map(|file| PublicationFile {
+                path: file.path.clone(),
+                content: file.content.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut compatible = !snapshot.is_empty();
+        if let Some(first) = snapshot.first() {
+            compatible &= snapshot
+                .iter()
+                .all(|file| file.source_revision == first.source_revision);
+            compatible &=
+                self.verify_publication_files(&first.source_revision, language, &files)?;
+            if compatible {
+                compatible &= self
+                    .documentation
+                    .check(self.repo, &first.source_revision, &files)?
+                    .failures
+                    .is_empty();
+            }
+        }
+        for file in &snapshot {
+            compatible &= self
+                .database
+                .canonical_compatible(file.content_version_id)?;
+        }
+        if compatible {
             self.database.promote_merged_publication(
                 repository_id,
                 language,
                 candidate_commit,
                 "github_merged",
             )?;
+        } else if !snapshot.is_empty() {
+            self.database.transition_publication_manifest(
+                repository_id,
+                language,
+                candidate_commit,
+                PublicationState::Superseded,
+            )?;
         }
         Ok(())
+    }
+
+    fn verify_publication_files(
+        &self,
+        revision: &str,
+        language: &str,
+        files: &[PublicationFile],
+    ) -> Result<bool> {
+        let sources = self.git.discover(self.repo, revision)?;
+        let mut seen = HashSet::new();
+        for file in files {
+            if !seen.insert(&file.path) {
+                return Ok(false);
+            }
+            let mut source = None;
+            for document in &sources {
+                if target_path(self.repo, language, &document.path)?.to_string_lossy() == file.path
+                {
+                    source = Some(document);
+                    break;
+                }
+            }
+            let Some(source) = source else {
+                return Ok(false);
+            };
+            let Ok(parsed) = parse_document(DocumentFormat::Markdown, &source.bytes) else {
+                return Ok(false);
+            };
+            let Ok(text) = std::str::from_utf8(&file.content) else {
+                return Ok(false);
+            };
+            if verify_document(&parsed, text).is_err() {
+                return Ok(false);
+            }
+            let Ok(target) = parse_document(DocumentFormat::Markdown, &file.content) else {
+                return Ok(false);
+            };
+            if parsed.units.len() != target.units.len()
+                || parsed
+                    .units
+                    .iter()
+                    .zip(&target.units)
+                    .any(|(source, target)| {
+                        crate::domain::document::translated_unit_text(source, target).is_none()
+                    })
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn publish(
@@ -1812,6 +2048,67 @@ impl<'a> Orchestrator<'a> {
                 path: record.path.clone(),
                 content: record.content.as_bytes().to_vec(),
             });
+        }
+        let mut compatible = payload.policy_fingerprint == prompts::policy_fingerprint();
+        if payload.source_revision != outcome.source_revision {
+            let old_sources = self.git.discover(self.repo, &payload.source_revision)?;
+            let current_sources = self.git.discover(self.repo, &outcome.source_revision)?;
+            for old in &old_sources {
+                let target = target_path(self.repo, language, &old.path)?;
+                if records
+                    .iter()
+                    .any(|record| target.to_string_lossy() == record.path)
+                {
+                    compatible &= current_sources
+                        .iter()
+                        .any(|current| current.path == old.path && current.bytes == old.bytes);
+                }
+            }
+        }
+        for record in &records {
+            compatible &= self
+                .database
+                .canonical_compatible(record.canonical_content_version_id)?;
+        }
+        compatible &=
+            self.verify_publication_files(&payload_source_revision, language, &durable_files)?;
+        if compatible && (written.is_empty() || entry.attempt_count > 1 || payload.run_id != run_id)
+        {
+            compatible &= self
+                .documentation
+                .check(self.repo, &payload_source_revision, &durable_files)?
+                .failures
+                .is_empty();
+        }
+        if !compatible {
+            if let Some(commit) = payload.commit.as_deref() {
+                if !self
+                    .database
+                    .publication_snapshot(repository_id, language, commit)?
+                    .is_empty()
+                {
+                    self.database.transition_publication_manifest(
+                        repository_id,
+                        language,
+                        commit,
+                        PublicationState::Superseded,
+                    )?;
+                }
+            }
+            let mut rejected = serde_json::to_value(&payload)?;
+            rejected["superseded_reason"] =
+                "document compatibility or current project checks failed".into();
+            self.database.update_outbox_payload(
+                OutboxKind::Publication,
+                entry.id,
+                &owner,
+                &rejected.to_string(),
+            )?;
+            self.database
+                .complete_outbox(OutboxKind::Publication, entry.id, &owner)?;
+            outcome.published.skipped =
+                "incompatible publication superseded; replan required".into();
+            return Ok(());
         }
         outcome.published = if let Some(commit) = payload.commit.as_deref() {
             self.database
@@ -1956,11 +2253,15 @@ impl<'a> Orchestrator<'a> {
                 })?;
                 match pr_state {
                     "merged" => {
-                        self.database.promote_merged_publication(
+                        if reconciled.pull_request.head_revision.as_deref()
+                            != Some(outcome.published.commit.as_str())
+                        {
+                            bail!("merged pull request head does not match published candidate");
+                        }
+                        self.promote_verified_publication(
                             repository_id,
                             language,
                             &outcome.published.commit,
-                            "github_merged",
                         )?;
                     }
                     "open" | "draft" => {
@@ -2221,6 +2522,7 @@ pub fn adopt_human_edit(
     database: &dyn StateStore,
     materializer: &dyn Materializer,
     git: &dyn GitPublisher,
+    documentation: &dyn DocumentationChecker,
     language: &str,
 ) -> Result<usize> {
     let repository_key = repo
@@ -2235,6 +2537,49 @@ pub fn adopt_human_edit(
     )?;
     let source_revision = git.resolve_source_revision(repo)?;
     let documents = git.discover(repo, &source_revision)?;
+    let mut adoption_files = Vec::new();
+    for document in &documents {
+        let target = target_path(repo, language, &document.path)?
+            .to_string_lossy()
+            .into_owned();
+        if database
+            .canonical_file(repository_id, language, &target)?
+            .is_none()
+        {
+            continue;
+        }
+        let bytes = materializer
+            .read(&repo.path, Path::new(&target))?
+            .with_context(|| format!("cannot read human target {target}"))?;
+        let source = parse_document(DocumentFormat::Markdown, &document.bytes)?;
+        let translated = parse_document(DocumentFormat::Markdown, &bytes)?;
+        verify_document(&source, &translated.source)
+            .with_context(|| format!("human target {target} failed validation"))?;
+        if source.units.is_empty()
+            || source.units.len() != translated.units.len()
+            || source
+                .units
+                .iter()
+                .zip(&translated.units)
+                .any(|(source, target)| {
+                    crate::domain::document::translated_unit_text(source, target).is_none()
+                })
+        {
+            bail!("human target {target} failed validation");
+        }
+        adoption_files.push(PublicationFile {
+            path: target,
+            content: bytes,
+        });
+    }
+    if !adoption_files.is_empty()
+        && !documentation
+            .check(repo, &source_revision, &adoption_files)?
+            .failures
+            .is_empty()
+    {
+        bail!("human targets failed configured documentation checks; no translations were trusted");
+    }
     let mut adopted = 0;
     for document in documents {
         let target = target_path(repo, language, &document.path)?
@@ -2243,9 +2588,12 @@ pub fn adopt_human_edit(
         let Some(canonical) = database.canonical_file(repository_id, language, &target)? else {
             continue;
         };
-        let bytes = materializer
-            .read(&repo.path, Path::new(&target))?
-            .with_context(|| format!("cannot read human target {target}"))?;
+        let bytes = adoption_files
+            .iter()
+            .find(|file| file.path == target)
+            .ok_or_else(|| anyhow!("human target {target} was not checked"))?
+            .content
+            .clone();
         let target_text = std::str::from_utf8(&bytes).context("human target is not UTF-8")?;
         let source_text =
             std::str::from_utf8(&document.bytes).context("source Markdown is not UTF-8")?;
@@ -2258,11 +2606,14 @@ pub fn adopt_human_edit(
         if source_units.len() != target_units.len() || source_units.is_empty() {
             bail!("human target {target} does not preserve the source Markdown unit structure");
         }
-        for (source_unit, target_unit) in source_units.iter().zip(target_units) {
-            validate_unit(source_unit, &target_unit.protected_source).map_err(|findings| {
-                anyhow!("human target {target} failed validation: {findings:?}")
-            })?;
-        }
+        let translations = source_units
+            .iter()
+            .zip(target_units)
+            .map(|(source, translated)| {
+                crate::domain::document::translated_unit_text(source, translated)
+                    .ok_or_else(|| anyhow!("human target {target} failed validation"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let stable_ids = source_units
             .iter()
             .enumerate()
@@ -2292,11 +2643,13 @@ pub fn adopt_human_edit(
             &document.path,
             Some(&source_revision),
             &document.content_hash,
-            "{}",
+            &serde_json::to_string(
+                &json!({"format": source_document.format, "contract": source_document.contract}),
+            )?,
         )?;
-        for (ordinal, ((source_unit, target_unit), matched)) in source_units
+        for (ordinal, ((source_unit, translated), matched)) in source_units
             .iter()
-            .zip(target_units)
+            .zip(&translations)
             .zip(matched)
             .enumerate()
         {
@@ -2304,14 +2657,14 @@ pub fn adopt_human_edit(
                 .stable_id
                 .unwrap_or_else(|| stable_ids[ordinal].clone());
             let source_hash = hash(&[source_unit.source.as_bytes()]);
-            let context = kind_name(source_unit);
+            let context = source_unit.memory_context_key(&document.path);
             let unit_id = database.upsert_unit(
                 document_id,
                 &stable_id,
                 ordinal as i64,
                 &source_unit.source,
                 &source_hash,
-                &serde_json::to_string(&json!({"kind": context}))?,
+                &unit_metadata(source_unit, &document.path),
             )?;
             database.trust_translation(TrustTranslationInput {
                 repository_id,
@@ -2319,7 +2672,7 @@ pub fn adopt_human_edit(
                 locale: language,
                 source_hash: &source_hash,
                 context_key: &context,
-                target_text: &target_unit.protected_source,
+                target_text: translated,
                 provenance: "human_adopted",
                 policy_fingerprint: &prompts::policy_fingerprint(),
             })?;

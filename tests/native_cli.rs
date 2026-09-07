@@ -598,7 +598,7 @@ repair = "fixture"
     let third_report: Value =
         serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
     assert_eq!(third.status.code(), Some(0), "{third_report}");
-    assert_eq!(third_report["totals"]["agent_calls"], 0);
+    assert_eq!(third_report["totals"]["agent_calls"], 0, "{third_report}");
     assert_eq!(third_report["totals"]["files_written"], 0);
     assert_eq!(
         third_report["languages"][0]["message"],

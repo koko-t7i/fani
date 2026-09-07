@@ -226,10 +226,24 @@ pub struct AttemptCandidateInput<'a> {
     pub provenance: TranslationProvenance,
 }
 
+#[derive(Clone, Debug)]
+pub struct TranslationCandidate {
+    pub unit_id: i64,
+    pub text: String,
+    pub provenance: crate::domain::document::UnitProvenance,
+    pub trusted: bool,
+    pub run_id: Option<String>,
+    pub invocation_key: Option<String>,
+    pub deterministic_model: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredAttempt {
     pub id: i64,
+    pub dedupe_key: String,
+    pub request_json: String,
     pub output: String,
+    pub provenance: Option<crate::domain::document::UnitProvenance>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -325,6 +339,14 @@ pub struct CanonicalFile {
     pub state: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct CanonicalSnapshot {
+    pub content_version_id: i64,
+    pub source_revision: String,
+    pub path: String,
+    pub content: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredPullRequest {
     pub external_id: String,
@@ -386,6 +408,25 @@ pub trait StateStore {
     ) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+    fn translation_candidates(
+        &self,
+        document_id: i64,
+        locale: &str,
+    ) -> Result<Vec<TranslationCandidate>>;
+    fn review_attempts(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        run_or_invocation: &str,
+    ) -> Result<Vec<RecoveredAttempt>>;
+    fn revalidate_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        candidate: &TranslationCandidate,
+    ) -> Result<()>;
+    fn retire_attempt(&self, attempt_id: i64) -> Result<()>;
+    fn quarantine_incompatible_translations(&self, document_id: i64, locale: &str) -> Result<()>;
     fn trusted_translation(
         &self,
         repository_id: i64,
@@ -550,6 +591,13 @@ pub trait StateStore {
         candidate_commit: &str,
         state: PublicationState,
     ) -> Result<()>;
+    fn publication_snapshot(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        commit: &str,
+    ) -> Result<Vec<CanonicalSnapshot>>;
+    fn canonical_compatible(&self, content_version_id: i64) -> Result<bool>;
     fn promote_merged_publication(
         &self,
         repository_id: i64,

@@ -3,8 +3,9 @@ use crate::application::ports::{
     AttemptCandidateInput, AttemptInput, AttemptReceipt, CanonicalFile, CanonicalFileInput,
     CanonicalTranslationInput, FailedAttemptContext, FindingInput, OutboxEntry, OutboxKind,
     PublicationManifestInput, PullRequestStateInput, RecoveredAttempt, StateStore,
-    StoredPullRequest, TrustTranslationInput, UnitHistory,
+    StoredPullRequest, TranslationCandidate, TrustTranslationInput, UnitHistory,
 };
+use crate::domain::document::{UnitProvenance, validate_stored_translation};
 use crate::domain::model::{CanonicalTransition, PublicationState};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -14,6 +15,171 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+fn bound_request(
+    conn: &Connection,
+    work_item_id: i64,
+    request: &str,
+    policy: &str,
+) -> Result<String> {
+    let provenance = conn.query_row(
+        "SELECT d.path,u.source_text,COALESCE(d.source_revision,''),u.context_json FROM work_items w JOIN units u ON u.id=w.unit_id JOIN documents d ON d.id=u.document_id WHERE w.id=?1",
+        [work_item_id], |row| Ok(UnitProvenance {
+            document_path: row.get(0)?, source: row.get(1)?, source_revision: row.get(2)?,
+            context_json: row.get(3)?, policy_fingerprint: policy.into(),
+        }))?;
+    let mut value: serde_json::Value = serde_json::from_str(request)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("_fani_unit".into(), serde_json::to_value(provenance)?);
+    } else {
+        bail!("stored Agent request must be an object");
+    }
+    Ok(serde_json::to_string(&value)?)
+}
+
+fn attempt_provenance(conn: &Connection, id: i64) -> Result<Option<UnitProvenance>> {
+    let (request, policy, expected_revision): (String, String, Option<String>) = conn.query_row(
+        "SELECT a.request_json,a.policy_fingerprint,json_extract(w.input_json,'$.source_revision') FROM attempts a JOIN work_items w ON w.id=a.work_item_id WHERE a.id=?1",
+        [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    let value: serde_json::Value = serde_json::from_str(&request)?;
+    if let Some(snapshot) = value.get("_fani_unit") {
+        let parsed = serde_json::from_value::<UnitProvenance>(snapshot.clone()).ok();
+        return Ok(parsed.filter(|p| {
+            p.policy_fingerprint == policy
+                && expected_revision
+                    .as_ref()
+                    .is_none_or(|rev| rev == &p.source_revision)
+        }));
+    }
+    Ok(conn.query_row(
+        "SELECT d.path,uv.source_text,uv.source_revision,uv.context_json FROM translation_versions tv JOIN unit_versions uv ON uv.id=tv.unit_version_id JOIN units u ON u.id=uv.unit_id JOIN documents d ON d.id=u.document_id WHERE tv.source_attempt_id=?1 ORDER BY tv.id LIMIT 1",
+        [id], |row| Ok(UnitProvenance { document_path: row.get(0)?, source: row.get(1)?, source_revision: row.get(2)?, context_json: row.get(3)?, policy_fingerprint: policy.clone() }))
+        .optional()?.filter(|p| expected_revision.as_ref().is_none_or(|rev| rev == &p.source_revision)))
+}
+
+fn checked_candidate_text(
+    conn: &Connection,
+    unit_id: i64,
+    attempt_id: i64,
+    text: String,
+) -> Result<Option<String>> {
+    let Some(bound) = attempt_provenance(conn, attempt_id)? else {
+        return Ok(None);
+    };
+    let current: UnitProvenance = conn.query_row("SELECT d.path,u.source_text,COALESCE(d.source_revision,''),u.context_json FROM units u JOIN documents d ON d.id=u.document_id WHERE u.id=?1", [unit_id], |row| Ok(UnitProvenance { document_path: row.get(0)?, source: row.get(1)?, source_revision: row.get(2)?, context_json: row.get(3)?, policy_fingerprint: bound.policy_fingerprint.clone() }))?;
+    let Some(unit) = crate::domain::document::stored_unit(&current) else {
+        return Ok(None);
+    };
+    let output: Option<String> = conn.query_row(
+        "SELECT json_extract(response_json,'$.output') FROM attempts WHERE id=?1",
+        [attempt_id],
+        |row| row.get(0),
+    )?;
+    Ok((output.as_deref() == Some(text.as_str())
+        && crate::domain::document::validate_provenance(
+            &current.document_path,
+            &unit,
+            &bound,
+            &text,
+        )
+        .is_ok())
+    .then_some(text))
+}
+
+fn metadata_from_key(key: &str, path: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(key).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 4 || object.get("document")?.as_str()? != path {
+        return None;
+    }
+    Some(
+        serde_json::json!({"kind": object.get("kind")?, "context": object.get("context")?,
+        "contract": object.get("contract")?, "memory_key": key})
+        .to_string(),
+    )
+}
+
+fn version_provenance(conn: &Connection, version_id: i64) -> Result<UnitProvenance> {
+    let (mut provenance, attempt): (UnitProvenance, Option<i64>) = conn.query_row(
+        "SELECT d.path,uv.source_text,uv.source_revision,uv.context_json,tv.policy_fingerprint,tv.source_attempt_id FROM translation_versions tv JOIN unit_versions uv ON uv.id=tv.unit_version_id JOIN units u ON u.id=uv.unit_id JOIN documents d ON d.id=u.document_id WHERE tv.id=?1",
+        [version_id], |row| Ok((UnitProvenance { document_path: row.get(0)?, source: row.get(1)?, source_revision: row.get(2)?, context_json: row.get(3)?, policy_fingerprint: row.get(4)? }, row.get(5)?)))?;
+    let version = provenance.clone();
+    if let Some(id) = attempt {
+        let snapshot = attempt_provenance(conn, id)?
+            .ok_or_else(|| anyhow!("translation has incompatible attempt provenance"))?;
+        if snapshot.source != provenance.source
+            || snapshot.document_path != provenance.document_path
+        {
+            bail!("translation version source differs from attempt provenance");
+        }
+        let output_matches: bool = conn.query_row(
+            "SELECT COALESCE(json_extract(a.response_json,'$.output')=tv.target_text,0) FROM translation_versions tv JOIN attempts a ON a.id=tv.source_attempt_id WHERE tv.id=?1",
+            [version_id], |row| row.get(0))?;
+        if !output_matches {
+            bail!("translation version differs from durable attempt output");
+        }
+        provenance = snapshot;
+    }
+    let memory: Option<(String,String)> = conn.query_row("SELECT context_key,provenance FROM translation_memory_entries WHERE translation_version_id=?1 ORDER BY id LIMIT 1", [version_id], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+    if let Some((key, audit)) = memory {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&audit) {
+            if let Some(snapshot) = value.get("_fani_unit") {
+                let bound: UnitProvenance = serde_json::from_value(snapshot.clone())?;
+                let unit = crate::domain::document::stored_unit(&bound)
+                    .ok_or_else(|| anyhow!("invalid revalidated parser snapshot"))?;
+                let text: String = conn.query_row(
+                    "SELECT target_text FROM translation_versions WHERE id=?1",
+                    [version_id],
+                    |row| row.get(0),
+                )?;
+                if bound.source != version.source
+                    || bound.source_revision != version.source_revision
+                    || bound.document_path != version.document_path
+                    || bound.policy_fingerprint != version.policy_fingerprint
+                    || crate::domain::document::validate_provenance(
+                        &bound.document_path,
+                        &unit,
+                        &provenance,
+                        &text,
+                    )
+                    .is_err()
+                {
+                    bail!("revalidated snapshot differs from immutable translation provenance");
+                }
+                provenance = bound;
+            }
+        }
+        bind_memory_metadata(&mut provenance, &key)?;
+    }
+    Ok(provenance)
+}
+
+fn current_memory_key(provenance: &UnitProvenance) -> Result<String> {
+    let unit = crate::domain::document::stored_unit(provenance)
+        .ok_or_else(|| anyhow!("incompatible stored source unit"))?;
+    Ok(unit.memory_context_key(&provenance.document_path))
+}
+
+fn bind_memory_metadata(provenance: &mut UnitProvenance, key: &str) -> Result<()> {
+    if crate::domain::document::compatible_metadata(provenance).is_none() {
+        bail!("incompatible immutable unit context");
+    }
+    if let Some(metadata) = metadata_from_key(key, &provenance.document_path) {
+        let old: serde_json::Value = serde_json::from_str(&provenance.context_json)?;
+        let mut new: serde_json::Value = serde_json::from_str(&metadata)?;
+        if let Some(source) = old.get("parser_source") {
+            new["parser_source"] = source.clone();
+        }
+        provenance.context_json = new.to_string();
+    } else {
+        let metadata = crate::domain::document::compatible_metadata(provenance)
+            .ok_or_else(|| anyhow!("incompatible stored memory context"))?;
+        if key != metadata.kind.as_str() {
+            bail!("trusted memory context has a different document identity or contract");
+        }
+    }
+    Ok(())
+}
 
 const APPLICATION_ID: i64 = 0x4641_4e49;
 const SCHEMA_VERSION: i64 = 2;
@@ -553,11 +719,19 @@ impl Database {
     pub fn unit_history(&self, document_id: i64, locale: &str) -> Result<Vec<UnitHistory>> {
         let conn = self.connect()?;
         let mut statement = conn.prepare(
-            r#"SELECT u.id,u.unit_key,u.ordinal,u.source_text,u.source_hash,u.context_json,
-                      t.target_text,CASE WHEN t.id IS NULL THEN 0 ELSE 1 END
+            r#"SELECT u.id,u.unit_key,u.ordinal,COALESCE(uv.source_text,u.source_text),
+                      COALESCE(uv.source_hash,u.source_hash),COALESCE(uv.context_json,u.context_json),
+                      CASE WHEN uv.id IS NOT NULL THEN t.target_text END,
+                      CASE WHEN uv.id IS NULL THEN 0 ELSE 1 END
                FROM units u
-               LEFT JOIN translation_memory_entries t
-                 ON t.unit_id=u.id AND t.locale=?2 AND t.tier='trusted' AND t.superseded_at IS NULL
+               LEFT JOIN translation_memory_entries t ON t.id=(
+                 SELECT m.id FROM translation_memory_entries m WHERE m.unit_id=u.id AND m.locale=?2
+                   AND m.tier='trusted' AND m.superseded_at IS NULL ORDER BY m.id DESC LIMIT 1)
+               LEFT JOIN translation_versions tv ON tv.id=t.translation_version_id
+               LEFT JOIN unit_versions uv ON uv.id=COALESCE(tv.unit_version_id,
+                 (SELECT v.id FROM unit_versions v WHERE v.unit_id=t.unit_id AND v.source_hash=t.source_hash
+                    AND (t.source_revision='' OR v.source_revision=t.source_revision) ORDER BY v.id LIMIT 1))
+                 AND uv.source_hash=t.source_hash
                WHERE u.document_id=?1 AND u.active=1 ORDER BY u.ordinal,u.id"#,
         )?;
         let rows = statement.query_map(params![document_id, locale], |row| {
@@ -576,63 +750,52 @@ impl Database {
     }
 
     pub fn trust_translation(&self, input: TrustTranslationInput<'_>) -> Result<i64> {
-        let TrustTranslationInput {
-            repository_id,
-            unit_id,
-            locale,
-            source_hash,
-            context_key,
-            target_text,
-            provenance,
-            policy_fingerprint,
-        } = input;
-        require_fingerprint(policy_fingerprint, "translation policy")?;
+        require_fingerprint(input.policy_fingerprint, "translation policy")?;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let updated = tx.execute(
-            r#"UPDATE translation_memory_entries
-               SET unit_id=?2,target_text=?6,provenance=?7,policy_fingerprint=?8,
-                   created_at=?9,superseded_at=NULL
-               WHERE repository_id=?1 AND locale=?3 AND source_hash=?4 AND context_key=?5
-                 AND tier='trusted' AND superseded_at IS NULL"#,
-            params![
-                repository_id,
-                unit_id,
-                locale,
-                source_hash,
-                context_key,
-                target_text,
-                provenance,
-                policy_fingerprint,
-                now_ms()
-            ],
-        )?;
-        if updated == 0 {
-            tx.execute(
-                r#"INSERT INTO translation_memory_entries(
-                       repository_id,unit_id,locale,source_hash,context_key,target_text,tier,
-                       provenance,policy_fingerprint,created_at)
-                   VALUES (?1,?2,?3,?4,?5,?6,'trusted',?7,?8,?9)"#,
-                params![
-                    repository_id,
-                    unit_id,
-                    locale,
-                    source_hash,
-                    context_key,
-                    target_text,
-                    provenance,
-                    policy_fingerprint,
-                    now_ms()
-                ],
-            )?;
+        let unit_id = input
+            .unit_id
+            .ok_or_else(|| anyhow!("trusted memory requires a source unit"))?;
+        let (unit_version_id, mut bound): (i64, UnitProvenance) = tx.query_row(
+            "SELECT uv.id,d.path,uv.source_text,uv.source_revision,uv.context_json FROM unit_versions uv JOIN units u ON u.id=uv.unit_id JOIN documents d ON d.id=u.document_id WHERE u.id=?1 AND d.repository_id=?2 AND uv.source_hash=?3 ORDER BY uv.id DESC LIMIT 1",
+            params![unit_id,input.repository_id,input.source_hash], |row| Ok((row.get(0)?, UnitProvenance {
+                document_path: row.get(1)?, source: row.get(2)?, source_revision: row.get(3)?, context_json: row.get(4)?, policy_fingerprint: input.policy_fingerprint.into(),
+            })))?;
+        let original = crate::domain::document::compatible_metadata(&bound)
+            .ok_or_else(|| anyhow!("incompatible immutable unit context"))?;
+        if original.parser_source.is_none() {
+            let current: Option<String> = tx.query_row("SELECT u.context_json FROM units u JOIN documents d ON d.id=u.document_id WHERE u.id=?1 AND u.source_text=?2 AND d.source_revision=?3", params![unit_id,bound.source,bound.source_revision], |row| row.get(0)).optional()?;
+            if let Some(current) = current {
+                let mut snapshot = bound.clone();
+                snapshot.context_json = current;
+                if crate::domain::document::compatible_metadata(&snapshot)
+                    .is_some_and(|metadata| metadata.kind == original.kind)
+                {
+                    bound = snapshot;
+                }
+            }
         }
-        let id = tx.query_row(
-            r#"SELECT id FROM translation_memory_entries
-               WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4
-                 AND tier='trusted' AND superseded_at IS NULL"#,
-            params![repository_id, locale, source_hash, context_key],
-            |row| row.get(0),
-        )?;
+        bind_memory_metadata(&mut bound, input.context_key)?;
+        if !validate_stored_translation(&bound, input.target_text) {
+            bail!("trusted translation failed document compatibility validation");
+        }
+        let key = current_memory_key(&bound)?;
+        if let Some(id) = tx.query_row(
+            "SELECT id FROM translation_memory_entries WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4 AND target_text=?5 AND tier='trusted' AND superseded_at IS NULL",
+            params![input.repository_id,input.locale,input.source_hash,key,input.target_text], |row| row.get(0)).optional()? {
+            return Ok(id);
+        }
+        let now = now_ms();
+        tx.execute("UPDATE translation_memory_entries SET tier='history',superseded_at=?5 WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4 AND tier='trusted' AND superseded_at IS NULL",
+            params![input.repository_id,input.locale,input.source_hash,key,now])?;
+        tx.execute("INSERT INTO translation_versions(unit_version_id,locale,target_text,target_hash,freshness,provenance,validation_state,review_state,publication_state,policy_fingerprint,created_at) VALUES (?1,?2,?3,?4,'exact','trusted_tm','passed','approved','candidate',?5,?6)",
+            params![unit_version_id,input.locale,input.target_text,migration_checksum(input.target_text),input.policy_fingerprint,now])?;
+        let version_id = tx.last_insert_rowid();
+        let audit =
+            serde_json::json!({"origin": input.provenance, "_fani_unit": bound}).to_string();
+        tx.execute("INSERT INTO translation_memory_entries(repository_id,unit_id,translation_version_id,locale,source_hash,source_revision,context_key,target_text,tier,provenance,policy_fingerprint,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'trusted',?9,?10,?11)",
+            params![input.repository_id,unit_id,version_id,input.locale,input.source_hash,bound.source_revision,key,input.target_text,audit,input.policy_fingerprint,now])?;
+        let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok(id)
     }
@@ -714,6 +877,12 @@ impl Database {
     pub fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt> {
         require_attempt_provenance(&input)?;
         require_json(input.request_json)?;
+        let request_json = bound_request(
+            &self.connect()?,
+            input.work_item_id,
+            input.request_json,
+            input.policy_fingerprint,
+        )?;
         if let Some(response) = input.response_json {
             require_json(response)?;
         }
@@ -759,7 +928,7 @@ impl Database {
                 input.prompt_hash,
                 input.policy_fingerprint,
                 input.status,
-                input.request_json,
+                request_json,
                 input.response_json,
                 input.error,
                 now
@@ -834,10 +1003,17 @@ impl Database {
             let output = value
                 .get("output")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("durable Agent response has no output string"))?;
+                .unwrap_or("");
             Ok(RecoveredAttempt {
                 id,
+                dedupe_key: dedupe_key.to_owned(),
                 output: output.to_owned(),
+                request_json: self.connect()?.query_row(
+                    "SELECT request_json FROM attempts WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )?,
+                provenance: attempt_provenance(&self.connect()?, id)?,
             })
         })
         .transpose()
@@ -853,6 +1029,12 @@ impl Database {
         require_fingerprint(input.policy_fingerprint, "translation policy")?;
         require_attempt_provenance(&input.attempt)?;
         require_json(input.attempt.request_json)?;
+        let request_json = bound_request(
+            &self.connect()?,
+            input.attempt.work_item_id,
+            input.attempt.request_json,
+            input.attempt.policy_fingerprint,
+        )?;
         let response = input
             .attempt
             .response_json
@@ -906,7 +1088,7 @@ impl Database {
                     input.attempt.prompt_version,
                     input.attempt.prompt_hash,
                     input.attempt.policy_fingerprint,
-                    input.attempt.request_json,
+                    request_json,
                     response,
                     now,
                 ],
@@ -941,7 +1123,7 @@ impl Database {
             String,
         ) = tx.query_row(
             r#"SELECT uv.id,d.repository_id,uv.source_hash,uv.source_revision,
-                          COALESCE(json_extract(uv.context_json,'$.kind'),'')
+                          COALESCE(json_extract(u.context_json,'$.memory_key'),json_extract(u.context_json,'$.kind'),'')
                    FROM units u
                    JOIN documents d ON d.id=u.document_id
                    JOIN unit_versions uv ON uv.unit_id=u.id AND uv.source_hash=u.source_hash
@@ -1096,6 +1278,27 @@ impl Database {
             |row| row.get(0),
         )?;
         tx.commit()?;
+        if let Some(attempt) = source_attempt_id {
+            if let Some(provenance) = attempt_provenance(&self.connect()?, attempt)? {
+                if crate::domain::document::compatible_metadata(&provenance)
+                    .is_some_and(|metadata| metadata.parser_source.is_none())
+                {
+                    self.revalidate_candidate(
+                        unit_id,
+                        locale,
+                        &TranslationCandidate {
+                            unit_id,
+                            text: target_text.into(),
+                            provenance,
+                            trusted: false,
+                            run_id: None,
+                            invocation_key: None,
+                            deterministic_model: None,
+                        },
+                    )?;
+                }
+            }
+        }
         Ok(id)
     }
 
@@ -1550,7 +1753,7 @@ impl Database {
             let unit_version: (i64, String, String) = tx
                 .query_row(
                     r#"SELECT uv.id,uv.source_hash,
-                              COALESCE(json_extract(uv.context_json,'$.kind'),'')
+                              COALESCE(json_extract(uv.context_json,'$.memory_key'),json_extract(uv.context_json,'$.kind'),'')
                        FROM unit_versions uv
                        JOIN units u ON u.id=uv.unit_id
                        JOIN documents d ON d.id=u.document_id
@@ -1573,8 +1776,9 @@ impl Database {
                     r#"SELECT tv.id
                        FROM translation_versions tv
                        WHERE tv.unit_version_id=?1 AND tv.locale=?2 AND tv.target_text=?3
-                       ORDER BY tv.id DESC LIMIT 1"#,
-                    params![unit_version.0, locale, translation.target_text],
+                         AND tv.superseded_at IS NULL AND tv.validation_state='passed'
+                       ORDER BY CASE WHEN EXISTS(SELECT 1 FROM canonical_file_translations cft WHERE cft.canonical_content_version_id=?4 AND cft.translation_version_id=tv.id) THEN 0 ELSE 1 END,tv.id DESC LIMIT 1"#,
+                    params![unit_version.0, locale, translation.target_text, content_version_id],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -1623,6 +1827,10 @@ impl Database {
                 )?;
                 tx.last_insert_rowid()
             };
+            let bound = version_provenance(&tx, translation_version_id)?;
+            if !validate_stored_translation(&bound, translation.target_text) {
+                bail!("canonical translation failed document compatibility validation");
+            }
             translation_version_ids.push(translation_version_id);
         }
         if !translation_version_ids.is_empty() {
@@ -1644,7 +1852,23 @@ impl Database {
                     )?;
                 }
             } else if stored != translation_version_ids {
-                bail!("canonical content translation set conflicts with immutable durable links");
+                let mut statement = tx.prepare("SELECT cft.translation_version_id FROM canonical_file_translations cft JOIN translation_versions tv ON tv.id=cft.translation_version_id WHERE cft.canonical_content_version_id=?1 AND tv.superseded_at IS NULL ORDER BY cft.translation_version_id")?;
+                let active = statement
+                    .query_map([content_version_id], |row| row.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if active.len() == stored.len()
+                    || active
+                        .iter()
+                        .any(|id| !translation_version_ids.contains(id))
+                {
+                    bail!(
+                        "canonical content translation set conflicts with immutable durable links"
+                    );
+                }
+                // Revalidated identical bytes retain quarantined links as history.
+                for id in &translation_version_ids {
+                    tx.execute("INSERT OR IGNORE INTO canonical_file_translations(canonical_content_version_id,translation_version_id) VALUES (?1,?2)", params![content_version_id,id])?;
+                }
             }
         }
         tx.commit()?;
@@ -1927,6 +2151,46 @@ impl Database {
         Ok(())
     }
 
+    pub fn canonical_compatible(&self, content_version_id: i64) -> Result<bool> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare("SELECT tv.id,tv.target_text FROM canonical_file_translations cft JOIN translation_versions tv ON tv.id=cft.translation_version_id WHERE cft.canonical_content_version_id=?1 AND tv.superseded_at IS NULL")?;
+        let versions = statement
+            .query_map([content_version_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if versions.is_empty() && conn.query_row("SELECT COUNT(*) FROM canonical_file_translations WHERE canonical_content_version_id=?1", [content_version_id], |row| row.get::<_,i64>(0))? > 0 { return Ok(false); }
+        for (id, text) in versions {
+            let Ok(provenance) = version_provenance(&conn, id) else {
+                return Ok(false);
+            };
+            if !validate_stored_translation(&provenance, &text) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn publication_snapshot(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        commit: &str,
+    ) -> Result<Vec<crate::application::ports::CanonicalSnapshot>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare("SELECT cv.id,cv.source_revision,cf.path,cv.content FROM publication_manifests pm JOIN publication_manifest_files pmf ON pmf.manifest_id=pm.id JOIN canonical_content_versions cv ON cv.id=pmf.canonical_content_version_id JOIN canonical_files cf ON cf.id=cv.canonical_file_id WHERE pm.repository_id=?1 AND pm.locale=?2 AND pm.candidate_commit=?3 AND pm.state<>'superseded' ORDER BY cf.path")?;
+        Ok(statement
+            .query_map(params![repository_id, locale, commit], |row| {
+                Ok(crate::application::ports::CanonicalSnapshot {
+                    content_version_id: row.get(0)?,
+                    source_revision: row.get(1)?,
+                    path: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn promote_merged_publication(
         &self,
         repository_id: i64,
@@ -1944,10 +2208,10 @@ impl Database {
             )
             .optional()?
             .ok_or_else(|| anyhow!("verified merged commit has no publication manifest"))?;
-        let translations = {
+        let mut translations = {
             let mut statement = tx.prepare(
                 r#"SELECT DISTINCT tv.id,uv.unit_id,uv.source_hash,uv.source_revision,
-                          COALESCE(json_extract(uv.context_json,'$.kind'),''),tv.target_text,
+                          COALESCE(json_extract(uv.context_json,'$.memory_key'),json_extract(uv.context_json,'$.kind'),''),tv.target_text,
                           tv.policy_fingerprint
                    FROM publication_manifest_files pmf
                    JOIN canonical_file_translations cft
@@ -1956,7 +2220,7 @@ impl Database {
                    JOIN unit_versions uv ON uv.id=tv.unit_version_id
                    JOIN units u ON u.id=uv.unit_id
                    JOIN documents d ON d.id=u.document_id
-                   WHERE pmf.manifest_id=?1 AND d.repository_id=?2 AND tv.locale=?3"#,
+                   WHERE pmf.manifest_id=?1 AND d.repository_id=?2 AND tv.locale=?3 AND tv.superseded_at IS NULL AND tv.validation_state='passed'"#,
             )?;
             statement
                 .query_map(params![manifest_id, repository_id, locale], |row| {
@@ -1975,6 +2239,21 @@ impl Database {
         if translations.is_empty() {
             bail!("publication manifest contains no exact translation versions");
         }
+        for translation in &mut translations {
+            let bound = version_provenance(&tx, translation.0);
+            if !bound
+                .as_ref()
+                .is_ok_and(|bound| validate_stored_translation(bound, &translation.5))
+            {
+                tx.execute(
+                    "UPDATE publication_manifests SET state='superseded' WHERE id=?1",
+                    [manifest_id],
+                )?;
+                tx.commit()?;
+                return Ok(0);
+            }
+            translation.4 = current_memory_key(&bound?)?;
+        }
         let now = now_ms();
         for (
             version_id,
@@ -1986,6 +2265,8 @@ impl Database {
             fingerprint,
         ) in &translations
         {
+            let provenance = serde_json::json!({"origin": provenance, "_fani_unit": version_provenance(&tx, *version_id)?}).to_string();
+            tx.execute("UPDATE translation_memory_entries SET tier='history',superseded_at=?7 WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4 AND tier='trusted' AND superseded_at IS NULL AND (translation_version_id IS NOT ?5 OR target_text<>?6)", params![repository_id,locale,source_hash,context_key,version_id,target_text,now])?;
             let updated = tx.execute(
                 r#"UPDATE translation_memory_entries
                    SET unit_id=?2,translation_version_id=?3,source_revision=?6,target_text=?8,provenance=?9,
@@ -2029,7 +2310,7 @@ impl Database {
             }
         }
         tx.execute(
-            "UPDATE translation_versions SET publication_state='merged',review_state='approved' WHERE id IN (SELECT cft.translation_version_id FROM publication_manifest_files pmf JOIN canonical_file_translations cft ON cft.canonical_content_version_id=pmf.canonical_content_version_id WHERE pmf.manifest_id=?1)",
+            "UPDATE translation_versions SET publication_state='merged',review_state='approved' WHERE superseded_at IS NULL AND validation_state='passed' AND id IN (SELECT cft.translation_version_id FROM publication_manifest_files pmf JOIN canonical_file_translations cft ON cft.canonical_content_version_id=pmf.canonical_content_version_id WHERE pmf.manifest_id=?1)",
             [manifest_id],
         )?;
         tx.execute(
@@ -2170,11 +2451,153 @@ impl Database {
         source_hash: &str,
         context_key: &str,
     ) -> Result<Option<String>> {
-        Ok(self.connect()?.query_row(
-            "SELECT target_text FROM translation_memory_entries WHERE repository_id=?1 AND locale=?2 AND source_hash=?3 AND context_key=?4 AND tier='trusted' AND superseded_at IS NULL",
-            params![repository_id, locale, source_hash, context_key],
-            |row| row.get(0),
-        ).optional()?)
+        let row: Option<(i64, i64, String)> = self.connect()?.query_row(
+            "SELECT u.document_id,t.unit_id,t.target_text FROM translation_memory_entries t JOIN units u ON u.id=t.unit_id WHERE t.repository_id=?1 AND t.locale=?2 AND t.source_hash=?3 AND t.context_key=?4 AND t.tier='trusted' AND t.superseded_at IS NULL",
+            params![repository_id,locale,source_hash,context_key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        let Some((document_id, unit_id, text)) = row else {
+            return Ok(None);
+        };
+        Ok(self
+            .translation_candidates(document_id, locale)?
+            .into_iter()
+            .find(|candidate| {
+                candidate.trusted
+                    && candidate.unit_id == unit_id
+                    && candidate.text == text
+                    && current_memory_key(&candidate.provenance).ok().as_deref()
+                        == Some(context_key)
+                    && validate_stored_translation(&candidate.provenance, &candidate.text)
+            })
+            .map(|candidate| candidate.text))
+    }
+
+    pub fn translation_candidates(
+        &self,
+        document_id: i64,
+        locale: &str,
+    ) -> Result<Vec<TranslationCandidate>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            r#"SELECT t.unit_id,t.target_text,t.tier,d.path,uv.source_text,uv.source_revision,
+                      uv.context_json,t.policy_fingerprint,w.run_id,r.invocation_key,
+                      CASE WHEN a.agent='fani' AND a.provider='deterministic' AND a.adapter='native' THEN a.model END,
+                      a.id,tv.id,t.context_key
+               FROM (
+                 SELECT id,unit_id,target_text,tier,policy_fingerprint,translation_version_id,locale,superseded_at,source_hash,source_revision,context_key
+                 FROM translation_memory_entries
+                 UNION ALL
+                 SELECT -tv.id,uv.unit_id,tv.target_text,'candidate',tv.policy_fingerprint,tv.id,tv.locale,tv.superseded_at,uv.source_hash,uv.source_revision,
+                        COALESCE(json_extract(uv.context_json,'$.memory_key'),json_extract(uv.context_json,'$.kind'),'')
+                 FROM translation_versions tv JOIN unit_versions uv ON uv.id=tv.unit_version_id
+                 WHERE tv.source_attempt_id IS NOT NULL
+                   AND NOT EXISTS(SELECT 1 FROM translation_memory_entries m WHERE m.translation_version_id=tv.id AND m.superseded_at IS NULL)
+               ) t
+               JOIN units u ON u.id=t.unit_id
+               JOIN documents d ON d.id=u.document_id
+               LEFT JOIN translation_versions tv ON tv.id=t.translation_version_id
+               JOIN unit_versions uv ON uv.id=COALESCE(tv.unit_version_id,
+                 (SELECT v.id FROM unit_versions v WHERE v.unit_id=t.unit_id AND v.source_hash=t.source_hash
+                   AND (t.source_revision='' OR v.source_revision=t.source_revision) ORDER BY v.id LIMIT 1))
+               LEFT JOIN attempts a ON a.id=tv.source_attempt_id
+               LEFT JOIN work_items w ON w.id=a.work_item_id
+               LEFT JOIN runs r ON r.id=w.run_id
+               WHERE d.id=?1 AND t.locale=?2 AND t.superseded_at IS NULL
+                 AND t.source_hash=uv.source_hash AND uv.unit_id=t.unit_id
+                 AND (tv.id IS NULL OR (tv.locale=t.locale AND tv.target_text=t.target_text AND tv.superseded_at IS NULL))
+                 AND (t.tier='trusted' OR (t.tier='candidate' AND a.status='succeeded'
+                   AND EXISTS(SELECT 1 FROM canonical_candidates c WHERE c.source_attempt_id=a.id AND c.selected=1 AND c.target_text=t.target_text)))
+               ORDER BY CASE t.tier WHEN 'trusted' THEN 0 ELSE 1 END,t.id DESC"#)?;
+        let rows = statement
+            .query_map(params![document_id, locale], |row| {
+                Ok((
+                    TranslationCandidate {
+                        unit_id: row.get(0)?,
+                        text: row.get(1)?,
+                        trusted: row.get::<_, String>(2)? == "trusted",
+                        provenance: UnitProvenance {
+                            document_path: row.get(3)?,
+                            source: row.get(4)?,
+                            source_revision: row.get(5)?,
+                            context_json: row.get(6)?,
+                            policy_fingerprint: row.get(7)?,
+                        },
+                        run_id: row.get(8)?,
+                        invocation_key: row.get(9)?,
+                        deterministic_model: row.get(10)?,
+                    },
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, String>(13)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut candidates = Vec::new();
+        for (mut candidate, _attempt_id, version_id, key) in rows {
+            if let Some(id) = version_id {
+                let Ok(snapshot) = version_provenance(&conn, id) else {
+                    continue;
+                };
+                if snapshot.source != candidate.provenance.source
+                    || snapshot.document_path != candidate.provenance.document_path
+                {
+                    continue;
+                }
+                candidate.provenance = snapshot;
+            }
+            let Some(metadata) =
+                crate::domain::document::compatible_metadata(&candidate.provenance)
+            else {
+                continue;
+            };
+            if key != metadata.kind.as_str()
+                && metadata.memory_key.as_deref() != Some(key.as_str())
+                && current_memory_key(&candidate.provenance).ok().as_deref() != Some(key.as_str())
+            {
+                continue;
+            }
+            candidates.push(candidate);
+        }
+        Ok(candidates)
+    }
+
+    pub fn quarantine_incompatible_translations(
+        &self,
+        document_id: i64,
+        locale: &str,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let versions = {
+            let mut statement = tx.prepare("SELECT tv.id,tv.target_text FROM translation_versions tv JOIN unit_versions uv ON uv.id=tv.unit_version_id JOIN units u ON u.id=uv.unit_id WHERE u.document_id=?1 AND tv.locale=?2 AND tv.superseded_at IS NULL")?;
+            statement
+                .query_map(params![document_id, locale], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, text) in versions {
+            if version_provenance(&tx, id)
+                .as_ref()
+                .is_ok_and(|bound| validate_stored_translation(bound, &text))
+            {
+                continue;
+            }
+            tx.execute("UPDATE translation_memory_entries SET tier='history',superseded_at=?2 WHERE translation_version_id=?1 AND superseded_at IS NULL", params![id,now_ms()])?;
+            tx.execute("UPDATE translation_versions SET validation_state='quarantined',superseded_at=?2 WHERE id=?1", params![id,now_ms()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn retire_attempt(&self, attempt_id: i64) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE attempts SET dedupe_key=dedupe_key||':superseded:'||id,status='cancelled',error='stored output rejected by current document contract' WHERE id=?1 AND status='succeeded'", [attempt_id])?;
+        tx.execute("UPDATE canonical_candidates SET selected=0,candidate_key=candidate_key||':superseded:'||id WHERE source_attempt_id=?1", [attempt_id])?;
+        tx.execute("UPDATE translation_memory_entries SET tier='history',superseded_at=?2 WHERE translation_version_id IN (SELECT id FROM translation_versions WHERE source_attempt_id=?1) AND superseded_at IS NULL", params![attempt_id,now_ms()])?;
+        tx.execute("UPDATE translation_versions SET validation_state='quarantined',superseded_at=?2 WHERE source_attempt_id=?1", params![attempt_id,now_ms()])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn selected_candidate(&self, unit_id: i64, locale: &str) -> Result<Option<String>> {
@@ -2194,10 +2617,9 @@ impl Database {
         deterministic_repair_version: &str,
     ) -> Result<Option<String>> {
         require_fingerprint(policy_fingerprint, "translation policy")?;
-        Ok(self
-            .connect()?
-            .query_row(
-                r#"SELECT c.target_text
+        let conn = self.connect()?;
+        let row = conn.query_row(
+                r#"SELECT c.target_text,a.id
                    FROM canonical_candidates c
                    JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
                    JOIN work_items w ON w.id=a.work_item_id
@@ -2211,9 +2633,13 @@ impl Database {
                     policy_fingerprint,
                     deterministic_repair_version
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)),
             )
-            .optional()?)
+            .optional()?;
+        match row {
+            Some((text, id)) => checked_candidate_text(&conn, unit_id, id, text),
+            None => Ok(None),
+        }
     }
 
     pub fn recoverable_invocation_candidate(
@@ -2225,10 +2651,9 @@ impl Database {
         deterministic_repair_version: &str,
     ) -> Result<Option<String>> {
         require_fingerprint(policy_fingerprint, "translation policy")?;
-        Ok(self
-            .connect()?
-            .query_row(
-                r#"SELECT c.target_text
+        let conn = self.connect()?;
+        let row = conn.query_row(
+                r#"SELECT c.target_text,a.id
                    FROM canonical_candidates c
                    JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
                    JOIN work_items w ON w.id=a.work_item_id
@@ -2243,9 +2668,13 @@ impl Database {
                     policy_fingerprint,
                     deterministic_repair_version
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)),
             )
-            .optional()?)
+            .optional()?;
+        match row {
+            Some((text, id)) => checked_candidate_text(&conn, unit_id, id, text),
+            None => Ok(None),
+        }
     }
 
     pub fn recoverable_unit_candidate(
@@ -2256,10 +2685,9 @@ impl Database {
         deterministic_repair_version: &str,
     ) -> Result<Option<String>> {
         require_fingerprint(policy_fingerprint, "translation policy")?;
-        Ok(self
-            .connect()?
-            .query_row(
-                r#"SELECT c.target_text
+        let conn = self.connect()?;
+        let row = conn.query_row(
+                r#"SELECT c.target_text,a.id
                    FROM canonical_candidates c
                    JOIN attempts a ON a.id=c.source_attempt_id AND a.status='succeeded'
                    JOIN work_items w ON w.id=a.work_item_id
@@ -2272,9 +2700,13 @@ impl Database {
                     policy_fingerprint,
                     deterministic_repair_version
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)),
             )
-            .optional()?)
+            .optional()?;
+        match row {
+            Some((text, id)) => checked_candidate_text(&conn, unit_id, id, text),
+            None => Ok(None),
+        }
     }
 
     pub fn upsert_canonical_file(&self, input: CanonicalFileInput<'_>) -> Result<i64> {
@@ -2512,6 +2944,86 @@ impl StateStore for Database {
         content_hash: &str,
     ) -> Result<Vec<String>> {
         Database::unchanged_document_unit_keys(self, repository_id, path, content_hash)
+    }
+
+    fn translation_candidates(
+        &self,
+        document_id: i64,
+        locale: &str,
+    ) -> Result<Vec<TranslationCandidate>> {
+        Database::translation_candidates(self, document_id, locale)
+    }
+
+    fn review_attempts(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        run_or_invocation: &str,
+    ) -> Result<Vec<RecoveredAttempt>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare("SELECT a.work_item_id,a.dedupe_key FROM attempts a JOIN work_items w ON w.id=a.work_item_id JOIN runs r ON r.id=w.run_id WHERE w.unit_id=?1 AND w.locale=?2 AND (r.id=?3 OR r.invocation_key=?3) AND a.status='succeeded' AND (a.dedupe_key LIKE '%:revision' OR a.dedupe_key LIKE '%:proofread')")?;
+        let keys = statement
+            .query_map(params![unit_id, locale, run_or_invocation], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut receipts = Vec::new();
+        for (work, key) in keys {
+            if let Some(receipt) = self.successful_attempt(work, &key)? {
+                receipts.push(receipt);
+            }
+        }
+        Ok(receipts)
+    }
+
+    fn revalidate_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        candidate: &TranslationCandidate,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (version_id, source_hash, bound): (i64,String,UnitProvenance) = tx.query_row(
+            "SELECT uv.id,uv.source_hash,d.path,uv.source_text,uv.source_revision,u.context_json FROM units u JOIN documents d ON d.id=u.document_id JOIN unit_versions uv ON uv.unit_id=u.id AND uv.source_revision=d.source_revision AND uv.source_hash=u.source_hash AND uv.source_text=u.source_text WHERE u.id=?1",
+            [unit_id], |row| Ok((row.get(0)?,row.get(1)?,UnitProvenance { document_path:row.get(2)?,source:row.get(3)?,source_revision:row.get(4)?,context_json:row.get(5)?,policy_fingerprint:candidate.provenance.policy_fingerprint.clone() })))?;
+        let unit = crate::domain::document::stored_unit(&bound)
+            .ok_or_else(|| anyhow!("current source has no parser snapshot"))?;
+        crate::domain::document::validate_provenance(
+            &bound.document_path,
+            &unit,
+            &candidate.provenance,
+            &candidate.text,
+        )
+        .map_err(|_| anyhow!("legacy candidate failed current validation"))?;
+        let attempt: i64 = tx.query_row("SELECT a.id FROM canonical_candidates c JOIN attempts a ON a.id=c.source_attempt_id WHERE c.unit_id=?1 AND c.locale=?2 AND c.selected=1 AND c.target_text=?3 AND a.status='succeeded' AND json_extract(a.response_json,'$.output')=c.target_text", params![unit_id,locale,candidate.text], |row| row.get(0))?;
+        let original = attempt_provenance(&tx, attempt)?
+            .ok_or_else(|| anyhow!("legacy candidate has no immutable attempt source"))?;
+        crate::domain::document::validate_provenance(
+            &bound.document_path,
+            &unit,
+            &original,
+            &candidate.text,
+        )
+        .map_err(|_| anyhow!("legacy attempt failed current validation"))?;
+        let now = now_ms();
+        let key = unit.memory_context_key(&bound.document_path);
+        tx.execute("INSERT INTO translation_versions(unit_version_id,locale,target_text,target_hash,freshness,provenance,validation_state,review_state,publication_state,policy_fingerprint,source_attempt_id,created_at) VALUES (?1,?2,?3,?4,'exact','candidate_tm','passed','unreviewed','candidate',?5,?6,?7)", params![version_id,locale,candidate.text,migration_checksum(&candidate.text),bound.policy_fingerprint,attempt,now])?;
+        let translation_id = tx.last_insert_rowid();
+        tx.execute("UPDATE translation_memory_entries SET tier='history',superseded_at=?4 WHERE repository_id=(SELECT d.repository_id FROM units u JOIN documents d ON d.id=u.document_id WHERE u.id=?1) AND source_hash=(SELECT source_hash FROM units WHERE id=?1) AND locale=?2 AND context_key=?3 AND tier='candidate' AND superseded_at IS NULL", params![unit_id,locale,key,now])?;
+        let audit =
+            serde_json::json!({"origin":"compatible_candidate","_fani_unit":bound}).to_string();
+        tx.execute("INSERT INTO translation_memory_entries(repository_id,unit_id,translation_version_id,locale,source_hash,source_revision,context_key,target_text,tier,provenance,policy_fingerprint,created_at) SELECT d.repository_id,?1,?2,?3,?4,?5,?6,?7,'candidate',?8,?9,?10 FROM units u JOIN documents d ON d.id=u.document_id WHERE u.id=?1", params![unit_id,translation_id,locale,source_hash,bound.source_revision,key,candidate.text,audit,bound.policy_fingerprint,now])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn retire_attempt(&self, attempt_id: i64) -> Result<()> {
+        Database::retire_attempt(self, attempt_id)
+    }
+
+    fn quarantine_incompatible_translations(&self, document_id: i64, locale: &str) -> Result<()> {
+        Database::quarantine_incompatible_translations(self, document_id, locale)
     }
 
     fn trusted_translation(
@@ -2814,6 +3326,19 @@ impl StateStore for Database {
             candidate_commit,
             state,
         )
+    }
+
+    fn publication_snapshot(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        commit: &str,
+    ) -> Result<Vec<crate::application::ports::CanonicalSnapshot>> {
+        Database::publication_snapshot(self, repository_id, locale, commit)
+    }
+
+    fn canonical_compatible(&self, content_version_id: i64) -> Result<bool> {
+        Database::canonical_compatible(self, content_version_id)
     }
 
     fn promote_merged_publication(
