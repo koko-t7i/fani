@@ -7,53 +7,11 @@ use std::ops::Range;
 use std::sync::OnceLock;
 use thiserror::Error;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum UnitKind {
-    Paragraph,
-    Heading,
-    ListItem,
-    TableCell,
-    DefinitionTerm,
-    Definition,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ProtectedKind {
-    InlineCode,
-    LinkTarget,
-    Html,
-    Placeholder,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProtectedSpan {
-    pub token: String,
-    pub value: String,
-    pub kind: ProtectedKind,
-    pub range: Range<usize>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MarkdownUnit {
-    pub id: String,
-    pub kind: UnitKind,
-    pub range: Range<usize>,
-    pub source: String,
-    pub protected_source: String,
-    pub protected: Vec<ProtectedSpan>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnitTranslation {
-    pub id: String,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidationFinding {
-    pub code: &'static str,
-    pub message: String,
-}
+use crate::domain::document::UnitContext;
+pub use crate::domain::document::{
+    ProtectedKind, ProtectedSpan, TranslatableUnit as MarkdownUnit, UnitKind, UnitTranslation,
+    ValidationFinding,
+};
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum MarkdownError {
@@ -439,6 +397,7 @@ fn build_unit(
         source: source.to_string(),
         protected_source,
         protected,
+        context: UnitContext::markdown(),
     })
 }
 
@@ -509,6 +468,9 @@ fn tokenize(
                 ProtectedKind::LinkTarget => "LINK_TARGET",
                 ProtectedKind::Html => "HTML",
                 ProtectedKind::Placeholder => "PLACEHOLDER",
+                ProtectedKind::MdxEsm => "MDX_ESM",
+                ProtectedKind::MdxExpression => "MDX_EXPRESSION",
+                ProtectedKind::MdxJsxSyntax => "MDX_JSX_SYNTAX",
             };
             let digest = short_hash(&value);
             let token = format!("@@FANI_{label}_{index:04}_{digest}@@");
@@ -546,7 +508,7 @@ fn stable_fingerprint(kind: &UnitKind, protected_source: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    short_hash(&format!("{kind:?}\0{normalized}"))
+    short_hash(&format!("{}\0{normalized}", kind.as_str()))
 }
 
 fn short_hash(value: &str) -> String {
@@ -568,6 +530,29 @@ fn inline_code_values(markdown: &str) -> Vec<String> {
         .collect::<Vec<_>>();
     values.sort();
     values
+}
+
+pub(crate) fn document_signature(markdown: &str) -> Vec<String> {
+    let mut signature = structure_signature(markdown)
+        .into_iter()
+        .filter(|part| part != "text")
+        .collect::<Vec<_>>();
+    let mut code_block = false;
+    for event in Parser::new_ext(markdown, Options::all()) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => code_block = true,
+            Event::End(TagEnd::CodeBlock) => code_block = false,
+            Event::Text(value) if code_block => signature.push(format!("code-text:{value}")),
+            _ => {}
+        }
+    }
+    // Prose position is not structural; inline code may move safely within a unit.
+    signature.extend(
+        inline_code_values(markdown)
+            .into_iter()
+            .map(|value| format!("code-value:{value}")),
+    );
+    signature
 }
 
 fn structure_signature(markdown: &str) -> Vec<String> {

@@ -1,10 +1,11 @@
-use crate::domain::markdown::{MarkdownUnit, UnitKind};
+use crate::domain::document::{TranslatableUnit, UnitContext, UnitKind};
 use strsim::normalized_levenshtein;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreviousUnit {
     pub stable_id: String,
     pub kind: UnitKind,
+    pub context: UnitContext,
     pub ordinal: usize,
     pub source: String,
     pub translation: String,
@@ -34,13 +35,13 @@ fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn match_units(previous: &[PreviousUnit], current: &[MarkdownUnit]) -> Vec<UnitMatch> {
+pub fn match_units(previous: &[PreviousUnit], current: &[TranslatableUnit]) -> Vec<UnitMatch> {
     match_units_with_stable_ids(previous, current, &[])
 }
 
 pub fn match_units_with_stable_ids(
     previous: &[PreviousUnit],
-    current: &[MarkdownUnit],
+    current: &[TranslatableUnit],
     stable_ids: &[String],
 ) -> Vec<UnitMatch> {
     let mut used = vec![false; previous.len()];
@@ -53,6 +54,7 @@ pub fn match_units_with_stable_ids(
                     !used[*index]
                         && candidate.stable_id == *stable_id
                         && candidate.kind == unit.kind
+                        && candidate.context == unit.context
                         && normalized(&candidate.source) == normalized(&unit.source)
                 })
             {
@@ -62,7 +64,7 @@ pub fn match_units_with_stable_ids(
                     stable_id: Some(candidate.stable_id.clone()),
                     previous_source: Some(candidate.source.clone()),
                     previous_translation: Some(candidate.translation.clone()),
-                    trusted_reuse: candidate.trusted,
+                    trusted_reuse: candidate.trusted && candidate.source == unit.source,
                     kind: MatchKind::Exact,
                 });
                 continue;
@@ -74,6 +76,7 @@ pub fn match_units_with_stable_ids(
             .filter(|(index, candidate)| {
                 !used[*index]
                     && candidate.kind == unit.kind
+                    && candidate.context == unit.context
                     && normalized(&candidate.source) == normalized(&unit.source)
             })
             .collect();
@@ -85,7 +88,7 @@ pub fn match_units_with_stable_ids(
                 stable_id: Some(candidate.stable_id.clone()),
                 previous_source: Some(candidate.source.clone()),
                 previous_translation: Some(candidate.translation.clone()),
-                trusted_reuse: candidate.trusted,
+                trusted_reuse: candidate.trusted && candidate.source == unit.source,
                 kind: if candidate.ordinal == ordinal {
                     MatchKind::Exact
                 } else {
@@ -110,7 +113,9 @@ pub fn match_units_with_stable_ids(
         let mut candidates: Vec<_> = previous
             .iter()
             .enumerate()
-            .filter(|(index, candidate)| !used[*index] && candidate.kind == unit.kind)
+            .filter(|(index, candidate)| {
+                !used[*index] && candidate.kind == unit.kind && candidate.context == unit.context
+            })
             .map(|(index, candidate)| {
                 let text_score = normalized_levenshtein(&normalized(&candidate.source), &source);
                 let distance = candidate.ordinal.abs_diff(ordinal) as f64;
@@ -172,6 +177,7 @@ mod tests {
         PreviousUnit {
             stable_id: id.into(),
             kind: UnitKind::Paragraph,
+            context: UnitContext::markdown(),
             ordinal,
             source: source.into(),
             translation: format!("translated {id}"),
@@ -184,7 +190,7 @@ mod tests {
         let current = extract_units("First paragraph!\n\nSame text.\n");
         let result = match_units(
             &[
-                previous("same", 0, "Same text.\n"),
+                previous("same", 0, "Same text."),
                 previous("changed", 1, "First paragraph.\n"),
             ],
             &current,
@@ -193,6 +199,18 @@ mod tests {
         assert!(!result[0].trusted_reuse);
         assert_eq!(result[1].kind, MatchKind::Moved);
         assert!(result[1].trusted_reuse);
+    }
+
+    #[test]
+    fn context_changes_do_not_match_and_whitespace_changes_do_not_reuse() {
+        let current = extract_units("Same text.\n");
+        let mut old = previous("same", 0, "Same text.");
+        old.context.version = "unknown".into();
+        assert_eq!(match_units(&[old], &current)[0].kind, MatchKind::New);
+        let result = match_units(&[previous("same", 0, "Same  text.")], &current);
+        assert_eq!(result[0].kind, MatchKind::Exact);
+        assert_eq!(result[0].stable_id.as_deref(), Some("same"));
+        assert!(!result[0].trusted_reuse);
     }
 
     #[test]

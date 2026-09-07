@@ -1,3 +1,4 @@
+pub mod document;
 pub mod markdown;
 pub mod matching;
 pub mod model;
