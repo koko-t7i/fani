@@ -69,6 +69,140 @@ fn fixture() -> Fixture {
 }
 
 #[test]
+fn document_work_is_unique_scoped_and_creates_no_translation_records() {
+    use fani::application::ports::StateStore;
+
+    let fixture = fixture();
+    let store: &dyn StateStore = &fixture.db;
+    let document_id = fixture
+        .db
+        .upsert_document(
+            fixture.repository_id,
+            "empty.md",
+            Some("abc123"),
+            "empty",
+            "{}",
+        )
+        .unwrap();
+    let first = store
+        .enqueue_document_work_item(&fixture.run_id, document_id, "fr", "assembly", 1, "{}")
+        .unwrap();
+    let repeated = store
+        .enqueue_document_work_item(
+            &fixture.run_id,
+            document_id,
+            "fr",
+            "assembly",
+            2,
+            r#"{"retry":true}"#,
+        )
+        .unwrap();
+    assert_eq!(first, repeated);
+    let other = store
+        .enqueue_document_work_item(
+            &fixture.run_id,
+            document_id,
+            "fr",
+            "materialization",
+            1,
+            "{}",
+        )
+        .unwrap();
+    assert_ne!(first, other);
+    assert!(
+        store
+            .enqueue_document_work_item(&fixture.run_id, document_id, "fr", "translate", 1, "{}")
+            .is_err()
+    );
+    assert!(
+        store
+            .enqueue_document_work_item(
+                &fixture.run_id,
+                document_id + 1000,
+                "fr",
+                "assembly",
+                1,
+                "{}"
+            )
+            .is_err()
+    );
+    let conn = fixture.db.connect().unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE work_items SET unit_id=?1 WHERE id=?2",
+            params![fixture.unit_id, first]
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE work_items SET document_id=NULL WHERE id=?1",
+            [first]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT unit_id,document_id,priority,input_json FROM work_items WHERE id=?1",
+            [first],
+            |row| Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?
+            ))
+        )
+        .unwrap(),
+        (None, document_id, 2, r#"{"retry":true}"#.into())
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM units WHERE document_id=?1",
+            [document_id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    for table in [
+        "attempts",
+        "translation_versions",
+        "translation_memory_entries",
+    ] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    let unit_work = fixture
+        .db
+        .enqueue_work_item(
+            &fixture.run_id,
+            fixture.unit_id,
+            "zh-CN",
+            "translate",
+            1,
+            "{}",
+        )
+        .unwrap();
+    assert_eq!(unit_work, fixture.work_item_id);
+    let outbox = fixture
+        .db
+        .enqueue_materialization(other, "empty-document", "{}")
+        .unwrap();
+    assert_eq!(
+        outbox,
+        fixture
+            .db
+            .enqueue_materialization(other, "empty-document", "{}")
+            .unwrap()
+    );
+    fixture.db.integrity_check().unwrap();
+}
+
+#[test]
 fn schema_enforces_pragmas_integrity_and_foreign_keys() {
     let fixture = fixture();
     let conn = fixture.db.connect().unwrap();
@@ -147,15 +281,25 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
                 )
             ),
         ),
+        (
+            3,
+            "0003_document_work_items".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    include_str!("../migrations/0003_document_work_items.sql").as_bytes()
+                )
+            ),
+        ),
     ];
     assert_eq!(application_id, 0x4641_4e49);
-    assert_eq!(user_version, 2);
+    assert_eq!(user_version, 3);
     assert_eq!(migrations, expected);
     drop(conn);
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 2);
+    assert_eq!(reopened.schema_version().unwrap(), 3);
     let count: i64 = reopened
         .connect()
         .unwrap()
@@ -163,7 +307,7 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(count, 3);
 }
 
 #[test]
@@ -201,7 +345,7 @@ fn version_one_database_upgrades_transactionally_to_latest() {
     drop(conn);
 
     let upgraded = Database::open(&path).unwrap();
-    assert_eq!(upgraded.schema_version().unwrap(), 2);
+    assert_eq!(upgraded.schema_version().unwrap(), 3);
     let conn = upgraded.connect().unwrap();
     assert!(conn
         .query_row(
