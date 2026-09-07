@@ -377,14 +377,29 @@ fn apply_migrations_exclusive(conn: &mut Connection, migrations: &[Migration]) -
         tx.pragma_update(None, "user_version", migration.version)?;
     }
 
-    let latest = migrations.last().map_or(0, |migration| migration.version);
-    let user_version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if user_version != latest {
-        bail!("SQLite user_version is {user_version}; expected migration version {latest}");
-    }
-    validate_physical_integrity(&tx)?;
+    validate_connection_version(&tx, migrations)?;
     tx.commit()?;
     Ok(())
+}
+
+fn migration_owner_is_dead(owner: &str) -> bool {
+    let mut parts = owner.split(':');
+    let Some((pid, started_at)) = parts
+        .next()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+        .zip(parts.next().and_then(|value| value.parse::<u64>().ok()))
+    else {
+        return false;
+    };
+    match process_identity(pid as u32) {
+        Some(identity) => identity.1 != started_at,
+        // Signal zero confirms absence without treating unreadable /proc data as death.
+        None => matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        ),
+    }
 }
 
 fn require_idle_application(conn: &Connection) -> Result<()> {
@@ -393,7 +408,7 @@ fn require_idle_application(conn: &Connection) -> Result<()> {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })? {
         let (kind, owner) = row?;
-        if kind != "repository" || !dead_repository_owner(&owner) {
+        if kind != "repository" || !migration_owner_is_dead(&owner) {
             bail!(
                 "database upgrade requires all application leases released; stop all fani processes first"
             );
@@ -403,7 +418,11 @@ fn require_idle_application(conn: &Connection) -> Result<()> {
         "SELECT owner FROM materialization_outbox WHERE state='processing' UNION ALL SELECT owner FROM publication_outbox WHERE state='processing'",
     )?;
     for owner in statement.query_map([], |row| row.get::<_, String>(0))? {
-        if !dead_process_owner(&owner?) {
+        let owner = owner?;
+        let identity = owner
+            .strip_prefix("materialize:")
+            .or_else(|| owner.strip_prefix("publish:"));
+        if !identity.is_some_and(migration_owner_is_dead) {
             bail!("database upgrade requires all outbox workers stopped");
         }
     }
@@ -3600,23 +3619,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("gap.db");
         let mut conn = open_connection(&path).unwrap();
-        let migrations = [
-            Migration {
-                version: 1,
-                name: "0001_first",
-                sql: "CREATE TABLE first(id INTEGER);",
-            },
-            Migration {
-                version: 2,
-                name: "0002_second",
-                sql: "CREATE TABLE second(id INTEGER);",
-            },
-        ];
-        apply_migrations(&mut conn, &migrations).unwrap();
+        let migrations = &MIGRATIONS[..2];
+        apply_migrations(&mut conn, migrations).unwrap();
         conn.execute("DELETE FROM schema_migrations WHERE version=1", [])
             .unwrap();
 
-        let error = apply_migrations(&mut conn, &migrations).unwrap_err();
+        let error = apply_migrations(&mut conn, migrations).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3792,6 +3800,139 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn final_schema_contract_faults_roll_back_the_complete_upgrade() {
+        for (trigger, message) in [
+            (
+                "CREATE TRIGGER corrupt_marker AFTER UPDATE ON state_schema WHEN NEW.version=3 BEGIN UPDATE state_schema SET version=2 WHERE singleton=1; END;",
+                "invalid state_schema marker",
+            ),
+            (
+                "CREATE TRIGGER corrupt_ledger AFTER INSERT ON schema_migrations WHEN NEW.version=3 BEGIN UPDATE schema_migrations SET checksum=lower(hex(zeroblob(32))) WHERE version=1; END;",
+                "checksum/name mismatch",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("old.db");
+            let mut conn = schema_two_fixture(&path);
+            conn.execute_batch(trigger).unwrap();
+            let schema = rows(&conn, "sqlite_schema");
+            let error = apply_migrations(&mut conn, MIGRATIONS).unwrap_err();
+            assert!(error.to_string().contains(message), "{error:#}");
+            validate_connection_version(&conn, &MIGRATIONS[..2]).unwrap();
+            assert_eq!(rows(&conn, "sqlite_schema"), schema);
+            assert_eq!(
+                conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            let backup = Connection::open(temp.path().join("old.db.pre-schema-2.bak")).unwrap();
+            validate_connection_version(&backup, &MIGRATIONS[..2]).unwrap();
+            let mut statement = backup
+                .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                .unwrap();
+            let tables = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for table in tables {
+                assert_eq!(rows(&conn, &table), rows(&backup, &table), "{table}");
+            }
+        }
+    }
+
+    #[test]
+    fn upgrade_rejects_live_owners_with_unreadable_identity() {
+        std::thread::spawn(|| {
+            let pid = nix::unistd::gettid().as_raw() as u32;
+            let (_, started) = process_identity(pid).unwrap();
+            nix::sys::prctl::set_name(c"\xff").unwrap();
+            assert!(process_identity(pid).is_none());
+            assert!(fs::metadata(format!("/proc/{pid}")).is_ok());
+            for kind in ["repository", "materialize", "publish"] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("old.db");
+                let mut conn = schema_two_fixture(&path);
+                let identity = format!("{pid}:{started}:run");
+                if kind == "repository" {
+                    conn.execute(
+                        "INSERT INTO leases VALUES ('repository','repo',?1,1,1,2)",
+                        [&identity],
+                    )
+                    .unwrap();
+                } else {
+                    let table = if kind == "materialize" {
+                        "materialization_outbox"
+                    } else {
+                        "publication_outbox"
+                    };
+                    conn.execute(
+                        &format!(
+                            "UPDATE {table} SET state='processing',owner=?1,lease_expires_at=2"
+                        ),
+                        [format!("{kind}:{identity}")],
+                    )
+                    .unwrap();
+                }
+                let message = if kind == "repository" {
+                    "all application leases released"
+                } else {
+                    "outbox workers stopped"
+                };
+                assert!(
+                    apply_migrations(&mut conn, MIGRATIONS)
+                        .unwrap_err()
+                        .to_string()
+                        .contains(message)
+                );
+                validate_connection_version(&conn, &MIGRATIONS[..2]).unwrap();
+                assert!(!temp.path().join("old.db.pre-schema-2.bak").exists());
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_guard_accepts_confirmed_dead_and_reused_owners() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let identity = process_identity(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (_, started) = identity.unwrap();
+        let dead = format!("{pid}:{started}:run");
+        assert!(migration_owner_is_dead(&dead));
+        let (pid, started) = process_identity(std::process::id()).unwrap();
+        assert!(!migration_owner_is_dead(&format!("{pid}:{started}:run")));
+        let reused = format!("{pid}:{}:run", started + 1);
+        assert!(migration_owner_is_dead(&reused));
+        assert!(!migration_owner_is_dead("unknown"));
+        let temp = tempfile::tempdir().unwrap();
+        let mut conn = schema_two_fixture(&temp.path().join("old.db"));
+        conn.execute(
+            "INSERT INTO leases VALUES ('repository','repo',?1,1,1,2)",
+            [&dead],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE materialization_outbox SET state='processing',owner=?1,lease_expires_at=2",
+            [format!("materialize:{reused}")],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE publication_outbox SET state='processing',owner=?1,lease_expires_at=2",
+            [format!("publish:{dead}")],
+        )
+        .unwrap();
+        apply_migrations(&mut conn, MIGRATIONS).unwrap();
+        validate_existing_connection(&conn).unwrap();
     }
 
     #[test]
