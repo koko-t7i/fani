@@ -203,6 +203,203 @@ translate = "fixture"
     }
 }
 
+fn json_fixture(source: &str) -> Fixture {
+    let mut fixture = Fixture::new("");
+    fs::remove_file(fixture.repo.join("docs/guide.md")).unwrap();
+    fs::write(fixture.repo.join("docs/guide.json"), source).unwrap();
+    fixture.commit();
+    let config = fs::read_to_string(&fixture.config).unwrap()
+        .replace("include = [\"docs/**/*.md\"]", "sources = [{ format = 'json', message_syntax = 'i18next-interpolation-v1', include = ['docs/*.json'], strip_prefix = 'docs/', target_pattern = 'translations/{lang}/{relpath}' }]")
+        .replace("target_pattern = \"translations/{lang}/{relpath}\"\n", "");
+    fs::write(&fixture.config, config).unwrap();
+    fixture.target = fixture.repo.join("translations/zh-CN/guide.json");
+    let provider = fixture.temp.path().join("provider.sh");
+    fs::write(&provider, format!("#!/bin/sh\nset -eu\njq -c . | tee -a '{}' | jq -c '{{schema:\"fani.agent.response.v1\",task_id:.task.id,output:(.task.source | gsub(\"Hello\";\"Bonjour\"))}}'\n", fixture.temp.path().join("calls").display())).unwrap();
+    fixture
+}
+
+#[test]
+fn json_lifecycle_pointer_reuse_changed_source_and_human_adoption() {
+    let fixture = json_fixture(r#"{"title":"Hello","arg":"Hello {{name}}"}"#);
+    fixture.status(2, 0);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 2);
+    let requests: Vec<Value> = fs::read_to_string(fixture.temp.path().join("calls"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for request in requests {
+        assert_eq!(request["schema"], "fani.agent.request.v2");
+        assert_eq!(request["task"]["source_format"], "json");
+        assert_eq!(
+            request["task"]["message_syntax"],
+            "i18next-interpolation-v1"
+        );
+        assert!(
+            !request["task"]["source"]
+                .as_str()
+                .unwrap()
+                .contains("title")
+        );
+        assert_eq!(
+            request["task"]["protected_tokens"],
+            request["task"]["token_permissions"]["reorderable_tokens"]
+        );
+    }
+    fixture.sync(0);
+    fixture.status(0, 2);
+    assert_eq!(fixture.calls(), 2);
+    fs::write(
+        &fixture.target,
+        r#"{"arg":"Salut {{name}}","title":"Salut"}"#,
+    )
+    .unwrap();
+    fixture.adopt();
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 2);
+    fs::write(
+        fixture.repo.join("docs/guide.json"),
+        r#"{"title":"Entirely different message","arg":"Hello {{name}}"}"#,
+    )
+    .unwrap();
+    fixture.commit();
+    fixture.status(1, 1);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 3);
+    let calls = fs::read_to_string(fixture.temp.path().join("calls")).unwrap();
+    let latest: Value = serde_json::from_str(calls.lines().last().unwrap()).unwrap();
+    assert_eq!(latest["task"]["previous_source"], "Hello");
+    assert_eq!(latest["task"]["previous_translation"], "Salut");
+    fs::write(
+        fixture.repo.join("docs/other.json"),
+        r#"{"arg":"Hello {{name}}"}"#,
+    )
+    .unwrap();
+    fixture.commit();
+    fixture.status(1, 2);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 4);
+    fs::write(
+        &fixture.target,
+        r#"{"arg":"Salut {{wrong}}","title":"Changed"}"#,
+    )
+    .unwrap();
+    assert!(!fixture.run("adopt").status.success());
+}
+
+#[test]
+fn json_zero_units_unsupported_sources_and_filename_mapping_have_no_hidden_effects() {
+    let source = "{\r\n\"empty\":\"\",\"space\":\"\\u0020\\t\",\"data\":[1,true,null]}";
+    let fixture = json_fixture(source);
+    let config = fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace("include = ['docs/*.json']", "include = ['docs/guide.json']")
+        .replace("translations/{lang}/{relpath}", "translations/{lang}.json");
+    fs::write(&fixture.config, config).unwrap();
+    fixture.sync(0);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 0);
+    assert_eq!(
+        fs::read(fixture.repo.join("translations/zh-CN.json")).unwrap(),
+        source.as_bytes()
+    );
+    let db = fixture.db().connect().unwrap();
+    for table in [
+        "units",
+        "unit_versions",
+        "translation_versions",
+        "attempts",
+        "canonical_file_translations",
+    ] {
+        let count: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    drop(db);
+    for (source, code) in [
+        (
+            r#"{"secret_one":"SENSITIVE CONTENT"}"#,
+            "MESSAGE-UNSUPPORTED",
+        ),
+        (
+            r#"{"a":"SENSITIVE CONTENT","a":"duplicate"}"#,
+            "DOCUMENT-PARSE",
+        ),
+    ] {
+        fs::write(fixture.repo.join("docs/guide.json"), source).unwrap();
+        fixture.commit();
+        fixture.sync(1);
+        assert_eq!(fixture.calls(), 0);
+        let report = fs::read_to_string(fixture.temp.path().join("reports/report.json")).unwrap();
+        assert!(report.contains(code));
+        assert!(!report.contains("SENSITIVE CONTENT"));
+    }
+}
+
+#[test]
+fn json_recovery_and_project_check_failure_preserve_verified_effect_boundary() {
+    let fixture = json_fixture(r#"{"value":"Hello {{name}}"}"#);
+    fixture.kill_at("materialization_before_file_write");
+    assert_eq!(fixture.calls(), 1);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 1);
+    let original = fs::read(&fixture.target).unwrap();
+    fs::write(
+        fixture.repo.join("docs/guide.json"),
+        r#"{"value":"Hello changed {{name}}"}"#,
+    )
+    .unwrap();
+    fixture.commit();
+    let config = fs::read_to_string(&fixture.config).unwrap().replace(
+        "[repo.quality]",
+        "[repo.documentation]\ncommands = [[\"sh\", \"-c\", \"exit 1\"]]\n[repo.quality]",
+    );
+    fs::write(&fixture.config, config).unwrap();
+    fixture.sync(1);
+    assert_eq!(fs::read(&fixture.target).unwrap(), original);
+    let conn = fixture.db().connect().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM canonical_content_versions",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM publication_outbox", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn json_dialect_change_invalidates_memory_without_invalidating_markdown() {
+    let fixture = json_fixture(r#"{"title":"Hello"}"#);
+    fs::write(fixture.repo.join("docs/readme.md"), "Hello Markdown.\n").unwrap();
+    fixture.commit();
+    let config = fs::read_to_string(&fixture.config).unwrap().replace("sources = [{", "sources = [{ format = 'markdown', include = ['docs/*.md'], target_pattern = 'translations/{lang}/{relpath}' }, {");
+    fs::write(&fixture.config, &config).unwrap();
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 2);
+    fs::write(
+        &fixture.config,
+        config.replace("i18next-interpolation-v1", "plain"),
+    )
+    .unwrap();
+    fixture.status(1, 1);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 3);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 3);
+}
+
 fn seed_schema_two_canonical(fixture: &Fixture, source: &str) -> PathBuf {
     use sha2::{Digest, Sha256};
     let revision = Command::new("git")

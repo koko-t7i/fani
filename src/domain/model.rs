@@ -81,6 +81,25 @@ pub struct SourceDocument {
 }
 
 impl SourceDocument {
+    pub fn parse(
+        &self,
+    ) -> Result<crate::domain::document::ParsedDocument, crate::domain::document::DocumentError>
+    {
+        self.parse_bytes(&self.bytes)
+    }
+
+    pub fn parse_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> Result<crate::domain::document::ParsedDocument, crate::domain::document::DocumentError>
+    {
+        crate::domain::document::parse_document_with_syntax(
+            self.source_format,
+            bytes,
+            self.message_syntax,
+        )
+    }
+
     pub fn target_path(&self, language: &str) -> PathBuf {
         self.target_pattern
             .replace("{lang}", language)
@@ -325,7 +344,10 @@ impl TokenPermissions {
                     matches!(
                         span.kind,
                         crate::domain::document::ProtectedKind::InlineCode
-                    )
+                    ) || (unit.context.format == crate::domain::document::DocumentFormat::Json
+                        && crate::domain::json::syntax(&unit.context)
+                            == Some(MessageSyntax::I18nextInterpolationV1)
+                        && span.kind == crate::domain::document::ProtectedKind::Placeholder)
                 })
                 .map(|span| span.token.clone())
                 .collect(),

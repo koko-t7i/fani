@@ -2,9 +2,9 @@
 
 [简体中文](i18n/zh-CN/README.md)
 
-fani is a Linux-first CLI for continuously translating Markdown documentation. It reads source files from a fixed Git commit, reuses trusted translations from SQLite, sends only unresolved units to a built-in model provider or a strict custom Agent, verifies the result, and can publish one stable branch and GitHub pull request per language.
+fani is a Linux-first CLI for continuously translating Markdown documentation and explicitly configured JSON message resources. It reads source files from a fixed Git commit, reuses trusted translations from SQLite, sends only unresolved units to a built-in model provider or a strict custom Agent, verifies the result, and can publish one stable branch and GitHub pull request per language.
 
-The shipped binary is fully native Rust. Running fani does not require Python, `uv`, an external i18n skill, or a provider adapter script.
+The shipped binary is fully native Rust. Running fani does not require Node, Python, `uv`, an external i18n skill, or a provider adapter script.
 
 ## Requirements
 
@@ -60,7 +60,7 @@ OpenAI and OpenAI-compatible native agents can optionally set `reasoning_effort 
 
 See [Best practices](docs/best-practices.md#providers-and-credentials) and the [annotated configuration](examples/fani.toml) for both paths.
 
-Explicit source sets support independent Markdown directory and filename mappings. They are mutually exclusive with repo-level `include`, `exclude`, and `target_pattern`, even when those fields are empty. Legacy globs matching non-`.md` files now fail with migration guidance; JSON and MDX remain unavailable. Read the [configuration upgrade notes](docs/best-practices.md#explicit-source-sets-and-upgrade-safety) before upgrading. Custom command providers must accept [Agent request v2](docs/architecture/native-i18n.md#request-v2-upgrade); response v1 is unchanged.
+Explicit source sets support independent Markdown and JSON directory and filename mappings. They are mutually exclusive with repo-level `include`, `exclude`, and `target_pattern`, even when those fields are empty. Legacy globs matching non-`.md` files fail with migration guidance. JSON requires `message_syntax = "plain"` or `"i18next-interpolation-v1"`; this is not full i18next or ICU support. MDX remains unavailable because its parser safety gates are blocked. Read the [configuration upgrade notes](docs/best-practices.md#explicit-source-sets-and-upgrade-safety) before upgrading. Custom command providers must accept [Agent request v2](docs/architecture/native-i18n.md#request-v2-upgrade); response v1 is unchanged.
 
 ## Core workflow
 
@@ -88,7 +88,7 @@ fani sync --config ./fani.toml --report-dir ./reports --quiet
 fani adopt --repo PATH_OR_BASENAME --lang zh-CN
 ```
 
-`fani sync` writes replaceable schema-4 `report.json` and `report.md` views to the selected report directory. Reports distinguish discovered files, parse failures, deterministically verified documents, byte-identical zero-unit pass-through, and actual writes. Project checks run over the complete candidate set before canonical persistence, file writes, or publication. Zero-unit Markdown needs no model calls or translation-memory records; JSON and MDX remain explicitly disabled.
+`fani sync` writes replaceable schema-4 `report.json` and `report.md` views to the selected report directory. Reports distinguish discovered files, parse failures, deterministically verified documents, byte-identical zero-unit pass-through, and actual writes. Project checks run over the complete candidate set before canonical persistence, file writes, or publication. Zero-unit Markdown and JSON need no model calls or translation-memory records. JSON skips empty and whitespace-only decoded strings, preserving their exact bytes. Changed values alone are JSON-escaped; identity translations retain original escapes such as `\\u0041`. Keys, topology, nonstrings, and interpolation schemas are immutable.
 
 SQLite at `<repo>/<data_dir>/fani.db` remains the sole fani-owned state authority. Native databases upgrade to schema 6 with a no-clobber pre-upgrade backup; stop all old processes first and follow the [upgrade/restore procedure](docs/architecture/native-i18n.md#schema-6-upgrade-and-restore).
 
@@ -107,7 +107,7 @@ For multiple repositories or languages, precedence is `error > needs_human > par
 
 - **Fixed source:** discovery and planning read blobs from one resolved Git commit, never mutable source files in the worktree.
 - **Single state authority:** translation memory, findings, canonical target bytes, recovery, and publication state live in SQLite.
-- **Untrusted model output:** fani protects Markdown syntax, bounds provider I/O, and verifies candidates before materialization or publication.
+- **Untrusted model output:** fani protects Markdown syntax and JSON resource contracts, bounds provider I/O, and verifies candidates before materialization or publication.
 - **Explicit human reconciliation:** a changed target is never silently overwritten; choose `adopt` or `discard`.
 - **Isolated publication:** candidate commits use a temporary Git index and do not disturb the checked-out branch, `HEAD`, real index, or unrelated files.
 - **Secrets stay outside configuration:** official providers use fixed endpoints and fixed credential-variable names; built-in requests do not follow redirects or inherit proxy environment variables.

@@ -6,7 +6,7 @@ Decision record: [`ADR-0001`](adr-0001-native-single-authority.md)
 
 ## Product boundary
 
-fani 0.3 is a Linux-first continuous documentation translation CLI for GitHub repositories. It supports Markdown/CommonMark/GFM, built-in HTTPS model providers, a strict custom command Agent protocol, SQLite state, Git branch publication, and GitHub pull requests. MDX, resource files, other forges, automatic merge, a Web UI, and compatibility with the experimental Python/i18n-skill implementation are outside this version.
+fani 0.3 is a Linux-first continuous documentation translation CLI for GitHub repositories. It supports Markdown/CommonMark/GFM and explicitly configured JSON message resources, built-in HTTPS model providers, a strict custom command Agent protocol, SQLite state, Git branch publication, and GitHub pull requests. MDX (blocked by parser safety), other resource formats, other forges, automatic merge, a Web UI, and compatibility with the experimental Python/i18n-skill implementation are outside this version.
 
 ## Authority
 
@@ -51,8 +51,8 @@ Stable process outcomes are `0 ok`, `1 needs_human`, `2 error`, and `3 partial`.
 ## Native document processing
 
 1. Resolve `publish.source_ref` to one commit SHA.
-2. Discover configured Markdown blobs with `git ls-tree`; read each blob from that SHA, never from the mutable worktree.
-3. Parse with `pulldown-cmark` offset events and derive stable document/unit identity.
+2. Discover configured Markdown and explicit JSON blobs with `git ls-tree`; read each blob from that SHA, never from the mutable worktree.
+3. Dispatch the pure format backend (`pulldown-cmark` offsets for Markdown, strict byte spans for JSON) and derive stable document/unit identity.
 4. Protect code, link destinations, HTML, placeholders, and non-translatable frontmatter ranges.
 5. Reuse only exact trusted translation memory before an Agent call. Fuzzy results provide context or a deterministic conflict; they are never silently published.
 6. Assemble with descending byte-range replacement. Empty replacement is byte-identical; bytes outside selected ranges remain byte-identical.
@@ -60,7 +60,15 @@ Stable process outcomes are `0 ok`, `1 needs_human`, `2 error`, and `3 partial`.
 8. Run each configured project command once over the ordered complete candidate set in fixed-source staging. The first candidate document owns the `project_check` work, whose input and result bind the full manifest hash. No candidates means no project checks.
 9. Only after all blocking checks pass, persist canonical bytes and exact immutable translation links, then materialize and publish. Failed or timed-out checks leave canonical content, targets, and publication unchanged.
 
-Zero-unit Markdown is byte-identical pass-through, including CRLF and opaque content. It creates real document work but no fake unit, Agent attempt, translation version, or translation memory; normal canonical provenance is `imported`, not AI translation. Historical `passed` flags are not authorization: a zero-unit canonical without an outbox is revalidated and checked before new effects. Adoption checks the exact proposed full target set before trust; discard restores canonical bytes without approving publication. Already-current verified targets remain eligible for a missing publication after a crash.
+Zero-unit Markdown and JSON are byte-identical pass-through, including CRLF and opaque or unselected content. It creates real document work but no fake unit, Agent attempt, translation version, or translation memory; normal canonical provenance is `imported`, not AI translation. Historical `passed` flags are not authorization: a zero-unit canonical without an outbox is revalidated and checked before new effects. Adoption checks the exact proposed full target set before trust; discard restores canonical bytes without approving publication. Already-current verified targets remain eligible for a missing publication after a crash.
+
+### JSON backend and semantic contracts
+
+See [ADR-0002](adr-0002-json-resources.md). `parse_document_with_syntax` dispatches explicit JSON; `SourceDocument::parse`/`parse_bytes` preserve the configured dialect across planning, recovery and adoption. `context_contract` binds each JSON unit to its pointer and dialect without changing Markdown's fingerprint. `validate_provenance`, stored-translation validation, receipt validation, assembly and full target reparse gate reuse and promotion.
+
+The parser rejects duplicate decoded keys and invalid UTF-8/JSON. Version-1 limits are 4 MiB per document, 64 KiB per string literal/decoded message, depth 64, 100,000 value nodes, 4,096 bytes per pointer, 16 MiB cumulative pointer bytes, and 256 interpolation occurrences per message. Out-of-range numeric literals unsupported by the scalar decoder are rejected. Limits apply to source and target. Empty/whitespace-only strings preserve exact bytes and do not create units. Identity output preserves original string escapes; only changed literals are reencoded.
+
+Whole-document signatures preserve decoded pointers, raw key literals, object/array topology, array indices/lengths, raw nonstring literals, unselected string bytes, and interpolation occurrence schemas. Object members may reorder during adoption; units align by sorted pointer. An all-translatable-string array cannot prove semantic non-swapping from final text alone. This limitation requires human semantic review, not a stronger structural claim. Malformed/limited resources yield `DOCUMENT-PARSE`; unsupported message constructs yield `MESSAGE-UNSUPPORTED`, both without excerpts and with `needs_human`.
 
 ## SQLite contract
 
@@ -102,19 +110,19 @@ Every task, including translate-with-previous-source, repair, blocking revision,
 
 | Field | Meaning |
 | --- | --- |
-| `source_format` | Stable `markdown`, `json`, or `mdx` discriminator; this build dispatches only Markdown. |
+| `source_format` | Stable `markdown`, `json`, or `mdx` discriminator; this build dispatches Markdown and explicit JSON; MDX is unavailable. |
 | `unit_context` | PR1 format, context version, structural path, and token contract. |
 | `context_key` | Source-document-bound stable memory context, including kind and semantic format contract; not an absolute repository path. |
-| `message_syntax` | `null` for Markdown; reserved typed values are `plain` and `i18next-interpolation-v1`, not enabled JSON support. |
+| `message_syntax` | `null` for Markdown; JSON carries its actual explicit `plain` or `i18next-interpolation-v1` dialect. |
 | `token_permissions` | Versioned `contract` and explicit `reorderable_tokens` allowlist; every token must still appear exactly once, unchanged. |
 
-Only listed Markdown inline-code tokens may move when meaning and associations remain intact. Structural tokens retain source order and nesting. JSON interpolation permissions must eventually come from its message dialect, never from model output. MDX executable syntax must never be translated or introduced. Prompt resources and rendered context expose the same constraints for all stages. Prompt hashes change independently of PR1's Markdown semantic compatibility fingerprint; a prompt upgrade does not by itself invalidate verified trusted Markdown memory. Old request receipts cannot serve as current v2 review approvals.
+Only listed Markdown inline-code tokens may move when meaning and associations remain intact. Structural tokens retain source order and nesting. JSON interpolation permissions come from the fixed message dialect, never from model output. JSON task source contains decoded/protected values, not keys or serialized containers. MDX executable syntax must never be translated or introduced. Prompt resources and rendered context expose the same constraints for all stages. Prompt hashes change independently of PR1's Markdown semantic compatibility fingerprint; a prompt upgrade does not by itself invalidate verified trusted Markdown memory. Old request receipts cannot serve as current v2 review approvals.
 
 ### Source sets and fixed-revision preflight
 
 Absent `sources` retains legacy repo-level `include`, `exclude`, and `target_pattern`; absent or empty legacy include keeps Markdown defaults. Explicit `sources` must be nonempty and cannot coexist with any explicitly provided legacy field, including `include = []`, `exclude = []`, or an empty target pattern. There is no implicit Markdown set and no inherited global exclude in explicit mode.
 
-Configuration loading validates formats, globs, path components, placeholders, and mapping shape without Git, SQLite, or Agent calls. JSON and MDX remain unavailable and are explicitly rejected. Fixed-revision discovery then validates component-based `strip_prefix`, exact `.md` extensions, missing single-file inputs, source-set overlap, and targets for **every configured language**, even when the command selects only one language. Targets cannot collide (including file/directory ancestry), overwrite inputs, match any effective source rule, or overlap `.git`, configured state, or report directories. Sync includes its custom `--report-dir` reservation; status/check share discovery and default reservations without a report-dir option.
+Configuration loading validates formats, globs, path components, placeholders, and mapping shape without Git, SQLite, or Agent calls. JSON requires an explicit supported message dialect; MDX remains unavailable. Fixed-revision discovery then validates component-based `strip_prefix`, format-matching `.md` or `.json` extensions, missing single-file inputs, source-set overlap, and targets for **every configured language**, even when the command selects only one language. Targets cannot collide (including file/directory ancestry), overwrite inputs, match any effective source rule, or overlap `.git`, configured state, or report directories. Sync includes its custom `--report-dir` reservation; status/check share discovery and default reservations without a report-dir option.
 
 Native status/check, sync, adopt, and discard run this complete preflight before opening or snapshotting a database, acquiring a lease, recording a run, reconciling a PR, or recovering an outbox. The validated commit replaces the runtime source ref for every language in that repository invocation; a moving branch cannot introduce unvalidated sources later in the invocation. Selected input paths that resolve through filesystem aliases are rejected, including directory aliases whose final input file does not yet exist. Git blob identity remains fixed-revision and does not follow the worktree alias.
 
@@ -124,7 +132,7 @@ Compatible pending materializations are reassembled and checked under current ru
 
 ## Report schema 4
 
-JSON reports expose `markdown_files`, `mdx_files`, `json_files`, `parse_failures`, `verified_documents`, and `pass_through_documents` per language and in totals. File counts count discovered files; verification counts deterministically assembled complete documents even when checks block later effects or targets are already current. Pass-through counts parsed zero-unit sources independently of writes. `files_written` still measures actual filesystem writes. `status`/`check` expose the same counters for currently reusable candidates without running project commands or models. Parse/verify diagnostics contain stable codes and no source/protected-code excerpts. JSON and MDX counts remain zero because those formats are explicitly disabled.
+JSON reports expose `markdown_files`, `mdx_files`, `json_files`, `parse_failures`, `verified_documents`, and `pass_through_documents` per language and in totals. File counts count discovered files; verification counts deterministically assembled complete documents even when checks block later effects or targets are already current. Pass-through counts parsed zero-unit sources independently of writes. `files_written` still measures actual filesystem writes. `status`/`check` expose the same counters for currently reusable candidates without running project commands or models. Parse/verify diagnostics contain stable codes and no source/protected-code excerpts. JSON is counted independently; MDX counts remain zero because it is disabled.
 
 ## Git and GitHub publication
 

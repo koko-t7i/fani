@@ -177,12 +177,18 @@ fn validate_sources(repo: &RepoConfig) -> Result<(), ConfigError> {
         return validate_template(&repo.target_pattern, true, &repo.path);
     };
     for source in sources {
-        if source.format != crate::domain::document::DocumentFormat::Markdown {
+        if source.format == crate::domain::document::DocumentFormat::Mdx {
             return Err(invalid(
-                "source format is unavailable in this build; only markdown is enabled",
+                "MDX source format is unavailable: parser safety gates are blocked",
             ));
         }
-        if source.message_syntax.is_some() {
+        if source.format == crate::domain::document::DocumentFormat::Json {
+            if source.message_syntax.is_none() {
+                return Err(invalid(
+                    "JSON requires explicit message_syntax: plain or i18next-interpolation-v1",
+                ));
+            }
+        } else if source.message_syntax.is_some() {
             return Err(invalid("message_syntax is only valid for JSON source sets"));
         }
         if source.include.is_empty() {
@@ -559,7 +565,7 @@ translate = "fake"
         let path = tmp.path().join("fani.toml");
         let valid = "sources = [{ format = 'markdown', include = ['docs/a.md'], strip_prefix = 'docs/', target_pattern = 'out/{lang}.md' }]";
         for (fields, expected) in [
-            (valid.replace("markdown", "json"), "unavailable"),
+            (valid.replace("markdown", "json"), "explicit message_syntax"),
             (valid.replace("markdown", "mdx"), "unavailable"),
             (valid.replace("markdown", "yaml"), "unknown variant"),
             (

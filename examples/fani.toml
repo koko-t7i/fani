@@ -56,7 +56,7 @@ draft = false
 
 # Alternative explicit source mode: remove repo-level include, exclude, and
 # target_pattern above before uncommenting these tables. No global exclude or
-# implicit source set is inherited. Only Markdown is enabled in this build.
+# implicit source set is inherited. Markdown and explicit JSON are enabled.
 #
 # [[repo.sources]]
 # format = "markdown"
@@ -72,7 +72,23 @@ draft = false
 # target_pattern = "readme/{lang}.md"
 # # One explicit filename permits omission of {relpath}.
 # # Locale values are literal: zh-CN is not automatically shortened to zh.
-# # JSON and MDX source sets remain rejected, not silently treated as Markdown.
+#
+# [[repo.sources]]
+# format = "json"
+# message_syntax = "i18next-interpolation-v1"
+# include = ["apps/web/messages/en/*.json"]
+# strip_prefix = "apps/web/messages/en/"
+# target_pattern = "apps/web/messages/{lang}/{relpath}"
+#
+# [[repo.sources]]
+# format = "json"
+# message_syntax = "plain"
+# include = ["messages/common.en.json"]
+# target_pattern = "messages/common.{lang}.json"
+# # Plain rejects template candidates; the i18next dialect supports only
+# # {{name}} / {{user.name}} with optional ASCII whitespace. No plurals,
+# # ICU, formatting, nesting, custom delimiters, or rich text are supported.
+# # MDX remains unavailable: parser safety gates are blocked.
 
 # Official providers need no script or provider CLI. Supported values are
 # anthropic, openai, xai, and deepseek. Their fixed standard API-key environment

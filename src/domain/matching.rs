@@ -48,6 +48,37 @@ pub fn match_units_with_stable_ids(
     let mut matches = Vec::with_capacity(current.len());
 
     for (ordinal, unit) in current.iter().enumerate() {
+        if unit.context.format == crate::domain::document::DocumentFormat::Json {
+            let candidate = previous.iter().enumerate().find(|(index, candidate)| {
+                !used[*index] && candidate.kind == unit.kind && candidate.context == unit.context
+            });
+            matches.push(if let Some((index, candidate)) = candidate {
+                used[index] = true;
+                let unchanged = candidate.source == unit.source;
+                UnitMatch {
+                    current_id: unit.id.clone(),
+                    stable_id: Some(candidate.stable_id.clone()),
+                    previous_source: Some(candidate.source.clone()),
+                    previous_translation: Some(candidate.translation.clone()),
+                    trusted_reuse: unchanged && candidate.trusted,
+                    kind: if unchanged {
+                        MatchKind::Exact
+                    } else {
+                        MatchKind::Fuzzy(0.0)
+                    },
+                }
+            } else {
+                UnitMatch {
+                    current_id: unit.id.clone(),
+                    stable_id: None,
+                    previous_source: None,
+                    previous_translation: None,
+                    trusted_reuse: false,
+                    kind: MatchKind::New,
+                }
+            });
+            continue;
+        }
         if let Some(stable_id) = stable_ids.get(ordinal) {
             if let Some((index, candidate)) =
                 previous.iter().enumerate().find(|(index, candidate)| {

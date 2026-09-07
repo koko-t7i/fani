@@ -1,4 +1,4 @@
-use crate::domain::markdown;
+use crate::domain::{json, markdown, model::MessageSyntax};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ops::Range;
@@ -99,7 +99,7 @@ impl TranslatableUnit {
             "document": document_identity,
             "kind": self.kind.as_str(),
             "context": self.context,
-            "contract": format_contract(self.context.format).ok(),
+            "contract": context_contract(&self.context).ok(),
         }))
         .expect("unit contexts are serializable")
     }
@@ -129,15 +129,37 @@ pub fn unit_metadata(unit: &TranslatableUnit, document_path: &str) -> String {
     serde_json::to_string(&StoredUnitContext {
         kind: unit.kind.clone(),
         context: Some(unit.context.clone()),
-        contract: format_contract(unit.context.format).ok(),
+        contract: context_contract(&unit.context).ok(),
         memory_key: Some(unit.memory_context_key(document_path)),
         parser_source: unit.parser_source.clone(),
     })
     .expect("unit metadata is serializable")
 }
 
+fn stored_unit_key(metadata: &StoredUnitContext, path: &str) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "document": path,
+        "kind": metadata.kind.as_str(),
+        "context": metadata.context.as_ref()?,
+        "contract": metadata.contract.as_ref()?,
+    }))
+    .ok()
+}
+
 pub fn compatible_metadata(provenance: &UnitProvenance) -> Option<StoredUnitContext> {
     let metadata: StoredUnitContext = serde_json::from_str(&provenance.context_json).ok()?;
+    if let Some(context) = &metadata.context {
+        if context.format == DocumentFormat::Json {
+            if metadata.kind != UnitKind::StringValue
+                || metadata.contract.as_ref() != Some(&context_contract(context).ok()?)
+                || metadata.memory_key.as_deref()
+                    != Some(stored_unit_key(&metadata, &provenance.document_path)?.as_str())
+            {
+                return None;
+            }
+            return Some(metadata);
+        }
+    }
     let current = format_contract(DocumentFormat::Markdown).ok()?;
     match (&metadata.context, &metadata.contract) {
         (Some(context), Some(contract)) if context == &UnitContext::markdown() => {
@@ -182,14 +204,33 @@ pub fn validate_provenance(
         unit,
         &provenance.source,
         &metadata.kind,
-        &UnitContext::markdown(),
-        &format_contract(DocumentFormat::Markdown).expect("enabled Markdown contract"),
+        metadata
+            .context
+            .as_ref()
+            .unwrap_or(&UnitContext::markdown()),
+        &context_contract(
+            metadata
+                .context
+                .as_ref()
+                .unwrap_or(&UnitContext::markdown()),
+        )
+        .expect("validated contract"),
         translated,
     )
 }
 
 pub fn stored_unit(provenance: &UnitProvenance) -> Option<TranslatableUnit> {
     let metadata = compatible_metadata(provenance)?;
+    if let Some(context) = &metadata.context {
+        if context.format == DocumentFormat::Json {
+            return json::unit(
+                &provenance.source,
+                context.structural_path.as_deref()?,
+                json::syntax(context)?,
+            )
+            .ok();
+        }
+    }
     let source = metadata
         .parser_source
         .as_deref()
@@ -254,6 +295,33 @@ pub fn format_contract(format: DocumentFormat) -> Result<FormatContract, Documen
     }
 }
 
+pub fn context_contract(context: &UnitContext) -> Result<FormatContract, DocumentError> {
+    if context.format == DocumentFormat::Json {
+        return json::syntax(context)
+            .map(json::contract)
+            .ok_or(DocumentError::IncompatibleContract);
+    }
+    format_contract(context.format)
+}
+
+pub fn message_syntax(unit: &TranslatableUnit) -> Option<MessageSyntax> {
+    json::syntax(&unit.context)
+}
+
+pub fn parse_document_with_syntax(
+    format: DocumentFormat,
+    source: &[u8],
+    syntax: Option<MessageSyntax>,
+) -> Result<ParsedDocument, DocumentError> {
+    if format == DocumentFormat::Json {
+        return json::parse(source, syntax.ok_or(DocumentError::MessageUnsupported)?);
+    }
+    if syntax.is_some() {
+        return Err(DocumentError::IncompatibleContract);
+    }
+    parse_document(format, source)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ParsedDocument {
     pub format: DocumentFormat,
@@ -287,6 +355,8 @@ pub enum DocumentError {
     Token(Vec<ValidationFinding>),
     #[error("document resource limit exceeded: {0}")]
     ResourceLimit(String),
+    #[error("MESSAGE-UNSUPPORTED: resource requires a supported explicit message dialect")]
+    MessageUnsupported,
     #[error("document structure changed")]
     Structure,
     #[error("document contract is incompatible")]
@@ -319,6 +389,7 @@ pub fn validate_unit(
         DocumentFormat::Markdown if unit.context == UnitContext::markdown() => {
             markdown::validate_translation(unit, translated)
         }
+        DocumentFormat::Json => json::validate(unit, translated),
         _ => Err(vec![ValidationFinding {
             code: "DOCUMENT-CONTRACT",
             message: "unsupported unit format or context contract".into(),
@@ -330,7 +401,10 @@ pub fn translated_unit_text(
     source: &TranslatableUnit,
     target: &TranslatableUnit,
 ) -> Option<String> {
-    if source.kind != target.kind || source.protected.len() != target.protected.len() {
+    if source.context != target.context
+        || source.kind != target.kind
+        || source.protected.len() != target.protected.len()
+    {
         return None;
     }
     let mut used = vec![false; source.protected.len()];
@@ -371,6 +445,7 @@ pub fn assemble_document(
         DocumentFormat::Markdown => {
             markdown::apply_translations(&document.source, &document.units, translations)?
         }
+        DocumentFormat::Json => json::assemble(document, translations)?,
         format => return Err(DocumentError::UnsupportedFormat(format)),
     };
     verify_document(document, &output)?;
@@ -378,10 +453,24 @@ pub fn assemble_document(
 }
 
 pub fn verify_document(document: &ParsedDocument, translated: &str) -> Result<(), DocumentError> {
-    if document.contract != format_contract(document.format)? {
+    let syntax = document
+        .contract
+        .message_syntax
+        .as_ref()
+        .map(|value| {
+            serde_json::from_value::<MessageSyntax>(serde_json::Value::String(value.clone()))
+        })
+        .transpose()
+        .map_err(|_| DocumentError::IncompatibleContract)?;
+    let current = if document.format == DocumentFormat::Json {
+        json::contract(syntax.ok_or(DocumentError::IncompatibleContract)?)
+    } else {
+        format_contract(document.format)?
+    };
+    if document.contract != current {
         return Err(DocumentError::IncompatibleContract);
     }
-    let candidate = parse_document(document.format, translated.as_bytes())?;
+    let candidate = parse_document_with_syntax(document.format, translated.as_bytes(), syntax)?;
     if candidate.structure_signature != document.structure_signature {
         return Err(DocumentError::Structure);
     }
@@ -400,7 +489,7 @@ pub fn validate_reuse(
     if previous_source != unit.source
         || previous_kind != &unit.kind
         || previous_context != &unit.context
-        || format_contract(unit.context.format).as_ref().ok() != Some(previous_contract)
+        || context_contract(&unit.context).as_ref().ok() != Some(previous_contract)
     {
         return Err(vec![ValidationFinding {
             code: "DOCUMENT-REUSE",

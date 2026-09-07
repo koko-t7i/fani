@@ -202,12 +202,12 @@ pub fn preflight(
             continue;
         };
         let set = &sets[index];
-        if set.format != DocumentFormat::Markdown {
-            return Err(anyhow!(
-                "source format is unavailable; only markdown is enabled"
-            ));
-        }
-        if Path::new(&path).extension().and_then(|ext| ext.to_str()) != Some("md") {
+        let extension = match set.format {
+            DocumentFormat::Markdown if set.message_syntax.is_none() => "md",
+            DocumentFormat::Json if set.message_syntax.is_some() => "json",
+            _ => return Err(anyhow!("source format or message dialect is unavailable")),
+        };
+        if Path::new(&path).extension().and_then(|ext| ext.to_str()) != Some(extension) {
             return Err(anyhow!(
                 "unsupported source extension: {path}; migrate legacy include/exclude rules to explicit repo.sources with a supported format"
             ));

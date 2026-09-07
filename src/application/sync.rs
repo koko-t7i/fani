@@ -9,8 +9,8 @@ use crate::application::ports::{
 use crate::application::settings::RepoConfig;
 use crate::domain::document::{
     DocumentFormat, ParsedDocument, TranslatableUnit, UnitTranslation, assemble_document,
-    parse_document, repair_leading_strong_separator, unit_metadata, validate_provenance,
-    validate_unit, verify_document,
+    repair_leading_strong_separator, unit_metadata, validate_provenance, validate_unit,
+    verify_document,
 };
 use crate::domain::matching::{MatchKind, PreviousUnit, match_units_with_stable_ids};
 use crate::domain::model::{
@@ -82,7 +82,7 @@ fn compatible_review_request(
         && task.source_format == unit.context.format
         && task.unit_context == unit.context
         && task.context_key == unit.memory_context_key(path)
-        && task.message_syntax.is_none()
+        && task.message_syntax == crate::domain::document::message_syntax(unit)
         && task.token_permissions == crate::domain::model::TokenPermissions::for_unit(unit)
         && task.stage.as_str() == stage
         && task.source == unit.protected_source
@@ -93,6 +93,12 @@ fn compatible_review_request(
 }
 
 fn stable_unit_id(path: &str, unit: &TranslatableUnit, ordinal: usize) -> String {
+    if unit.context.format == DocumentFormat::Json {
+        return format!(
+            "unit-{}",
+            &hash(&[b"json-pointer-v1", path.as_bytes(), unit.id.as_bytes()])[..24]
+        );
+    }
     format!(
         "unit-{}",
         &hash(&[
@@ -185,6 +191,24 @@ fn compatible_document_identity(stored: &DocumentIdentity, current: &DocumentIde
         && stored.mapping_hash() == current.mapping_hash()
 }
 
+fn count_formats(
+    statistics: &mut DocumentStatistics,
+    documents: &[crate::domain::model::SourceDocument],
+) {
+    statistics.markdown_files = documents
+        .iter()
+        .filter(|d| d.source_format == DocumentFormat::Markdown)
+        .count();
+    statistics.json_files = documents
+        .iter()
+        .filter(|d| d.source_format == DocumentFormat::Json)
+        .count();
+    statistics.mdx_files = documents
+        .iter()
+        .filter(|d| d.source_format == DocumentFormat::Mdx)
+        .count();
+}
+
 fn finding(path: &str, unit_id: Option<String>, code: &str, message: impl Into<String>) -> Finding {
     Finding {
         severity: FindingSeverity::Error,
@@ -210,7 +234,7 @@ fn previous_units(rows: &[crate::application::ports::UnitHistory]) -> Vec<Previo
                 .context
                 .unwrap_or_else(crate::domain::document::UnitContext::markdown);
             let compatible = stored.contract.as_ref().is_none_or(|contract| {
-                crate::domain::document::format_contract(context.format)
+                crate::domain::document::context_contract(&context)
                     .as_ref()
                     .ok()
                     == Some(contract)
@@ -415,12 +439,10 @@ impl<'a> Orchestrator<'a> {
         let mut pending = 0;
         let mut reused = 0;
         let mut conflicts = 0;
-        let mut document_statistics = DocumentStatistics {
-            markdown_files: documents.len(),
-            ..Default::default()
-        };
+        let mut document_statistics = DocumentStatistics::default();
+        count_formats(&mut document_statistics, &documents);
         for document in &documents {
-            let parsed = match parse_document(document.source_format, &document.bytes) {
+            let parsed = match document.parse() {
                 Ok(parsed) => parsed,
                 Err(_) => {
                     conflicts += 1;
@@ -536,16 +558,23 @@ impl<'a> Orchestrator<'a> {
         let mut scheduled = 0;
         let policy_fingerprint = prompts::policy_fingerprint();
         let documents = self.git.discover(self.repo, source_revision)?;
-        statistics.markdown_files = documents.len();
+        count_formats(statistics, &documents);
         for document in documents {
-            let parsed = match parse_document(document.source_format, &document.bytes) {
+            let parsed = match document.parse() {
                 Ok(parsed) => parsed,
-                Err(_) => {
+                Err(error) => {
                     statistics.parse_failures += 1;
                     conflicts.push(finding(
                         &document.path,
                         None,
-                        "DOCUMENT-PARSE",
+                        if matches!(
+                            error,
+                            crate::domain::document::DocumentError::MessageUnsupported
+                        ) {
+                            "MESSAGE-UNSUPPORTED"
+                        } else {
+                            "DOCUMENT-PARSE"
+                        },
                         "source document could not be parsed under the configured contract",
                     ));
                     continue;
@@ -596,7 +625,7 @@ impl<'a> Orchestrator<'a> {
                                 &document.path,
                                 Some(unit.id.clone()),
                                 DecisionCode::AmbiguousMatch.as_str(),
-                                "multiple previous units match this Markdown unit",
+                                "multiple previous units match this document unit",
                             )
                         }),
                 );
@@ -882,7 +911,7 @@ impl<'a> Orchestrator<'a> {
                     source_format: unit.unit.context.format,
                     unit_context: unit.unit.context.clone(),
                     context_key: unit.unit.memory_context_key(&document.source_path),
-                    message_syntax: None,
+                    message_syntax: crate::domain::document::message_syntax(&unit.unit),
                     token_permissions: crate::domain::model::TokenPermissions::for_unit(&unit.unit),
                     id: unit.stable_id.clone(),
                     stage: AgentStage::Translate,
@@ -912,7 +941,7 @@ impl<'a> Orchestrator<'a> {
         let provider_fingerprint = execution.provider_fingerprint;
         let results = execution.results;
         self.log(&format!(
-            "    dispatched {} native Markdown unit(s) to {}",
+            "    dispatched {} native document unit(s) to {}",
             tasks.len(),
             agent_name
         ));
@@ -977,7 +1006,7 @@ impl<'a> Orchestrator<'a> {
                                 status: "failed",
                                 request_json: result.request_json.as_str(),
                                 response_json: result.response_json.as_deref(),
-                                error: Some("deterministic Markdown validation failed"),
+                                error: Some("deterministic document validation failed"),
                             })?;
                             for validation in findings {
                                 self.database.record_finding(FindingInput {
@@ -1204,7 +1233,7 @@ impl<'a> Orchestrator<'a> {
                                 .as_ref()
                                 .and_then(|context| context.error.as_deref())
                                 .unwrap_or(
-                                    "previous output failed deterministic Markdown validation",
+                                    "previous output failed deterministic document validation",
                                 ),
                         ));
                     }
@@ -1212,7 +1241,7 @@ impl<'a> Orchestrator<'a> {
                         source_format: unit.unit.context.format,
                         unit_context: unit.unit.context.clone(),
                         context_key: unit.unit.memory_context_key(&document.source_path),
-                        message_syntax: None,
+                        message_syntax: crate::domain::document::message_syntax(&unit.unit),
                         token_permissions: crate::domain::model::TokenPermissions::for_unit(
                             &unit.unit,
                         ),
@@ -1313,7 +1342,7 @@ impl<'a> Orchestrator<'a> {
                             request_json: result.request_json.as_str(),
                             response_json: result.response_json.as_deref(),
                             error: Some(if result.ok {
-                                "deterministic Markdown validation failed"
+                                "deterministic document validation failed"
                             } else {
                                 result.diagnostic.as_str()
                             }),
@@ -1430,7 +1459,7 @@ impl<'a> Orchestrator<'a> {
                         source_format: unit.unit.context.format,
                         unit_context: unit.unit.context.clone(),
                         context_key: unit.unit.memory_context_key(&document.source_path),
-                        message_syntax: None,
+                        message_syntax: crate::domain::document::message_syntax(&unit.unit),
                         token_permissions: crate::domain::model::TokenPermissions::for_unit(
                             &unit.unit,
                         ),
@@ -1577,7 +1606,7 @@ impl<'a> Orchestrator<'a> {
                                     status: "failed",
                                     request_json: result.request_json.as_str(),
                                     response_json: result.response_json.as_deref(),
-                                    error: Some("deterministic Markdown validation failed"),
+                                    error: Some("deterministic document validation failed"),
                                 })?;
                                 findings.push(finding(
                                     &document.source_path,
@@ -2077,14 +2106,12 @@ impl<'a> Orchestrator<'a> {
                     && payload.locale == language
                     && sources.iter().any(|source| {
                         source.target_path(language).to_string_lossy() == payload.path
-                            && parse_document(source.source_format, &source.bytes).is_ok_and(
-                                |parsed| {
-                                    compatible_document_identity(
-                                        &payload.document_identity,
-                                        &document_identity(source, language, &parsed),
-                                    )
-                                },
-                            )
+                            && source.parse().is_ok_and(|parsed| {
+                                compatible_document_identity(
+                                    &payload.document_identity,
+                                    &document_identity(source, language, &parsed),
+                                )
+                            })
                     })
             });
             if !compatible {
@@ -2205,15 +2232,13 @@ impl<'a> Orchestrator<'a> {
                 .iter()
                 .find(|document| document.target_path(language).to_string_lossy() == file.path);
             compatible &= match (stored.as_ref(), current) {
-                (Some(stored), Some(current)) => {
-                    parse_document(current.source_format, &current.bytes).is_ok_and(|parsed| {
-                        stored.source_revision == file.source_revision
-                            && compatible_document_identity(
-                                stored,
-                                &document_identity(current, language, &parsed),
-                            )
-                    })
-                }
+                (Some(stored), Some(current)) => current.parse().is_ok_and(|parsed| {
+                    stored.source_revision == file.source_revision
+                        && compatible_document_identity(
+                            stored,
+                            &document_identity(current, language, &parsed),
+                        )
+                }),
                 _ => false,
             };
             compatible &= self
@@ -2260,7 +2285,7 @@ impl<'a> Orchestrator<'a> {
             let Some(source) = source else {
                 return Ok(false);
             };
-            let Ok(parsed) = parse_document(source.source_format, &source.bytes) else {
+            let Ok(parsed) = source.parse() else {
                 return Ok(false);
             };
             let Ok(text) = std::str::from_utf8(&file.content) else {
@@ -2269,7 +2294,7 @@ impl<'a> Orchestrator<'a> {
             if verify_document(&parsed, text).is_err() {
                 return Ok(false);
             }
-            let Ok(target) = parse_document(DocumentFormat::Markdown, &file.content) else {
+            let Ok(target) = source.parse_bytes(&file.content) else {
                 return Ok(false);
             };
             if parsed.units.len() != target.units.len()
@@ -2417,15 +2442,13 @@ impl<'a> Orchestrator<'a> {
                 .iter()
                 .find(|document| document.target_path(language).to_string_lossy() == record.path);
             compatible &= match (record.document_identity.as_ref(), current) {
-                (Some(stored), Some(current)) => {
-                    parse_document(current.source_format, &current.bytes).is_ok_and(|parsed| {
-                        stored.source_revision == payload.source_revision
-                            && compatible_document_identity(
-                                stored,
-                                &document_identity(current, language, &parsed),
-                            )
-                    })
-                }
+                (Some(stored), Some(current)) => current.parse().is_ok_and(|parsed| {
+                    stored.source_revision == payload.source_revision
+                        && compatible_document_identity(
+                            stored,
+                            &document_identity(current, language, &parsed),
+                        )
+                }),
                 _ => false,
             };
         }
@@ -2476,20 +2499,32 @@ impl<'a> Orchestrator<'a> {
                 "incompatible publication superseded; replan required".into();
             return Ok(());
         }
-        if written.is_empty() && outcome.documents.markdown_files == 0 {
-            outcome.documents.markdown_files = current_sources.len();
+        if written.is_empty()
+            && outcome.documents.markdown_files
+                + outcome.documents.json_files
+                + outcome.documents.mdx_files
+                == 0
+        {
+            count_formats(&mut outcome.documents, &current_sources);
             outcome.documents.verified_documents = records.len();
             for source in &current_sources {
-                match parse_document(source.source_format, &source.bytes) {
+                match source.parse() {
                     Ok(parsed) if parsed.units.is_empty() => {
                         outcome.documents.pass_through_documents += 1
                     }
-                    Err(_) => {
+                    Err(error) => {
                         outcome.documents.parse_failures += 1;
                         outcome.conflicts.push(finding(
                             &source.path,
                             None,
-                            "DOCUMENT-PARSE",
+                            if matches!(
+                                error,
+                                crate::domain::document::DocumentError::MessageUnsupported
+                            ) {
+                                "MESSAGE-UNSUPPORTED"
+                            } else {
+                                "DOCUMENT-PARSE"
+                            },
                             "source document could not be parsed under the configured contract",
                         ));
                     }
@@ -2938,8 +2973,8 @@ pub fn adopt_human_edit(
         let bytes = materializer
             .read(&repo.path, Path::new(&target))?
             .with_context(|| format!("cannot read human target {target}"))?;
-        let source = parse_document(document.source_format, &document.bytes)?;
-        let translated = parse_document(DocumentFormat::Markdown, &bytes)?;
+        let source = document.parse()?;
+        let translated = document.parse_bytes(&bytes)?;
         verify_document(&source, &translated.source)
             .with_context(|| format!("human target {target} failed validation"))?;
         if source.units.len() != translated.units.len()
@@ -3016,16 +3051,14 @@ pub fn adopt_human_edit(
             .content
             .clone();
         let target_text = std::str::from_utf8(&bytes).context("human target is not UTF-8")?;
-        let source_text =
-            std::str::from_utf8(&document.bytes).context("source Markdown is not UTF-8")?;
-        let source_document = parse_document(DocumentFormat::Markdown, source_text.as_bytes())?;
-        let target_document = parse_document(DocumentFormat::Markdown, target_text.as_bytes())?;
+        let source_document = document.parse()?;
+        let target_document = document.parse_bytes(target_text.as_bytes())?;
         verify_document(&source_document, target_text)
             .with_context(|| format!("human target {target} failed validation"))?;
         let source_units = &source_document.units;
         let target_units = &target_document.units;
         if source_units.len() != target_units.len() {
-            bail!("human target {target} does not preserve the source Markdown unit structure");
+            bail!("human target {target} does not preserve the source document unit structure");
         }
         let translations = source_units
             .iter()
