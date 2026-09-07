@@ -1,0 +1,22 @@
+{
+  "name": "fani-json-consumer-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node check.mjs",
+    "start": "node server.mjs",
+    "test": "node --test test/harness.test.mjs",
+    "test:ssr": "node --test test/ssr.test.mjs",
+    "test:browser": "node --test test/browser.test.mjs"
+  },
+  "dependencies": {
+    "i18next": "23.16.8"
+  },
+  "devDependencies": {
+    "playwright": "1.55.1"
+  },
+  "engines": {
+    "node": "24.18.0",
+    "npm": "12.0.2"
+  }
+}
