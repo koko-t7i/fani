@@ -31,6 +31,14 @@ fn bound_request(
     let mut value: serde_json::Value = serde_json::from_str(request)?;
     if let Some(object) = value.as_object_mut() {
         object.insert("_fani_unit".into(), serde_json::to_value(provenance)?);
+        let document: Option<String> = conn.query_row(
+            "SELECT json_extract(input_json,'$.document_identity') FROM work_items WHERE id=?1",
+            [work_item_id],
+            |row| row.get(0),
+        )?;
+        if let Some(document) = document {
+            object.insert("_fani_document".into(), serde_json::from_str(&document)?);
+        }
     } else {
         bail!("stored Agent request must be an object");
     }
@@ -182,7 +190,7 @@ fn bind_memory_metadata(provenance: &mut UnitProvenance, key: &str) -> Result<()
 }
 
 const APPLICATION_ID: i64 = 0x4641_4e49;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -208,6 +216,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "0003_document_work_items",
         sql: include_str!("../../migrations/0003_document_work_items.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "0004_revision_bound_canonical_content",
+        sql: include_str!("../../migrations/0004_revision_bound_canonical_content.sql"),
     },
 ];
 
@@ -359,6 +372,9 @@ fn apply_migrations_exclusive(conn: &mut Connection, migrations: &[Migration]) -
         if migration.version == 3 {
             validate_work_item_dependents(&tx)?;
         }
+        if migration.version == 4 {
+            validate_canonical_content_dependents(&tx)?;
+        }
         let expected_version = applied.len() as i64 + offset as i64 + 1;
         if migration.version != expected_version {
             bail!("database migration history is not contiguous at version {expected_version}");
@@ -375,6 +391,7 @@ fn apply_migrations_exclusive(conn: &mut Connection, migrations: &[Migration]) -
             ],
         )?;
         tx.pragma_update(None, "user_version", migration.version)?;
+        validate_connection_version(&tx, &migrations[..migration.version as usize])?;
     }
 
     validate_connection_version(&tx, migrations)?;
@@ -519,6 +536,66 @@ fn validate_work_item_dependents(conn: &Connection) -> Result<()> {
         [], |row| row.get(0))?;
     if extensions != 0 {
         bail!("unexpected work_items indexes or triggers; refusing table rebuild");
+    }
+    Ok(())
+}
+
+fn validate_canonical_content_dependents(conn: &Connection) -> Result<()> {
+    let mut statement = conn.prepare(
+        "SELECT m.name,f.\"from\",f.\"to\",f.on_delete FROM sqlite_schema m JOIN pragma_foreign_key_list(m.name) f WHERE m.type='table' AND f.\"table\"='canonical_content_versions' ORDER BY 1,2,3,4",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected = [
+        (
+            "canonical_file_translations",
+            "canonical_content_version_id",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "canonical_files",
+            "current_content_version_id",
+            "id",
+            "RESTRICT",
+        ),
+        (
+            "publication_manifest_files",
+            "canonical_content_version_id",
+            "id",
+            "RESTRICT",
+        ),
+        (
+            "publication_manifest_files",
+            "canonical_file_id",
+            "canonical_file_id",
+            "RESTRICT",
+        ),
+        (
+            "publication_manifest_files",
+            "content_hash",
+            "content_hash",
+            "RESTRICT",
+        ),
+    ]
+    .map(|(a, b, c, d)| (a.into(), b.into(), c.into(), d.into()));
+    if actual != expected {
+        bail!("unexpected canonical content foreign keys; refusing table rebuild");
+    }
+    let extensions: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE tbl_name='canonical_content_versions' AND (type='trigger' OR (type='index' AND sql IS NOT NULL))",
+        [], |row| row.get(0),
+    )?;
+    if extensions != 0 {
+        bail!("unexpected canonical content indexes or triggers; refusing table rebuild");
     }
     Ok(())
 }
@@ -1213,16 +1290,22 @@ impl Database {
                 .get("output")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
+            let conn = self.connect()?;
+            let (request_json, current): (String, Option<String>) = conn.query_row(
+                "SELECT a.request_json,json_extract(w.input_json,'$.document_identity') FROM attempts a JOIN work_items w ON w.id=a.work_item_id WHERE a.id=?1",
+                [id], |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let request: serde_json::Value = serde_json::from_str(&request_json)?;
+            let binding_matches = match current {
+                Some(current) => request.get("_fani_document") == Some(&serde_json::from_str::<serde_json::Value>(&current)?),
+                None => request.get("_fani_document").is_none(),
+            };
             Ok(RecoveredAttempt {
                 id,
                 dedupe_key: dedupe_key.to_owned(),
                 output: output.to_owned(),
-                request_json: self.connect()?.query_row(
-                    "SELECT request_json FROM attempts WHERE id=?1",
-                    [id],
-                    |row| row.get(0),
-                )?,
-                provenance: attempt_provenance(&self.connect()?, id)?,
+                request_json,
+                provenance: if binding_matches { attempt_provenance(&conn, id)? } else { None },
             })
         })
         .transpose()
@@ -1513,6 +1596,7 @@ impl Database {
 
     pub fn supersede_materializations(
         &self,
+        repository_id: i64,
         locale: &str,
         path: &str,
         active_dedupe_key: &str,
@@ -1525,25 +1609,32 @@ impl Database {
                 r#"SELECT owner FROM materialization_outbox
                    WHERE dedupe_key<>?3 AND state='processing'
                      AND json_extract(payload_json,'$.locale')=?1
-                     AND json_extract(payload_json,'$.path')=?2"#,
+                     AND json_extract(payload_json,'$.path')=?2
+                     AND work_item_id IN (SELECT w.id FROM work_items w JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?4)"#,
             )?;
             statement
-                .query_map(params![locale, path, active_dedupe_key], |row| {
-                    row.get::<_, String>(0)
-                })?
+                .query_map(
+                    params![locale, path, active_dedupe_key, repository_id],
+                    |row| row.get::<_, String>(0),
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         if owners.iter().any(|owner| !dead_process_owner(owner)) {
             bail!("older materialization for {path} is still owned by a live worker");
         }
+        tx.execute(
+            "UPDATE work_items SET status='cancelled',updated_at=?4 WHERE id IN (SELECT o.work_item_id FROM materialization_outbox o JOIN work_items w ON w.id=o.work_item_id JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?5 AND o.dedupe_key<>?3 AND o.state<>'done' AND json_extract(o.payload_json,'$.locale')=?1 AND json_extract(o.payload_json,'$.path')=?2)",
+            params![locale, path, active_dedupe_key, now, repository_id],
+        )?;
         let changed = tx.execute(
             r#"UPDATE materialization_outbox
                SET state='done',owner=NULL,lease_expires_at=NULL,
                    last_error='superseded by newer canonical content',completed_at=?4
                WHERE dedupe_key<>?3 AND state<>'done'
                  AND json_extract(payload_json,'$.locale')=?1
-                 AND json_extract(payload_json,'$.path')=?2"#,
-            params![locale, path, active_dedupe_key, now],
+                 AND json_extract(payload_json,'$.path')=?2
+                 AND work_item_id IN (SELECT w.id FROM work_items w JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?5)"#,
+            params![locale, path, active_dedupe_key, now, repository_id],
         )?;
         tx.commit()?;
         Ok(changed)
@@ -1664,6 +1755,7 @@ impl Database {
 
     pub fn claim_publication_locale(
         &self,
+        repository_id: i64,
         locale: &str,
         owner: &str,
         now: i64,
@@ -1676,10 +1768,10 @@ impl Database {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let dead_ids = {
             let mut statement = tx.prepare(
-                "SELECT id,owner FROM publication_outbox WHERE locale=?1 AND state='processing'",
+                "SELECT id,owner FROM publication_outbox WHERE locale=?1 AND repository_id=?2 AND state='processing'",
             )?;
             statement
-                .query_map([locale], |row| {
+                .query_map(params![locale, repository_id], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -1694,13 +1786,13 @@ impl Database {
             )?;
         }
         tx.execute(
-            "UPDATE publication_outbox SET state='pending',owner=NULL,lease_expires_at=NULL,last_error=COALESCE(last_error,'worker lease expired') WHERE locale=?1 AND state='processing' AND lease_expires_at<=?2",
-            params![locale, now],
+            "UPDATE publication_outbox SET state='pending',owner=NULL,lease_expires_at=NULL,last_error=COALESCE(last_error,'worker lease expired') WHERE locale=?1 AND repository_id=?3 AND state='processing' AND lease_expires_at<=?2",
+            params![locale, now, repository_id],
         )?;
         let row: Option<(i64, String, String, i64)> = tx
             .query_row(
-                "SELECT id,dedupe_key,payload_json,attempt_count FROM publication_outbox WHERE locale=?1 AND state='pending' AND available_at<=?2 ORDER BY available_at,id LIMIT 1",
-                params![locale, now],
+                "SELECT id,dedupe_key,payload_json,attempt_count FROM publication_outbox WHERE locale=?1 AND repository_id=?3 AND state='pending' AND available_at<=?2 ORDER BY available_at,id LIMIT 1",
+                params![locale, now, repository_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
@@ -1922,10 +2014,17 @@ impl Database {
             params![repository_id, locale, path],
             |row| row.get(0),
         )?;
+        let conflicting_bytes: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM canonical_content_versions WHERE canonical_file_id=?1 AND content_hash=?2 AND content<>?3)",
+            params![canonical_file_id, content_hash, content], |row| row.get(0),
+        )?;
+        if conflicting_bytes {
+            bail!("canonical content hash conflicts with immutable durable content");
+        }
         let existing_content: Option<(i64, String, Vec<u8>)> = tx
             .query_row(
-                "SELECT id,source_revision,content FROM canonical_content_versions WHERE canonical_file_id=?1 AND content_hash=?2",
-                params![canonical_file_id, content_hash],
+                "SELECT id,source_revision,content FROM canonical_content_versions WHERE canonical_file_id=?1 AND content_hash=?2 AND source_revision=?3",
+                params![canonical_file_id, content_hash, source_revision],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
@@ -1948,8 +2047,8 @@ impl Database {
             ],
         )?;
         let content_version_id: i64 = tx.query_row(
-            "SELECT id FROM canonical_content_versions WHERE canonical_file_id=?1 AND content_hash=?2",
-            params![canonical_file_id, content_hash],
+            "SELECT id FROM canonical_content_versions WHERE canonical_file_id=?1 AND content_hash=?2 AND source_revision=?3",
+            params![canonical_file_id, content_hash, source_revision],
             |row| row.get(0),
         )?;
         tx.execute(
@@ -3303,6 +3402,23 @@ impl StateStore for Database {
         )
     }
 
+    fn finish_document_work(
+        &self,
+        work_item_id: i64,
+        succeeded: bool,
+        result_json: &str,
+    ) -> Result<()> {
+        require_json(result_json)?;
+        let conn = self.connect()?;
+        if conn.execute(
+            "UPDATE work_items SET status=?2,result_json=?3,updated_at=?4 WHERE id=?1 AND document_id IS NOT NULL",
+            params![work_item_id, if succeeded { "succeeded" } else { "failed" }, result_json, now_ms()],
+        )? != 1 {
+            bail!("document work completion requires a document-scoped work item");
+        }
+        Ok(())
+    }
+
     fn successful_attempt(
         &self,
         work_item_id: i64,
@@ -3424,6 +3540,92 @@ impl StateStore for Database {
         Database::persist_canonical_file(self, input, translations)
     }
 
+    fn canonical_document_intent(&self, content_version_id: i64) -> Result<Option<String>> {
+        Ok(self.connect()?.query_row(
+            "SELECT identity_json FROM canonical_document_intents WHERE canonical_content_version_id=?1 ORDER BY id DESC LIMIT 1",
+            [content_version_id], |row| row.get(0),
+        ).optional()?)
+    }
+
+    fn bind_canonical_document_intent(
+        &self,
+        content_version_id: i64,
+        identity_json: &str,
+    ) -> Result<()> {
+        require_json(identity_json)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO canonical_document_intents(canonical_content_version_id,identity_json,created_at) VALUES (?1,?2,?3)",
+            params![content_version_id, identity_json, now_ms()],
+        )?;
+        let compatible: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM canonical_content_versions v JOIN canonical_files f ON f.id=v.canonical_file_id WHERE v.id=?1 AND v.source_revision=json_extract(?2,'$.source_revision') AND f.path=json_extract(?2,'$.target_path') AND f.locale=json_extract(?2,'$.locale'))",
+            params![content_version_id, identity_json], |row| row.get(0),
+        )?;
+        if !compatible {
+            bail!("canonical document identity conflicts with immutable content");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn pending_materializations(
+        &self,
+        repository_id: i64,
+        locale: &str,
+    ) -> Result<Vec<OutboxEntry>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            "SELECT o.id,o.dedupe_key,o.payload_json,o.attempt_count FROM materialization_outbox o JOIN work_items w ON w.id=o.work_item_id JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?1 AND w.locale=?2 AND o.state<>'done' ORDER BY o.id",
+        )?;
+        Ok(statement
+            .query_map(params![repository_id, locale], |row| {
+                Ok(OutboxEntry {
+                    id: row.get(0)?,
+                    dedupe_key: row.get(1)?,
+                    payload_json: row.get(2)?,
+                    attempt_count: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn cancel_materialization(&self, repository_id: i64, id: i64) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(i64,Option<String>)> = tx.query_row(
+            "SELECT o.work_item_id,o.owner FROM materialization_outbox o JOIN work_items w ON w.id=o.work_item_id JOIN runs r ON r.id=w.run_id WHERE o.id=?1 AND r.repository_id=?2 AND o.state<>'done'",
+            params![id,repository_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional()?;
+        if let Some((work, owner)) = row {
+            if owner
+                .as_deref()
+                .is_some_and(|owner| !dead_process_owner(owner))
+            {
+                bail!("incompatible materialization is still owned by a live worker");
+            }
+            tx.execute(
+                "UPDATE work_items SET status='cancelled',updated_at=?2 WHERE id=?1",
+                params![work, now_ms()],
+            )?;
+            tx.execute("UPDATE materialization_outbox SET state='done',owner=NULL,lease_expires_at=NULL,last_error='superseded: incompatible or unbound document intent',completed_at=?2 WHERE id=?1",params![id,now_ms()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn materialization_work(&self, dedupe_key: &str) -> Result<Option<i64>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT work_item_id FROM materialization_outbox WHERE dedupe_key=?1",
+                [dedupe_key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     fn record_canonical_file_translations(
         &self,
         canonical_file_id: i64,
@@ -3444,11 +3646,12 @@ impl StateStore for Database {
 
     fn supersede_materializations(
         &self,
+        repository_id: i64,
         locale: &str,
         path: &str,
         active_dedupe_key: &str,
     ) -> Result<usize> {
-        Database::supersede_materializations(self, locale, path, active_dedupe_key)
+        Database::supersede_materializations(self, repository_id, locale, path, active_dedupe_key)
     }
 
     fn enqueue_materialization(
@@ -3506,12 +3709,13 @@ impl StateStore for Database {
 
     fn claim_publication_locale(
         &self,
+        repository_id: i64,
         locale: &str,
         owner: &str,
         now: i64,
         lease_ms: i64,
     ) -> Result<Option<OutboxEntry>> {
-        Database::claim_publication_locale(self, locale, owner, now, lease_ms)
+        Database::claim_publication_locale(self, repository_id, locale, owner, now, lease_ms)
     }
 
     fn update_outbox_payload(
@@ -3564,6 +3768,24 @@ impl StateStore for Database {
         commit: &str,
     ) -> Result<Vec<crate::application::ports::CanonicalSnapshot>> {
         Database::publication_snapshot(self, repository_id, locale, commit)
+    }
+
+    fn canonical_content_matches(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        source_revision: &str,
+        binding: &crate::application::ports::PublicationManifestFile,
+        file: &crate::application::ports::PublicationFile,
+    ) -> Result<bool> {
+        if format!("{:x}", Sha256::digest(&file.content)) != binding.content_hash {
+            return Ok(false);
+        }
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM canonical_content_versions v JOIN canonical_files f ON f.id=v.canonical_file_id WHERE v.id=?1 AND v.canonical_file_id=?2 AND v.content_hash=?3 AND v.source_revision=?4 AND v.content=?5 AND f.repository_id=?6 AND f.locale=?7 AND f.path=?8)",
+            params![binding.canonical_content_version_id,binding.canonical_file_id,binding.content_hash,source_revision,file.content,repository_id,locale,file.path],
+            |row| row.get(0),
+        )?)
     }
 
     fn canonical_compatible(&self, content_version_id: i64) -> Result<bool> {
@@ -3738,7 +3960,54 @@ mod tests {
                 .contains("unknown migration 3")
         );
         apply_migrations(&mut conn, MIGRATIONS).unwrap();
-        assert_eq!(rows(&conn, "schema_migrations").len(), 3);
+        assert_eq!(rows(&conn, "schema_migrations").len(), 4);
+    }
+
+    #[test]
+    fn schema_three_revision_upgrade_preserves_ids_and_rolls_back_faults() {
+        for fault in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("old.db");
+            let mut conn = schema_two_fixture(&path);
+            apply_migrations(&mut conn, &MIGRATIONS[..3]).unwrap();
+            if fault {
+                conn.execute_batch("CREATE TRIGGER corrupt_revision_upgrade AFTER UPDATE ON state_schema WHEN NEW.version=4 BEGIN UPDATE state_schema SET version=3 WHERE singleton=1; END;").unwrap();
+            }
+            let tables = [
+                "canonical_files",
+                "canonical_content_versions",
+                "canonical_file_translations",
+                "publication_manifests",
+                "publication_manifest_files",
+                "work_items",
+                "materialization_outbox",
+                "publication_outbox",
+            ];
+            let before = tables.map(|table| rows(&conn, table));
+            let result = apply_migrations(&mut conn, MIGRATIONS);
+            if fault {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("invalid state_schema marker")
+                );
+                validate_connection_version(&conn, &MIGRATIONS[..3]).unwrap();
+            } else {
+                result.unwrap();
+                validate_existing_connection(&conn).unwrap();
+            }
+            for (table, previous) in tables.into_iter().zip(before) {
+                assert_eq!(rows(&conn, table), previous, "{table}");
+            }
+            let backup = Connection::open(temp.path().join("old.db.pre-schema-3.bak")).unwrap();
+            validate_connection_version(&backup, &MIGRATIONS[..3]).unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
     }
 
     #[test]

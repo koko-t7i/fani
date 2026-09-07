@@ -174,6 +174,483 @@ translate = "fixture"
     }
 }
 
+fn seed_schema_two_canonical(fixture: &Fixture, source: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let revision = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    let revision = String::from_utf8(revision.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let state = fixture.repo.join(".fani");
+    fs::create_dir_all(&state).unwrap();
+    let conn = rusqlite::Connection::open(state.join("fani.db")).unwrap();
+    conn.execute_batch(include_str!("../migrations/0001_native_authority.sql"))
+        .unwrap();
+    conn.execute_batch(include_str!(
+        "../migrations/0002_orthogonal_translation_state.sql"
+    ))
+    .unwrap();
+    conn.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY CHECK(version>0),name TEXT NOT NULL UNIQUE,checksum TEXT NOT NULL CHECK(length(checksum)=64),applied_at INTEGER NOT NULL) STRICT;").unwrap();
+    for (version, name, sql) in [
+        (
+            1,
+            "0001_native_authority",
+            include_str!("../migrations/0001_native_authority.sql"),
+        ),
+        (
+            2,
+            "0002_orthogonal_translation_state",
+            include_str!("../migrations/0002_orthogonal_translation_state.sql"),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO schema_migrations VALUES (?1,?2,?3,1)",
+            params![
+                version,
+                name,
+                format!("{:x}", Sha256::digest(sql.as_bytes()))
+            ],
+        )
+        .unwrap();
+    }
+    conn.pragma_update(None, "application_id", 0x4641_4e49_i64)
+        .unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
+    let root = fixture
+        .repo
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut hash = Sha256::new();
+    hash.update((root.len() as u64).to_be_bytes());
+    hash.update(root.as_bytes());
+    let repository_key = format!("{:x}", hash.finalize());
+    let source_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+    conn.execute("INSERT INTO repositories(id,repository_key,root_path,created_at,updated_at) VALUES (1,?1,?2,1,1)",params![repository_key,root]).unwrap();
+    conn.execute("INSERT INTO documents(id,repository_id,path,source_revision,content_hash,created_at,updated_at) VALUES (1,1,'docs/guide.md',?1,?2,1,1)",params![revision,source_hash]).unwrap();
+    conn.execute("INSERT INTO canonical_files(id,repository_id,locale,path,source_revision,content,content_hash,state,validation_state,updated_at) VALUES (71,1,'zh-CN','translations/zh-CN/docs/guide.md',?1,?2,?3,'candidate','passed',1)",params![revision,source.as_bytes(),source_hash]).unwrap();
+    conn.execute("INSERT INTO canonical_content_versions(id,canonical_file_id,source_revision,content,content_hash,created_at) VALUES (81,71,?1,?2,?3,1)",params![revision,source.as_bytes(),source_hash]).unwrap();
+    conn.execute(
+        "UPDATE canonical_files SET current_content_version_id=81 WHERE id=71",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    state
+}
+
+#[test]
+fn schema_two_passed_zero_unit_canonical_requires_current_checks_before_effects() {
+    let source = "<!-- legacy pass-through -->\n";
+    let fixture = Fixture::new(source);
+    let state = seed_schema_two_canonical(&fixture, source);
+    let config = fs::read_to_string(&fixture.config).unwrap();
+    fs::write(
+        &fixture.config,
+        config.replace(
+            "[repo.quality]",
+            "[repo.documentation]\ncommands = [[\"sh\", \"-c\", \"exit 1\"]]\n[repo.quality]",
+        ),
+    )
+    .unwrap();
+    fixture.sync(1);
+    assert!(!fixture.target.exists());
+    let conn = fixture.db().connect().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM materialization_outbox", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT provenance FROM canonical_files WHERE id=71",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "ai"
+    );
+    drop(conn);
+    fs::write(&fixture.config, config).unwrap();
+    fixture.sync(0);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 0);
+    assert_eq!(fs::read(&fixture.target).unwrap(), source.as_bytes());
+    assert!(state.join("fani.db.pre-schema-2.bak").is_file());
+    let conn = fixture.db().connect().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT content FROM canonical_content_versions WHERE id=81",
+            [],
+            |row| row.get::<_, Vec<u8>>(0)
+        )
+        .unwrap(),
+        source.as_bytes()
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM translation_versions", [], |row| row
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn schema_two_unbound_pending_intents_retain_original_cancelled_ids() {
+    use sha2::{Digest, Sha256};
+    let source = "Hello world.\n";
+    let fixture = Fixture::new(source);
+    let state = seed_schema_two_canonical(&fixture, source);
+    let conn = rusqlite::Connection::open(state.join("fani.db")).unwrap();
+    let revision: String = conn
+        .query_row(
+            "SELECT source_revision FROM documents WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let unit = fani::domain::document::parse_document(
+        fani::domain::document::DocumentFormat::Markdown,
+        source.as_bytes(),
+    )
+    .unwrap()
+    .units
+    .remove(0);
+    let metadata = fani::domain::document::unit_metadata(&unit, "docs/guide.md");
+    let source_hash = format!("{:x}", Sha256::digest(unit.source.as_bytes()));
+    let policy = fani::domain::prompts::policy_fingerprint();
+    conn.execute("INSERT INTO units(id,document_id,unit_key,ordinal,source_text,source_hash,context_json,created_at,updated_at) VALUES (401,1,'legacy-unit',0,?1,?2,?3,1,1)",params![unit.source,source_hash,metadata]).unwrap();
+    conn.execute("INSERT INTO unit_versions(id,unit_id,source_revision,source_text,source_hash,context_json,created_at) VALUES (402,401,?1,?2,?3,?4,1)",params![revision,unit.source,source_hash,metadata]).unwrap();
+    conn.execute("INSERT INTO runs(id,repository_id,invocation_key,config_path,started_at,heartbeat_at,policy_fingerprint) VALUES ('old',1,'old','old-config',1,1,?1)",[&policy]).unwrap();
+    conn.execute("INSERT INTO work_items(id,run_id,unit_id,locale,kind,input_json,created_at,updated_at,policy_fingerprint) VALUES (501,'old',401,'zh-CN','materialize',?1,1,1,?2)",params![serde_json::json!({"source_revision":revision,"path":"docs/guide.md"}).to_string(),policy]).unwrap();
+    conn.execute("INSERT INTO materialization_outbox(id,work_item_id,dedupe_key,payload_json,available_at,created_at) VALUES (601,501,'legacy-materialization','{\"repository_id\":1,\"locale\":\"zh-CN\",\"path\":\"translations/zh-CN/docs/guide.md\"}',1,1)",[]).unwrap();
+    let payload = serde_json::json!({"files":[{"canonical_content_version_id":81,"canonical_file_id":71,"content":source,"content_hash":format!("{:x}",Sha256::digest(source.as_bytes())),"path":"translations/zh-CN/docs/guide.md"}],"language":"zh-CN","policy_fingerprint":policy,"run_id":"old","source_revision":revision});
+    conn.execute("INSERT INTO publication_outbox(id,repository_id,run_id,locale,dedupe_key,payload_json,available_at,created_at) VALUES (701,1,'old','zh-CN','legacy-publication',?1,1,1)",[payload.to_string()]).unwrap();
+    drop(conn);
+    fs::write(
+        &fixture.config,
+        fs::read_to_string(&fixture.config)
+            .unwrap()
+            .replace("enabled = false", "enabled = true"),
+    )
+    .unwrap();
+    fixture.sync(0);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 1);
+    let conn = fixture.db().connect().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT status FROM work_items WHERE id=501", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        "cancelled"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM materialization_outbox WHERE id=601 AND work_item_id=501",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "done"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM publication_outbox WHERE id=701",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "done"
+    );
+    assert!(conn.query_row("SELECT json_extract(payload_json,'$.superseded_reason') FROM publication_outbox WHERE id=701",[],|row| row.get::<_,Option<String>>(0)).unwrap().is_some());
+    assert_eq!(
+        fs::read_to_string(&fixture.target).unwrap(),
+        "Bonjour world.\n"
+    );
+}
+
+#[test]
+fn zero_unit_documents_are_verified_without_translation_provenance() {
+    let source =
+        "<!-- private-source-sentinel -->\r\n\r\n```rust\r\nlet private_value = 7;\r\n```\r\n";
+    let fixture = Fixture::new(source);
+    fixture.sync(0);
+    assert_eq!(fs::read(&fixture.target).unwrap(), source.as_bytes());
+    fixture.sync(0);
+    fixture.adopt();
+    fs::write(&fixture.target, "human edit").unwrap();
+    let output = fixture.run("discard");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(&fixture.target).unwrap(), source.as_bytes());
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 0);
+    let conn = fixture.db().connect().unwrap();
+    for table in [
+        "units",
+        "unit_versions",
+        "attempts",
+        "translation_versions",
+        "translation_memory_entries",
+        "canonical_file_translations",
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    let provenance: String = conn
+        .query_row("SELECT provenance FROM canonical_files", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(provenance, "imported");
+    let text = fs::read_to_string(fixture.temp.path().join("reports/report.json")).unwrap();
+    assert!(!text.contains("private-source-sentinel"));
+    let report: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(report["schema"], 4);
+    assert_eq!(report["totals"]["files_written"], 0);
+    assert_eq!(report["totals"]["markdown_files"], 1);
+    assert_eq!(report["totals"]["verified_documents"], 1);
+    assert_eq!(report["totals"]["pass_through_documents"], 1);
+}
+
+#[test]
+fn blocking_project_checks_never_persist_or_materialize_candidates() {
+    for timed_out in [false, true] {
+        let fixture = Fixture::new("Hello world.\n");
+        fixture.sync(0);
+        let old_target = fs::read(&fixture.target).unwrap();
+        let conn = fixture.db().connect().unwrap();
+        let old_versions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM canonical_content_versions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        fs::write(fixture.repo.join("docs/guide.md"), "Hello changed world.\n").unwrap();
+        fixture.commit();
+        let command = if timed_out { "sleep 1" } else { "exit 1" };
+        let checks = format!(
+            "[repo.documentation]\ncommands = [[\"sh\", \"-c\", \"{command}\"]]\ntimeout_s = 0.05\n[repo.quality]"
+        );
+        let config = fs::read_to_string(&fixture.config)
+            .unwrap()
+            .replace("[repo.quality]", &checks);
+        fs::write(&fixture.config, config).unwrap();
+        fixture.sync(1);
+        assert_eq!(fs::read(&fixture.target).unwrap(), old_target);
+        let conn = fixture.db().connect().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM canonical_content_versions",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            old_versions
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM publication_outbox", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let code = if timed_out {
+            "DOC-CHECK-TIMEOUT"
+        } else {
+            "DOC-CHECK-FAILED"
+        };
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM findings WHERE code=?1",
+                [code],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn compatible_pending_document_intent_completes_original_work_after_new_revision() {
+    let fixture = Fixture::new("<!-- pass-through -->\n");
+    fixture.sync(0);
+    let conn = fixture.db().connect().unwrap();
+    let (outbox, work): (i64, i64) = conn
+        .query_row(
+            "SELECT id,work_item_id FROM materialization_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE materialization_outbox SET state='pending',completed_at=NULL",
+        [],
+    )
+    .unwrap();
+    conn.execute("UPDATE work_items SET status='pending' WHERE id=?1", [work])
+        .unwrap();
+    drop(conn);
+    fs::write(fixture.repo.join("docs/note.txt"), "unrelated revision").unwrap();
+    fixture.commit();
+    fixture.sync(0);
+    let conn = fixture.db().connect().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM work_items WHERE kind='materialization'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM materialization_outbox WHERE id=?1 AND work_item_id=?2",
+            params![outbox, work],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "done"
+    );
+    assert_eq!(
+        conn.query_row("SELECT status FROM work_items WHERE id=?1", [work], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        "succeeded"
+    );
+    assert_eq!(fixture.calls(), 0);
+}
+
+#[test]
+fn changed_mapping_cancels_original_pending_ids_before_replanning() {
+    let fixture = Fixture::new("Hello world.\n");
+    fixture.sync(0);
+    let original = fs::read(&fixture.target).unwrap();
+    let conn = fixture.db().connect().unwrap();
+    let (outbox, work): (i64, i64) = conn
+        .query_row(
+            "SELECT id,work_item_id FROM materialization_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE materialization_outbox SET state='pending',completed_at=NULL",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let config = fs::read_to_string(&fixture.config).unwrap().replace(
+        "translations/{lang}/{relpath}",
+        "new-target/{lang}/{relpath}",
+    );
+    fs::write(&fixture.config, config).unwrap();
+    fixture.sync(0);
+    let conn = fixture.db().connect().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM materialization_outbox WHERE id=?1",
+            [outbox],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "done"
+    );
+    assert_eq!(
+        conn.query_row("SELECT status FROM work_items WHERE id=?1", [work], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        "cancelled"
+    );
+    assert_eq!(fs::read(&fixture.target).unwrap(), original);
+    assert_eq!(
+        fs::read(fixture.repo.join("new-target/zh-CN/docs/guide.md")).unwrap(),
+        original
+    );
+    assert_eq!(fixture.calls(), 1);
+}
+
+#[test]
+fn project_check_is_anchored_to_first_complete_candidate_once() {
+    let fixture = Fixture::new("# Hello heading\n\nHello paragraph.\n");
+    fs::write(fixture.repo.join("docs/z-empty.md"), "<!-- opaque -->\n").unwrap();
+    fixture.commit();
+    fixture.budget_one();
+    let checks = fixture.temp.path().join("checks");
+    let config = fs::read_to_string(&fixture.config).unwrap().replace("[repo.quality]", &format!("[repo.documentation]\ncommands = [[\"sh\", \"-c\", \"test -f translations/zh-CN/docs/z-empty.md && test ! -f translations/zh-CN/docs/guide.md && echo checked >> '{}'\"]]\n[repo.quality]", checks.display()));
+    fs::write(&fixture.config, config).unwrap();
+    fixture.sync(3);
+    assert_eq!(fs::read_to_string(checks).unwrap().lines().count(), 1);
+    assert!(!fixture.target.exists());
+    let conn = fixture.db().connect().unwrap();
+    let (path, input, result, status): (String, String, String, String) = conn.query_row("SELECT d.path,w.input_json,w.result_json,w.status FROM work_items w JOIN documents d ON d.id=w.document_id WHERE w.kind='project_check'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+    assert_eq!(path, "docs/z-empty.md");
+    assert_eq!(status, "succeeded");
+    let input: Value = serde_json::from_str(&input).unwrap();
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(input["manifest_hash"], result["manifest_hash"]);
+    assert_eq!(input["manifest"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn unchanged_content_at_new_revision_retains_immutable_canonical_history() {
+    let fixture = Fixture::new("Hello world.\n");
+    fixture.sync(0);
+    let conn = fixture.db().connect().unwrap();
+    let old: (i64, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT id,source_revision,content FROM canonical_content_versions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let links: Vec<i64> = conn.prepare("SELECT translation_version_id FROM canonical_file_translations WHERE canonical_content_version_id=?1 ORDER BY 1").unwrap().query_map([old.0], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    drop(conn);
+    fs::write(
+        fixture.repo.join("docs/second.md"),
+        "Hello second document.\n",
+    )
+    .unwrap();
+    fixture.commit();
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 2);
+    fixture.sync(0);
+    assert_eq!(fixture.calls(), 2);
+    let conn = fixture.db().connect().unwrap();
+    let historical: (i64, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT id,source_revision,content FROM canonical_content_versions WHERE id=?1",
+            [old.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(historical, old);
+    let after: Vec<i64> = conn.prepare("SELECT translation_version_id FROM canonical_file_translations WHERE canonical_content_version_id=?1 ORDER BY 1").unwrap().query_map([old.0], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(after, links);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM canonical_content_versions WHERE canonical_file_id=(SELECT id FROM canonical_files WHERE path LIKE '%guide.md')", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+}
+
 #[test]
 fn reverse_input_alias_is_rejected_before_cli_state_or_provider_effects() {
     use std::os::unix::fs::symlink;

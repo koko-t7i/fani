@@ -385,8 +385,20 @@ pub struct Published {
     pub error: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentStatistics {
+    pub markdown_files: usize,
+    pub mdx_files: usize,
+    pub json_files: usize,
+    pub parse_failures: usize,
+    pub verified_documents: usize,
+    pub pass_through_documents: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LanguageOutcome {
+    #[serde(flatten)]
+    pub documents: DocumentStatistics,
     pub repo: String,
     pub lang: String,
     pub source_revision: String,
@@ -409,6 +421,7 @@ pub struct LanguageOutcome {
 impl LanguageOutcome {
     pub fn new(repo: &std::path::Path, lang: &str) -> Self {
         Self {
+            documents: DocumentStatistics::default(),
             repo: repo.display().to_string(),
             lang: lang.to_string(),
             source_revision: String::new(),
@@ -431,6 +444,8 @@ impl LanguageOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanSummary {
+    #[serde(flatten)]
+    pub document_statistics: DocumentStatistics,
     pub repository: PathBuf,
     pub language: String,
     pub source_revision: String,

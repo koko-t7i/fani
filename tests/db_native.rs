@@ -291,15 +291,26 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
                 )
             ),
         ),
+        (
+            4,
+            "0004_revision_bound_canonical_content".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    include_str!("../migrations/0004_revision_bound_canonical_content.sql")
+                        .as_bytes()
+                )
+            ),
+        ),
     ];
     assert_eq!(application_id, 0x4641_4e49);
-    assert_eq!(user_version, 3);
+    assert_eq!(user_version, 4);
     assert_eq!(migrations, expected);
     drop(conn);
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 3);
+    assert_eq!(reopened.schema_version().unwrap(), 4);
     let count: i64 = reopened
         .connect()
         .unwrap()
@@ -307,7 +318,7 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(count, 4);
 }
 
 #[test]
@@ -345,7 +356,7 @@ fn version_one_database_upgrades_transactionally_to_latest() {
     drop(conn);
 
     let upgraded = Database::open(&path).unwrap();
-    assert_eq!(upgraded.schema_version().unwrap(), 3);
+    assert_eq!(upgraded.schema_version().unwrap(), 4);
     let conn = upgraded.connect().unwrap();
     assert!(conn
         .query_row(
@@ -977,7 +988,12 @@ fn newer_materialization_supersedes_stale_processing_content() {
     assert_eq!(
         fixture
             .db
-            .supersede_materializations("zh-CN", "zh-CN/guide.md", active_key)
+            .supersede_materializations(
+                fixture.repository_id,
+                "zh-CN",
+                "zh-CN/guide.md",
+                active_key
+            )
             .unwrap(),
         1
     );
@@ -1022,9 +1038,108 @@ fn newer_materialization_supersedes_stale_processing_content() {
         .unwrap();
     let error = fixture
         .db
-        .supersede_materializations("zh-CN", "zh-CN/guide.md", "newest")
+        .supersede_materializations(fixture.repository_id, "zh-CN", "zh-CN/guide.md", "newest")
         .unwrap_err();
     assert!(error.to_string().contains("live worker"), "{error:#}");
+}
+
+#[test]
+fn same_locale_and_path_outboxes_are_repository_scoped() {
+    let fixture = fixture();
+    let other_repo = fixture
+        .db
+        .upsert_repository("other", &fixture._temp.path().join("other"), None, None)
+        .unwrap();
+    let other_document = fixture
+        .db
+        .upsert_document(other_repo, "guide.md", Some("abc123"), "hash", "{}")
+        .unwrap();
+    let other_run = fixture
+        .db
+        .begin_run(
+            other_repo,
+            "other-run",
+            fixture._temp.path().join("config").as_path(),
+            "{}",
+            TEST_FINGERPRINT,
+        )
+        .unwrap();
+    let other_work = fixture
+        .db
+        .enqueue_document_work_item(
+            &other_run,
+            other_document,
+            "zh-CN",
+            "materialization",
+            0,
+            "{}",
+        )
+        .unwrap();
+    for (work, key) in [(fixture.work_item_id, "ours"), (other_work, "theirs")] {
+        fixture
+            .db
+            .enqueue_materialization(work, key, r#"{"locale":"zh-CN","path":"same.md"}"#)
+            .unwrap();
+    }
+    assert_eq!(
+        fixture
+            .db
+            .supersede_materializations(fixture.repository_id, "zh-CN", "same.md", "new")
+            .unwrap(),
+        1
+    );
+    let conn = fixture.db.connect().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM materialization_outbox WHERE dedupe_key='theirs'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT status FROM work_items WHERE id=?1",
+            [fixture.work_item_id],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "cancelled"
+    );
+    let theirs = fixture
+        .db
+        .enqueue_publication(other_repo, Some(&other_run), "zh-CN", "theirs-pub", "{}")
+        .unwrap();
+    let ours = fixture
+        .db
+        .enqueue_publication(
+            fixture.repository_id,
+            Some(&fixture.run_id),
+            "zh-CN",
+            "ours-pub",
+            "{}",
+        )
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis() + 1000;
+    assert_eq!(
+        fixture
+            .db
+            .claim_publication_locale(fixture.repository_id, "zh-CN", "ours-owner", now, 10000)
+            .unwrap()
+            .unwrap()
+            .id,
+        ours
+    );
+    assert_eq!(
+        fixture
+            .db
+            .claim_publication_locale(other_repo, "zh-CN", "other-owner", now, 10000)
+            .unwrap()
+            .unwrap()
+            .id,
+        theirs
+    );
 }
 
 #[test]

@@ -464,6 +464,14 @@ pub trait StateStore {
     ) -> Result<i64> {
         anyhow::bail!("document-scoped work is not supported by this state store")
     }
+    fn finish_document_work(
+        &self,
+        _work_item_id: i64,
+        _succeeded: bool,
+        _result_json: &str,
+    ) -> Result<()> {
+        anyhow::bail!("document work completion is not supported by this state store")
+    }
     fn successful_attempt(
         &self,
         work_item_id: i64,
@@ -524,6 +532,29 @@ pub trait StateStore {
         input: CanonicalFileInput<'_>,
         translations: &[CanonicalTranslationInput<'_>],
     ) -> Result<CanonicalFile>;
+    fn canonical_document_intent(&self, _content_version_id: i64) -> Result<Option<String>> {
+        anyhow::bail!("document intent identity is not supported by this state store")
+    }
+    fn bind_canonical_document_intent(
+        &self,
+        _content_version_id: i64,
+        _identity_json: &str,
+    ) -> Result<()> {
+        anyhow::bail!("document intent identity is not supported by this state store")
+    }
+    fn pending_materializations(
+        &self,
+        _repository_id: i64,
+        _locale: &str,
+    ) -> Result<Vec<OutboxEntry>> {
+        anyhow::bail!("materialization intent recovery is not supported by this state store")
+    }
+    fn cancel_materialization(&self, _repository_id: i64, _id: i64) -> Result<()> {
+        anyhow::bail!("materialization cancellation is not supported by this state store")
+    }
+    fn materialization_work(&self, _dedupe_key: &str) -> Result<Option<i64>> {
+        anyhow::bail!("materialization work recovery is not supported by this state store")
+    }
     fn record_canonical_file_translations(
         &self,
         canonical_file_id: i64,
@@ -538,6 +569,7 @@ pub trait StateStore {
     ) -> Result<()>;
     fn supersede_materializations(
         &self,
+        repository_id: i64,
         locale: &str,
         path: &str,
         active_dedupe_key: &str,
@@ -575,6 +607,7 @@ pub trait StateStore {
     ) -> Result<i64>;
     fn claim_publication_locale(
         &self,
+        repository_id: i64,
         locale: &str,
         owner: &str,
         now: i64,
@@ -608,6 +641,16 @@ pub trait StateStore {
         locale: &str,
         commit: &str,
     ) -> Result<Vec<CanonicalSnapshot>>;
+    fn canonical_content_matches(
+        &self,
+        _repository_id: i64,
+        _locale: &str,
+        _source_revision: &str,
+        _binding: &PublicationManifestFile,
+        _file: &PublicationFile,
+    ) -> Result<bool> {
+        anyhow::bail!("canonical content binding is not supported by this state store")
+    }
     fn canonical_compatible(&self, content_version_id: i64) -> Result<bool>;
     fn promote_merged_publication(
         &self,

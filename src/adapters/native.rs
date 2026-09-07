@@ -259,7 +259,7 @@ fn status(args: Selection, output: &dyn OutputReporter) -> Result<CommandOutput>
                 duration_ms = started.elapsed().as_millis() as u64,
             );
             output.stdout(&format!(
-                "{} [{}] source={} documents={} pending={} reused={} conflicts={} deferred={}",
+                "{} [{}] source={} documents={} pending={} reused={} conflicts={} deferred={} markdown={} mdx={} json={} parse_failures={} verified={} pass_through={}",
                 repo.path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -271,6 +271,12 @@ fn status(args: Selection, output: &dyn OutputReporter) -> Result<CommandOutput>
                 plan.reused_units,
                 plan.conflicts,
                 plan.deferred_units,
+                plan.document_statistics.markdown_files,
+                plan.document_statistics.mdx_files,
+                plan.document_statistics.json_files,
+                plan.document_statistics.parse_failures,
+                plan.document_statistics.verified_documents,
+                plan.document_statistics.pass_through_documents,
             ));
         }
     }

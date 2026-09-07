@@ -144,7 +144,9 @@ commands = [
 timeout_s = 120
 ```
 
-Each command runs in independent fixed-source staging with the exact candidate targets overlaid and without provider credentials. Make checks deterministic, non-interactive, and independent of mutable local build products.
+Each command runs once per ordered complete candidate set in independent fixed-source staging with the exact candidate targets overlaid and without provider credentials. Incomplete documents are excluded; an empty set runs no commands. A failed or timed-out check returns `needs_human` without replacing canonical content or files, or publishing that set. Make checks deterministic, non-interactive, and independent of mutable local build products.
+
+Zero-unit Markdown passes through byte-identically without model calls or fabricated translation memory. Report schema 4 separates discovered files, parse failures, verified documents, and pass-through from actual writes, so an unchanged rerun can report verified documents and zero writes. Before upgrading, stop all processes and retain the schema-4 upgrader's pre-upgrade backup. Historical pending intents lacking original mapping evidence are superseded and replanned under current rules; do not infer their original mappings from today's configuration.
 
 ## Daily operation
 

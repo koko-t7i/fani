@@ -84,7 +84,7 @@ fn open_migration_integrity_and_foreign_keys_fail_closed() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("fani.db");
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 3);
+    assert_eq!(db.schema_version().unwrap(), 4);
     let conn = db.connect().unwrap();
     assert_eq!(
         conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
@@ -294,6 +294,81 @@ translate = "fixture"
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(self.provider_calls(), expected_calls);
+    }
+}
+
+#[test]
+fn zero_unit_crash_windows_recover_without_fake_translation_history() {
+    for failpoint in [
+        "project_checks_completed",
+        "canonical_content_before_translation_links",
+        "canonical_persisted_before_outbox",
+        "materialization_before_file_write",
+        "materialized_file_written",
+        "materialization_state_transitioned",
+        "publication_candidate_persisted",
+        "publication_side_effect_completed",
+    ] {
+        let fixture = CrashFixture::new();
+        let source = "<!-- pass-through -->\r\n\r\n```text\r\nopaque\r\n```\r\n";
+        fixture.update_source(source);
+        fs::write(&fixture.counter, "0").unwrap();
+        fs::write(
+            &fixture.config,
+            fs::read_to_string(&fixture.config)
+                .unwrap()
+                .replace("enabled = false", "enabled = true"),
+        )
+        .unwrap();
+        kill_at(
+            &fixture.config,
+            &fixture.reports,
+            failpoint,
+            &fixture.marker,
+        );
+        fixture.recover("0");
+        fixture.recover("0");
+        assert_eq!(
+            fs::read(&fixture.target).unwrap(),
+            source.as_bytes(),
+            "{failpoint}"
+        );
+        let db = Database::open(fixture.repo.join(".fani/fani.db")).unwrap();
+        let conn = db.connect().unwrap();
+        for table in [
+            "units",
+            "attempts",
+            "translation_versions",
+            "translation_memory_entries",
+            "canonical_file_translations",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{failpoint}: {table}"
+            );
+        }
+        for table in ["materialization_outbox", "publication_outbox"] {
+            assert_eq!(
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE state<>'done'"),
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0,
+                "{failpoint}: {table}"
+            );
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "{failpoint}: {table}"
+            );
+        }
     }
 }
 
