@@ -552,6 +552,9 @@ pub trait StateStore {
     fn cancel_materialization(&self, _repository_id: i64, _id: i64) -> Result<()> {
         anyhow::bail!("materialization cancellation is not supported by this state store")
     }
+    fn effect_key(&self, _kind: OutboxKind, _base: &str) -> Result<String> {
+        anyhow::bail!("effect history is not supported by this state store")
+    }
     fn materialization_work(&self, _dedupe_key: &str) -> Result<Option<i64>> {
         anyhow::bail!("materialization work recovery is not supported by this state store")
     }

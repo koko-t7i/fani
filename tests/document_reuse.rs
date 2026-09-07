@@ -125,6 +125,35 @@ translate = "fixture"
         }
     }
 
+    fn kill_at(&self, failpoint: &str) {
+        use std::time::{Duration, Instant};
+        let marker = self.temp.path().join("failpoint");
+        let _ = fs::remove_file(&marker);
+        let mut child = Command::new(assert_cmd::cargo::cargo_bin!("fani"))
+            .args(["sync", "--config"])
+            .arg(&self.config)
+            .arg("--report-dir")
+            .arg(self.temp.path().join("reports"))
+            .arg("--quiet")
+            .env("FANI_TEST_FAILPOINT", failpoint)
+            .env("FANI_TEST_FAILPOINT_MARKER", &marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !marker.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "exited before {failpoint}"
+            );
+            assert!(Instant::now() < deadline, "did not reach {failpoint}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+    }
+
     fn db(&self) -> Database {
         Database::open(self.repo.join(".fani/fani.db")).unwrap()
     }
@@ -539,6 +568,234 @@ fn compatible_pending_document_intent_completes_original_work_after_new_revision
         "succeeded"
     );
     assert_eq!(fixture.calls(), 0);
+}
+
+#[test]
+fn terminal_materialization_content_roundtrip_writes_current_bytes() {
+    let fixture = Fixture::new("<!-- A -->\n");
+    fixture.sync(0);
+    for source in ["<!-- B -->\n", "<!-- A -->\n"] {
+        fs::write(fixture.repo.join("docs/guide.md"), source).unwrap();
+        fixture.commit();
+        fixture.sync(0);
+        assert_eq!(fs::read_to_string(&fixture.target).unwrap(), source);
+    }
+    fixture.sync(0);
+    let conn = fixture.db().connect().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM materialization_outbox WHERE state='done'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM work_items WHERE kind='materialization' AND status='succeeded'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        3
+    );
+    assert_eq!(fixture.calls(), 0);
+}
+
+#[test]
+fn cancelled_mapping_roundtrip_retains_history_and_writes_returned_target() {
+    let fixture = Fixture::new("<!-- A -->\n");
+    let original_config = fs::read_to_string(&fixture.config).unwrap();
+    fixture.kill_at("materialization_before_file_write");
+    let conn = fixture.db().connect().unwrap();
+    let original: (i64, i64, String) = conn
+        .query_row(
+            "SELECT id,work_item_id,payload_json FROM materialization_outbox",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    fs::write(
+        &fixture.config,
+        original_config.replace("translations/{lang}/{relpath}", "other/{lang}/{relpath}"),
+    )
+    .unwrap();
+    fixture.sync(0);
+    assert!(!fixture.target.exists());
+    fs::write(&fixture.config, original_config).unwrap();
+    fixture.sync(0);
+    assert_eq!(fs::read_to_string(&fixture.target).unwrap(), "<!-- A -->\n");
+    fixture.sync(0);
+    let retained: (String, String, String) = conn.query_row("SELECT o.state,w.status,o.payload_json FROM materialization_outbox o JOIN work_items w ON w.id=o.work_item_id WHERE o.id=?1 AND w.id=?2", params![original.0, original.1], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(retained, ("done".into(), "cancelled".into(), original.2));
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM materialization_outbox", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(fixture.calls(), 0);
+}
+
+#[test]
+fn publication_recovery_reports_new_parse_failure_on_first_rerun() {
+    let fixture = Fixture::new("<!-- private opaque source -->\n");
+    fs::write(
+        &fixture.config,
+        fs::read_to_string(&fixture.config)
+            .unwrap()
+            .replace("enabled = false", "enabled = true\npush = false"),
+    )
+    .unwrap();
+    fixture.kill_at("publication_candidate_persisted");
+    let conn = fixture.db().connect().unwrap();
+    let original: (i64, String) = conn
+        .query_row("SELECT id,payload_json FROM publication_outbox", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    fs::write(
+        fixture.repo.join("docs/bad.md"),
+        b"\xff\nprivate-invalid-source",
+    )
+    .unwrap();
+    fixture.commit();
+    fixture.sync(1);
+    let report_text = fs::read_to_string(fixture.temp.path().join("reports/report.json")).unwrap();
+    let report: Value = serde_json::from_str(&report_text).unwrap();
+    assert_eq!(report["status"], "needs_human");
+    assert_eq!(report["languages"][0]["status"], "needs_human");
+    assert_eq!(report["languages"][0]["parse_failures"], 1);
+    assert_eq!(
+        report["languages"][0]["conflicts"][0]["code"],
+        "DOCUMENT-PARSE"
+    );
+    assert_eq!(
+        report["languages"][0]["conflicts"][0]["message"],
+        "source document could not be parsed under the configured contract"
+    );
+    assert!(report_text.contains("docs/bad.md"));
+    assert!(!report_text.contains("private-invalid-source"));
+    assert!(!report_text.contains("private opaque source"));
+    assert_eq!(
+        conn.query_row(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "needs_human"
+    );
+    let recovered: (String, String) = conn
+        .query_row(
+            "SELECT state,payload_json FROM publication_outbox WHERE id=?1",
+            [original.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(recovered, ("done".into(), original.1));
+    fixture.sync(1);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM publication_outbox", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(fixture.calls(), 0);
+}
+
+#[test]
+fn intent_binding_roundtrip_selects_current_identity_without_mutating_history() {
+    use fani::application::ports::StateStore;
+    let fixture = Fixture::new("Hello world.\n");
+    fixture.sync(0);
+    let db = fixture.db();
+    let conn = db.connect().unwrap();
+    let (content_id, identity_a): (i64, String) = conn
+        .query_row(
+            "SELECT canonical_content_version_id,identity_json FROM canonical_document_intents",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let mut identity_b: Value = serde_json::from_str(&identity_a).unwrap();
+    identity_b["source_set_id"] = "different".into();
+    let identity_b = identity_b.to_string();
+    let snapshot = || {
+        conn.query_row("SELECT json_group_array(json_array(id,canonical_content_version_id,identity_json,created_at)) FROM canonical_document_intents", [], |r| r.get::<_, String>(0)).unwrap()
+    };
+    db.bind_canonical_document_intent(content_id, &identity_b)
+        .unwrap();
+    assert_eq!(
+        db.canonical_document_intent(content_id).unwrap(),
+        Some(identity_b)
+    );
+    let history = snapshot();
+    for _ in 0..2 {
+        db.bind_canonical_document_intent(content_id, &identity_a)
+            .unwrap();
+        assert_eq!(
+            db.canonical_document_intent(content_id).unwrap(),
+            Some(identity_a.clone())
+        );
+        assert_eq!(snapshot(), history);
+    }
+    let mut incompatible: Value = serde_json::from_str(&identity_a).unwrap();
+    incompatible["source_revision"] = "wrong-revision".into();
+    assert!(
+        db.bind_canonical_document_intent(content_id, &incompatible.to_string())
+            .is_err()
+    );
+    assert_eq!(
+        db.canonical_document_intent(content_id).unwrap(),
+        Some(identity_a)
+    );
+    assert_eq!(snapshot(), history);
+}
+
+#[test]
+fn same_revision_configuration_roundtrip_publishes_current_intent_idempotently() {
+    let fixture = Fixture::new("Hello world.\n");
+    let config_a = fs::read_to_string(&fixture.config).unwrap();
+    fixture.sync(0);
+    let conn = fixture.db().connect().unwrap();
+    let snapshot = || {
+        conn.query_row("SELECT json_group_array(json_array(v.id,v.source_revision,hex(v.content),l.translation_version_id)) FROM canonical_content_versions v LEFT JOIN canonical_file_translations l ON l.canonical_content_version_id=v.id", [], |r| r.get::<_, String>(0)).unwrap()
+    };
+    let immutable = snapshot();
+    fs::write(
+        &fixture.config,
+        config_a.replace("docs/**/*.md", "docs/guide.md"),
+    )
+    .unwrap();
+    fixture.sync(0);
+    let history: String = conn.query_row("SELECT json_group_array(json_array(id,identity_json,created_at)) FROM canonical_document_intents", [], |r| r.get(0)).unwrap();
+    fs::write(
+        &fixture.config,
+        config_a.replace("enabled = false", "enabled = true\npush = false"),
+    )
+    .unwrap();
+    fixture.sync(0);
+    fixture.sync(0);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM publication_manifests WHERE state='commit_created'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM publication_outbox", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(snapshot(), immutable);
+    assert_eq!(conn.query_row("SELECT json_group_array(json_array(id,identity_json,created_at)) FROM canonical_document_intents", [], |r| r.get::<_, String>(0)).unwrap(), history);
+    assert_eq!(fixture.calls(), 1);
 }
 
 #[test]

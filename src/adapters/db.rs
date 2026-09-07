@@ -190,7 +190,7 @@ fn bind_memory_metadata(provenance: &mut UnitProvenance, key: &str) -> Result<()
 }
 
 const APPLICATION_ID: i64 = 0x4641_4e49;
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -221,6 +221,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "0004_revision_bound_canonical_content",
         sql: include_str!("../../migrations/0004_revision_bound_canonical_content.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "0005_current_intent_effects",
+        sql: include_str!("../../migrations/0005_current_intent_effects.sql"),
     },
 ];
 
@@ -1146,7 +1151,7 @@ impl Database {
                    run_id,document_id,locale,kind,priority,input_json,created_at,updated_at,policy_fingerprint)
                VALUES (?1,?2,?3,?4,?5,?6,?7,?7,
                        (SELECT policy_fingerprint FROM runs WHERE id=?1))
-               ON CONFLICT(run_id,document_id,locale,kind) WHERE document_id IS NOT NULL DO UPDATE SET
+               ON CONFLICT(run_id,document_id,locale,kind,COALESCE(json_extract(input_json, '$.effect_key'), '')) WHERE document_id IS NOT NULL DO UPDATE SET
                  priority=excluded.priority,
                  input_json=excluded.input_json,
                  policy_fingerprint=excluded.policy_fingerprint,
@@ -1154,8 +1159,8 @@ impl Database {
             params![run_id, document_id, locale, kind, priority, input_json, now_ms()],
         )?;
         Ok(conn.query_row(
-            "SELECT id FROM work_items WHERE run_id=?1 AND document_id=?2 AND locale=?3 AND kind=?4",
-            params![run_id, document_id, locale, kind],
+            "SELECT id FROM work_items WHERE run_id=?1 AND document_id=?2 AND locale=?3 AND kind=?4 AND COALESCE(json_extract(input_json, '$.effect_key'), '')=COALESCE(json_extract(?5, '$.effect_key'), '')",
+            params![run_id, document_id, locale, kind, input_json],
             |row| row.get(0),
         )?)
     }
@@ -3542,7 +3547,7 @@ impl StateStore for Database {
 
     fn canonical_document_intent(&self, content_version_id: i64) -> Result<Option<String>> {
         Ok(self.connect()?.query_row(
-            "SELECT identity_json FROM canonical_document_intents WHERE canonical_content_version_id=?1 ORDER BY id DESC LIMIT 1",
+            "SELECT i.identity_json FROM canonical_document_intent_selection s JOIN canonical_document_intents i ON i.id=s.intent_id AND i.canonical_content_version_id=s.canonical_content_version_id WHERE s.canonical_content_version_id=?1",
             [content_version_id], |row| row.get(0),
         ).optional()?)
     }
@@ -3566,6 +3571,10 @@ impl StateStore for Database {
         if !compatible {
             bail!("canonical document identity conflicts with immutable content");
         }
+        tx.execute(
+            "INSERT INTO canonical_document_intent_selection(canonical_content_version_id,intent_id) SELECT canonical_content_version_id,id FROM canonical_document_intents WHERE canonical_content_version_id=?1 AND identity_json=?2 ON CONFLICT(canonical_content_version_id) DO UPDATE SET intent_id=excluded.intent_id",
+            params![content_version_id, identity_json],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -3615,11 +3624,38 @@ impl StateStore for Database {
         Ok(())
     }
 
+    fn effect_key(&self, kind: OutboxKind, base: &str) -> Result<String> {
+        let conn = self.connect()?;
+        let mut key = base.to_owned();
+        loop {
+            let row: Option<(i64, String, String)> = conn
+                .query_row(
+                    &format!(
+                        "SELECT id,state,payload_json FROM {} WHERE dedupe_key=?1",
+                        outbox_table(kind)
+                    ),
+                    [&key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((id, state, payload)) = row else {
+                return Ok(key);
+            };
+            let superseded = serde_json::from_str::<serde_json::Value>(&payload)?
+                .get("superseded_reason")
+                .is_some();
+            if state != "done" || (matches!(kind, OutboxKind::Publication) && !superseded) {
+                return Ok(key);
+            }
+            key = format!("{base}:after:{id}");
+        }
+    }
+
     fn materialization_work(&self, dedupe_key: &str) -> Result<Option<i64>> {
         Ok(self
             .connect()?
             .query_row(
-                "SELECT work_item_id FROM materialization_outbox WHERE dedupe_key=?1",
+                "SELECT work_item_id FROM materialization_outbox WHERE dedupe_key=?1 AND state<>'done'",
                 [dedupe_key],
                 |row| row.get(0),
             )
@@ -3960,7 +3996,74 @@ mod tests {
                 .contains("unknown migration 3")
         );
         apply_migrations(&mut conn, MIGRATIONS).unwrap();
-        assert_eq!(rows(&conn, "schema_migrations").len(), 4);
+        assert_eq!(rows(&conn, "schema_migrations").len(), 5);
+    }
+
+    #[test]
+    fn schema_four_intent_selection_upgrade_preserves_history_and_rolls_back() {
+        for fault in [
+            None,
+            Some(
+                "CREATE TRIGGER corrupt_selection_upgrade AFTER UPDATE ON state_schema WHEN NEW.version=5 BEGIN UPDATE state_schema SET version=4 WHERE singleton=1; END;",
+            ),
+            Some(
+                "CREATE TRIGGER corrupt_selection_ledger AFTER INSERT ON schema_migrations WHEN NEW.version=5 BEGIN UPDATE schema_migrations SET checksum=lower(hex(zeroblob(32))) WHERE version=1; END;",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("old.db");
+            let mut conn = schema_two_fixture(&path);
+            apply_migrations(&mut conn, &MIGRATIONS[..4]).unwrap();
+            conn.execute_batch("INSERT INTO canonical_document_intents(id,canonical_content_version_id,identity_json,created_at) SELECT 1,id,'{\"identity\":\"A\"}',1 FROM canonical_content_versions LIMIT 1; INSERT INTO canonical_document_intents(id,canonical_content_version_id,identity_json,created_at) SELECT 2,id,'{\"identity\":\"B\"}',2 FROM canonical_content_versions LIMIT 1;").unwrap();
+            if let Some(sql) = fault {
+                conn.execute_batch(sql).unwrap();
+            }
+            let schema = rows(&conn, "sqlite_schema");
+            let tables = conn
+                .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let before = tables
+                .iter()
+                .map(|table| rows(&conn, table))
+                .collect::<Vec<_>>();
+            let result = apply_migrations(&mut conn, MIGRATIONS);
+            if fault.is_some() {
+                assert!(result.is_err());
+                validate_connection_version(&conn, &MIGRATIONS[..4]).unwrap();
+                assert_eq!(rows(&conn, "sqlite_schema"), schema);
+            } else {
+                result.unwrap();
+                validate_existing_connection(&conn).unwrap();
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT intent_id FROM canonical_document_intent_selection",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    2
+                );
+            }
+            let backup = Connection::open(temp.path().join("old.db.pre-schema-4.bak")).unwrap();
+            validate_connection_version(&backup, &MIGRATIONS[..4]).unwrap();
+            for (table, expected) in tables.iter().zip(before) {
+                assert_eq!(rows(&backup, table), expected, "backup {table}");
+                if fault.is_some()
+                    || !matches!(table.as_str(), "schema_migrations" | "state_schema")
+                {
+                    assert_eq!(rows(&conn, table), expected, "current {table}");
+                }
+            }
+            assert_eq!(
+                conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
     }
 
     #[test]

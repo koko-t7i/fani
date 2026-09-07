@@ -302,15 +302,25 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
                 )
             ),
         ),
+        (
+            5,
+            "0005_current_intent_effects".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    include_str!("../migrations/0005_current_intent_effects.sql").as_bytes()
+                )
+            ),
+        ),
     ];
     assert_eq!(application_id, 0x4641_4e49);
-    assert_eq!(user_version, 4);
+    assert_eq!(user_version, 5);
     assert_eq!(migrations, expected);
     drop(conn);
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 4);
+    assert_eq!(reopened.schema_version().unwrap(), 5);
     let count: i64 = reopened
         .connect()
         .unwrap()
@@ -318,7 +328,7 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
 }
 
 #[test]
@@ -356,7 +366,7 @@ fn version_one_database_upgrades_transactionally_to_latest() {
     drop(conn);
 
     let upgraded = Database::open(&path).unwrap();
-    assert_eq!(upgraded.schema_version().unwrap(), 4);
+    assert_eq!(upgraded.schema_version().unwrap(), 5);
     let conn = upgraded.connect().unwrap();
     assert!(conn
         .query_row(
@@ -856,6 +866,105 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
             .unwrap()
             .as_deref(),
         Some("人工认可译文")
+    );
+}
+
+#[test]
+fn superseded_publication_key_creates_new_effect_without_reopening_history() {
+    use fani::application::ports::StateStore;
+    let fixture = fixture();
+    let base = "publish:roundtrip";
+    let old = fixture
+        .db
+        .enqueue_publication(
+            fixture.repository_id,
+            Some(&fixture.run_id),
+            "zh-CN",
+            base,
+            "{}",
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .effect_key(OutboxKind::Publication, base)
+            .unwrap(),
+        base
+    );
+    let now = chrono::Utc::now().timestamp_millis();
+    fixture
+        .db
+        .claim_outbox(OutboxKind::Publication, "publisher", now, 1000)
+        .unwrap()
+        .unwrap();
+    fixture
+        .db
+        .update_outbox_payload(
+            OutboxKind::Publication,
+            old,
+            "publisher",
+            r#"{"superseded_reason":"incompatible"}"#,
+        )
+        .unwrap();
+    fixture
+        .db
+        .complete_outbox(OutboxKind::Publication, old, "publisher")
+        .unwrap();
+    let key = fixture
+        .db
+        .effect_key(OutboxKind::Publication, base)
+        .unwrap();
+    assert_ne!(key, base);
+    let new = fixture
+        .db
+        .enqueue_publication(
+            fixture.repository_id,
+            Some(&fixture.run_id),
+            "zh-CN",
+            &key,
+            "{}",
+        )
+        .unwrap();
+    assert_ne!(new, old);
+    assert_eq!(
+        fixture
+            .db
+            .effect_key(OutboxKind::Publication, base)
+            .unwrap(),
+        key
+    );
+    fixture
+        .db
+        .claim_outbox(OutboxKind::Publication, "publisher", now + 100, 1000)
+        .unwrap()
+        .unwrap();
+    fixture
+        .db
+        .complete_outbox(OutboxKind::Publication, new, "publisher")
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .effect_key(OutboxKind::Publication, base)
+            .unwrap(),
+        key
+    );
+    let retained: (String, String) = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state,payload_json FROM publication_outbox WHERE id=?1",
+            [old],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        retained,
+        (
+            "done".into(),
+            r#"{"superseded_reason":"incompatible"}"#.into()
+        )
     );
 }
 

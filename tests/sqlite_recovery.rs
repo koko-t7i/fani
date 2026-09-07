@@ -84,7 +84,7 @@ fn open_migration_integrity_and_foreign_keys_fail_closed() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("fani.db");
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 4);
+    assert_eq!(db.schema_version().unwrap(), 5);
     let conn = db.connect().unwrap();
     assert_eq!(
         conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))

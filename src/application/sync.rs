@@ -1790,13 +1790,33 @@ impl<'a> Orchestrator<'a> {
                 document.target_path,
                 document.identity.mapping_hash(),
             );
+            let base_dedupe = dedupe;
+            let dedupe = self
+                .database
+                .effect_key(OutboxKind::Materialization, &base_dedupe)?;
+            let pending_work = self.database.materialization_work(&dedupe)?;
+            // Terminal receipts describe history, not the current target bytes.
+            if pending_work.is_none()
+                && dedupe != base_dedupe
+                && self
+                    .materializer
+                    .read(&self.repo.path, Path::new(&document.target_path))?
+                    .is_some_and(|bytes| bytes == desired)
+            {
+                self.database.transition_canonical_file(
+                    canonical_id,
+                    CanonicalTransition::Materialized,
+                    Some(&desired_hash),
+                )?;
+                continue;
+            }
             self.database.supersede_materializations(
                 repository_id,
                 language,
                 &document.target_path,
                 &dedupe,
             )?;
-            let work_item_id = match self.database.materialization_work(&dedupe)? {
+            let work_item_id = match pending_work {
                 Some(id) => id,
                 None => self.database.enqueue_document_work_item(
                     run_id,
@@ -1804,7 +1824,7 @@ impl<'a> Orchestrator<'a> {
                     language,
                     "materialization",
                     0,
-                    &json!({"document_identity": document.identity, "content_hash": desired_hash})
+                    &json!({"document_identity": document.identity, "content_hash": desired_hash, "effect_key": dedupe})
                         .to_string(),
                 )?,
             };
@@ -2324,6 +2344,7 @@ impl<'a> Orchestrator<'a> {
                 "publish:{repository_id}:{language}:{}",
                 hash(&[payload.as_bytes()])
             );
+            let dedupe = self.database.effect_key(OutboxKind::Publication, &dedupe)?;
             self.database.enqueue_publication(
                 repository_id,
                 Some(run_id),
@@ -2468,7 +2489,15 @@ impl<'a> Orchestrator<'a> {
                     Ok(parsed) if parsed.units.is_empty() => {
                         outcome.documents.pass_through_documents += 1
                     }
-                    Err(_) => outcome.documents.parse_failures += 1,
+                    Err(_) => {
+                        outcome.documents.parse_failures += 1;
+                        outcome.conflicts.push(finding(
+                            &source.path,
+                            None,
+                            "DOCUMENT-PARSE",
+                            "source document could not be parsed under the configured contract",
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -2717,8 +2746,15 @@ impl<'a> Orchestrator<'a> {
                     self.publish(repository_id, &run_id, language, &[], &mut outcome)
                 })?;
                 if !outcome.published.commit.is_empty() {
-                    outcome.message = "recovered pending publication".into();
-                    outcome.transitions.push("complete:ok".into());
+                    if outcome.documents.parse_failures > 0 {
+                        outcome.status = Status::NeedsHuman;
+                        outcome.message =
+                            "source document parse failures require human attention".into();
+                        outcome.transitions.push("needs_human:conflict".into());
+                    } else {
+                        outcome.message = "recovered pending publication".into();
+                        outcome.transitions.push("complete:ok".into());
+                    }
                     return Ok(());
                 }
             }
