@@ -3,7 +3,7 @@ use crate::domain::model::{
     AgentResult, AgentTask, CanonicalTransition, Freshness, MemoryTier, PublicationState,
     Published, ReviewState, SourceDocument, TranslationProvenance, ValidationState,
 };
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -369,7 +369,25 @@ pub struct UnitHistory {
     pub trusted: bool,
 }
 
-pub trait StateStore {
+/// Durable work and outbox intent committed together, preserving an existing pending receipt.
+pub struct MaterializationIntentInput<'a> {
+    pub repository_id: i64,
+    pub run_id: &'a str,
+    pub document_id: i64,
+    pub locale: &'a str,
+    pub path: &'a str,
+    pub dedupe_key: &'a str,
+    pub work_input_json: &'a str,
+    pub payload_json: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializationReceipt {
+    pub work_item_id: i64,
+    pub outbox_id: i64,
+}
+
+pub trait DocumentStore {
     fn upsert_repository(
         &self,
         repository_key: &str,
@@ -385,11 +403,7 @@ pub trait StateStore {
         content_hash: &str,
         metadata_json: &str,
     ) -> Result<i64>;
-    fn document_id(&self, _repository_id: i64, _path: &str) -> Result<Option<i64>> {
-        Err(anyhow!(
-            "state store does not support document identity lookup"
-        ))
-    }
+    fn document_id(&self, repository_id: i64, path: &str) -> Result<Option<i64>>;
     fn upsert_unit(
         &self,
         document_id: i64,
@@ -402,12 +416,14 @@ pub trait StateStore {
     fn unit_history(&self, document_id: i64, locale: &str) -> Result<Vec<UnitHistory>>;
     fn unchanged_document_unit_keys(
         &self,
-        _repository_id: i64,
-        _path: &str,
-        _content_hash: &str,
-    ) -> Result<Vec<String>> {
-        Ok(Vec::new())
-    }
+        repository_id: i64,
+        path: &str,
+        content_hash: &str,
+    ) -> Result<Vec<String>>;
+    fn repository_id(&self, repository_key: &str) -> Result<Option<i64>>;
+}
+
+pub trait TranslationStore {
     fn translation_candidates(
         &self,
         document_id: i64,
@@ -435,6 +451,50 @@ pub trait StateStore {
         context_key: &str,
     ) -> Result<Option<String>>;
     fn trust_translation(&self, input: TrustTranslationInput<'_>) -> Result<i64>;
+    fn successful_attempt(
+        &self,
+        work_item_id: i64,
+        dedupe_key: &str,
+    ) -> Result<Option<RecoveredAttempt>>;
+    fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>>;
+    fn failed_attempt_context(&self, work_item_id: i64) -> Result<Option<FailedAttemptContext>>;
+    fn recoverable_candidate(
+        &self,
+        run_id: &str,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
+    ) -> Result<Option<String>>;
+    fn recoverable_invocation_candidate(
+        &self,
+        invocation_key: &str,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
+    ) -> Result<Option<String>>;
+    fn recoverable_unit_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        policy_fingerprint: &str,
+        deterministic_repair_version: &str,
+    ) -> Result<Option<String>>;
+    fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt>;
+    fn record_attempt_candidate(&self, input: AttemptCandidateInput<'_>) -> Result<AttemptReceipt>;
+    fn select_canonical_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        candidate_key: &str,
+        target_text: &str,
+        source_attempt_id: Option<i64>,
+        score: Option<f64>,
+    ) -> Result<i64>;
+}
+
+pub trait RunStore {
     fn begin_run(
         &self,
         repository_id: i64,
@@ -455,71 +515,23 @@ pub trait StateStore {
     ) -> Result<i64>;
     fn enqueue_document_work_item(
         &self,
-        _run_id: &str,
-        _document_id: i64,
-        _locale: &str,
-        _kind: &str,
-        _priority: i64,
-        _input_json: &str,
-    ) -> Result<i64> {
-        anyhow::bail!("document-scoped work is not supported by this state store")
-    }
+        run_id: &str,
+        document_id: i64,
+        locale: &str,
+        kind: &str,
+        priority: i64,
+        input_json: &str,
+    ) -> Result<i64>;
     fn finish_document_work(
         &self,
-        _work_item_id: i64,
-        _succeeded: bool,
-        _result_json: &str,
-    ) -> Result<()> {
-        anyhow::bail!("document work completion is not supported by this state store")
-    }
-    fn successful_attempt(
-        &self,
         work_item_id: i64,
-        dedupe_key: &str,
-    ) -> Result<Option<RecoveredAttempt>>;
-    fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>>;
-    fn failed_attempt_context(&self, _work_item_id: i64) -> Result<Option<FailedAttemptContext>> {
-        Ok(None)
-    }
-    fn recoverable_candidate(
-        &self,
-        run_id: &str,
-        unit_id: i64,
-        locale: &str,
-        policy_fingerprint: &str,
-        deterministic_repair_version: &str,
-    ) -> Result<Option<String>>;
-    fn recoverable_invocation_candidate(
-        &self,
-        _invocation_key: &str,
-        _unit_id: i64,
-        _locale: &str,
-        _policy_fingerprint: &str,
-        _deterministic_repair_version: &str,
-    ) -> Result<Option<String>> {
-        Ok(None)
-    }
-    fn recoverable_unit_candidate(
-        &self,
-        _unit_id: i64,
-        _locale: &str,
-        _policy_fingerprint: &str,
-        _deterministic_repair_version: &str,
-    ) -> Result<Option<String>> {
-        Ok(None)
-    }
-    fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt>;
-    fn record_attempt_candidate(&self, input: AttemptCandidateInput<'_>) -> Result<AttemptReceipt>;
-    fn select_canonical_candidate(
-        &self,
-        unit_id: i64,
-        locale: &str,
-        candidate_key: &str,
-        target_text: &str,
-        source_attempt_id: Option<i64>,
-        score: Option<f64>,
-    ) -> Result<i64>;
+        succeeded: bool,
+        result_json: &str,
+    ) -> Result<()>;
     fn record_finding(&self, input: FindingInput<'_>) -> Result<i64>;
+}
+
+pub trait CanonicalStore {
     fn canonical_file(
         &self,
         repository_id: i64,
@@ -532,32 +544,12 @@ pub trait StateStore {
         input: CanonicalFileInput<'_>,
         translations: &[CanonicalTranslationInput<'_>],
     ) -> Result<CanonicalFile>;
-    fn canonical_document_intent(&self, _content_version_id: i64) -> Result<Option<String>> {
-        anyhow::bail!("document intent identity is not supported by this state store")
-    }
+    fn canonical_document_intent(&self, content_version_id: i64) -> Result<Option<String>>;
     fn bind_canonical_document_intent(
         &self,
-        _content_version_id: i64,
-        _identity_json: &str,
-    ) -> Result<()> {
-        anyhow::bail!("document intent identity is not supported by this state store")
-    }
-    fn pending_materializations(
-        &self,
-        _repository_id: i64,
-        _locale: &str,
-    ) -> Result<Vec<OutboxEntry>> {
-        anyhow::bail!("materialization intent recovery is not supported by this state store")
-    }
-    fn cancel_materialization(&self, _repository_id: i64, _id: i64) -> Result<()> {
-        anyhow::bail!("materialization cancellation is not supported by this state store")
-    }
-    fn effect_key(&self, _kind: OutboxKind, _base: &str) -> Result<String> {
-        anyhow::bail!("effect history is not supported by this state store")
-    }
-    fn materialization_work(&self, _dedupe_key: &str) -> Result<Option<i64>> {
-        anyhow::bail!("materialization work recovery is not supported by this state store")
-    }
+        content_version_id: i64,
+        identity_json: &str,
+    ) -> Result<()>;
     fn record_canonical_file_translations(
         &self,
         canonical_file_id: i64,
@@ -570,6 +562,32 @@ pub trait StateStore {
         transition: CanonicalTransition,
         materialized_hash: Option<&str>,
     ) -> Result<()>;
+    fn canonical_content_matches(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        source_revision: &str,
+        binding: &PublicationManifestFile,
+        file: &PublicationFile,
+    ) -> Result<bool>;
+    fn canonical_compatible(&self, content_version_id: i64) -> Result<bool>;
+    fn persist_canonical_document(
+        &self,
+        input: CanonicalFileInput<'_>,
+        translations: &[CanonicalTranslationInput<'_>],
+        identity_json: &str,
+    ) -> Result<CanonicalFile>;
+}
+
+pub trait EffectStore {
+    fn pending_materializations(
+        &self,
+        repository_id: i64,
+        locale: &str,
+    ) -> Result<Vec<OutboxEntry>>;
+    fn cancel_materialization(&self, repository_id: i64, id: i64) -> Result<()>;
+    fn effect_key(&self, kind: OutboxKind, base: &str) -> Result<String>;
+    fn materialization_work(&self, dedupe_key: &str) -> Result<Option<i64>>;
     fn supersede_materializations(
         &self,
         repository_id: i64,
@@ -623,6 +641,13 @@ pub trait StateStore {
         owner: &str,
         payload_json: &str,
     ) -> Result<bool>;
+    fn schedule_materialization(
+        &self,
+        input: MaterializationIntentInput<'_>,
+    ) -> Result<MaterializationReceipt>;
+}
+
+pub trait PublicationStore {
     fn pull_request_for_branch(
         &self,
         repository_id: i64,
@@ -633,21 +658,17 @@ pub trait StateStore {
     fn record_publication_manifest(&self, input: PublicationManifestInput<'_>) -> Result<i64>;
     fn record_publication_authorization(
         &self,
-        _input: PublicationManifestInput<'_>,
-        _authorization_key: &str,
-    ) -> Result<i64> {
-        anyhow::bail!("publication authorizations are not supported by this state store")
-    }
+        input: PublicationManifestInput<'_>,
+        authorization_key: &str,
+    ) -> Result<i64>;
     fn transition_publication_authorization(
         &self,
-        _repository_id: i64,
-        _locale: &str,
-        _candidate_commit: &str,
-        _authorization_key: &str,
-        _state: PublicationState,
-    ) -> Result<()> {
-        anyhow::bail!("publication authorizations are not supported by this state store")
-    }
+        repository_id: i64,
+        locale: &str,
+        candidate_commit: &str,
+        authorization_key: &str,
+        state: PublicationState,
+    ) -> Result<()>;
     fn transition_publication_manifest(
         &self,
         repository_id: i64,
@@ -661,17 +682,6 @@ pub trait StateStore {
         locale: &str,
         commit: &str,
     ) -> Result<Vec<CanonicalSnapshot>>;
-    fn canonical_content_matches(
-        &self,
-        _repository_id: i64,
-        _locale: &str,
-        _source_revision: &str,
-        _binding: &PublicationManifestFile,
-        _file: &PublicationFile,
-    ) -> Result<bool> {
-        anyhow::bail!("canonical content binding is not supported by this state store")
-    }
-    fn canonical_compatible(&self, content_version_id: i64) -> Result<bool>;
     fn promote_merged_publication(
         &self,
         repository_id: i64,
@@ -680,4 +690,10 @@ pub trait StateStore {
         provenance: &str,
         verified_zero_unit_contents: &[i64],
     ) -> Result<usize>;
+}
+
+/// Aggregate required storage capabilities for the application composition root.
+pub trait StateStore:
+    DocumentStore + TranslationStore + RunStore + CanonicalStore + EffectStore + PublicationStore
+{
 }

@@ -881,7 +881,7 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
 
 #[test]
 fn completed_commit_without_authorization_requires_a_new_checked_effect() {
-    use fani::application::ports::StateStore;
+    use fani::application::ports::EffectStore;
     let fixture = fixture();
     let key = "publish:orphaned-authorization";
     let id = fixture
@@ -935,7 +935,7 @@ fn completed_commit_without_authorization_requires_a_new_checked_effect() {
 
 #[test]
 fn superseded_publication_key_creates_new_effect_without_reopening_history() {
-    use fani::application::ports::StateStore;
+    use fani::application::ports::EffectStore;
     let fixture = fixture();
     let base = "publish:roundtrip";
     let old = fixture

@@ -1,9 +1,11 @@
 use crate::adapters::process::process_identity;
 use crate::application::ports::{
     AttemptCandidateInput, AttemptInput, AttemptReceipt, CanonicalFile, CanonicalFileInput,
-    CanonicalTranslationInput, FailedAttemptContext, FindingInput, OutboxEntry, OutboxKind,
-    PublicationManifestInput, PullRequestStateInput, RecoveredAttempt, StateStore,
-    StoredPullRequest, TranslationCandidate, TrustTranslationInput, UnitHistory,
+    CanonicalStore, CanonicalTranslationInput, DocumentStore, EffectStore, FailedAttemptContext,
+    FindingInput, MaterializationIntentInput, MaterializationReceipt, OutboxEntry, OutboxKind,
+    PublicationManifestInput, PublicationStore, PullRequestStateInput, RecoveredAttempt, RunStore,
+    StateStore, StoredPullRequest, TranslationCandidate, TranslationStore, TrustTranslationInput,
+    UnitHistory,
 };
 use crate::domain::document::{UnitProvenance, validate_stored_translation};
 use crate::domain::model::{CanonicalTransition, PublicationState};
@@ -15,6 +17,138 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+struct StoredMaterializationIntent {
+    work_item_id: i64,
+    state: String,
+    repository_id: i64,
+    document_id: Option<i64>,
+    locale: String,
+    payload_json: String,
+}
+
+fn enqueue_document_work_item_in_transaction(
+    conn: &Connection,
+    run_id: &str,
+    document_id: i64,
+    locale: &str,
+    kind: &str,
+    priority: i64,
+    input_json: &str,
+) -> Result<i64> {
+    require_json(input_json)?;
+    if !matches!(kind, "assembly" | "materialization" | "project_check") {
+        bail!("document work must be assembly, materialization, or project_check");
+    }
+    let same_repository: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM documents d JOIN runs r ON r.repository_id=d.repository_id WHERE d.id=?1 AND r.id=?2)",
+            params![document_id, run_id], |row| row.get(0))?;
+    if !same_repository {
+        bail!("document work must belong to the run's repository");
+    }
+    conn.execute(
+            r#"INSERT INTO work_items(
+                   run_id,document_id,locale,kind,priority,input_json,created_at,updated_at,policy_fingerprint)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?7,
+                       (SELECT policy_fingerprint FROM runs WHERE id=?1))
+               ON CONFLICT(run_id,document_id,locale,kind,COALESCE(json_extract(input_json, '$.effect_key'), '')) WHERE document_id IS NOT NULL DO UPDATE SET
+                 priority=excluded.priority,
+                 input_json=excluded.input_json,
+                 policy_fingerprint=excluded.policy_fingerprint,
+                 updated_at=excluded.updated_at"#,
+            params![run_id, document_id, locale, kind, priority, input_json, now_ms()],
+        )?;
+    Ok(conn.query_row(
+            "SELECT id FROM work_items WHERE run_id=?1 AND document_id=?2 AND locale=?3 AND kind=?4 AND COALESCE(json_extract(input_json, '$.effect_key'), '')=COALESCE(json_extract(?5, '$.effect_key'), '')",
+            params![run_id, document_id, locale, kind, input_json],
+            |row| row.get(0),
+        )?)
+}
+
+fn supersede_materializations_in_transaction(
+    conn: &Connection,
+    repository_id: i64,
+    locale: &str,
+    path: &str,
+    active_dedupe_key: &str,
+) -> Result<usize> {
+    let now = now_ms();
+    let owners = {
+        let mut statement = conn.prepare(
+                r#"SELECT owner FROM materialization_outbox
+                   WHERE dedupe_key<>?3 AND state='processing'
+                     AND json_extract(payload_json,'$.locale')=?1
+                     AND json_extract(payload_json,'$.path')=?2
+                     AND work_item_id IN (SELECT w.id FROM work_items w JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?4)"#,
+            )?;
+        statement
+            .query_map(
+                params![locale, path, active_dedupe_key, repository_id],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if owners.iter().any(|owner| !dead_process_owner(owner)) {
+        bail!("older materialization for {path} is still owned by a live worker");
+    }
+    conn.execute(
+            "UPDATE work_items SET status='cancelled',updated_at=?4 WHERE id IN (SELECT o.work_item_id FROM materialization_outbox o JOIN work_items w ON w.id=o.work_item_id JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?5 AND o.dedupe_key<>?3 AND o.state<>'done' AND json_extract(o.payload_json,'$.locale')=?1 AND json_extract(o.payload_json,'$.path')=?2)",
+            params![locale, path, active_dedupe_key, now, repository_id],
+        )?;
+    let changed = conn.execute(
+            r#"UPDATE materialization_outbox
+               SET state='done',owner=NULL,lease_expires_at=NULL,
+                   last_error='superseded by newer canonical content',completed_at=?4
+               WHERE dedupe_key<>?3 AND state<>'done'
+                 AND json_extract(payload_json,'$.locale')=?1
+                 AND json_extract(payload_json,'$.path')=?2
+                 AND work_item_id IN (SELECT w.id FROM work_items w JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?5)"#,
+            params![locale, path, active_dedupe_key, now, repository_id],
+        )?;
+    Ok(changed)
+}
+
+fn enqueue_materialization_in_transaction(
+    conn: &Connection,
+    work_item_id: i64,
+    dedupe_key: &str,
+    payload_json: &str,
+    now: i64,
+) -> Result<i64> {
+    require_json(payload_json)?;
+    conn.execute(
+            "INSERT OR IGNORE INTO materialization_outbox(work_item_id,dedupe_key,payload_json,available_at,created_at) VALUES (?1,?2,?3,?4,?4)",
+            params![work_item_id, dedupe_key, payload_json, now],
+        )?;
+    Ok(conn.query_row(
+        "SELECT id FROM materialization_outbox WHERE dedupe_key=?1",
+        [dedupe_key],
+        |row| row.get(0),
+    )?)
+}
+
+fn bind_document_intent_in_transaction(
+    tx: &Connection,
+    content_version_id: i64,
+    identity_json: &str,
+) -> Result<()> {
+    tx.execute(
+            "INSERT OR IGNORE INTO canonical_document_intents(canonical_content_version_id,identity_json,created_at) VALUES (?1,?2,?3)",
+            params![content_version_id, identity_json, now_ms()],
+        )?;
+    let compatible: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM canonical_content_versions v JOIN canonical_files f ON f.id=v.canonical_file_id WHERE v.id=?1 AND v.source_revision=json_extract(?2,'$.source_revision') AND f.path=json_extract(?2,'$.target_path') AND f.locale=json_extract(?2,'$.locale'))",
+            params![content_version_id, identity_json], |row| row.get(0),
+        )?;
+    if !compatible {
+        bail!("canonical document identity conflicts with immutable content");
+    }
+    tx.execute(
+            "INSERT INTO canonical_document_intent_selection(canonical_content_version_id,intent_id) SELECT canonical_content_version_id,id FROM canonical_document_intents WHERE canonical_content_version_id=?1 AND identity_json=?2 ON CONFLICT(canonical_content_version_id) DO UPDATE SET intent_id=excluded.intent_id",
+            params![content_version_id, identity_json],
+        )?;
+    Ok(())
+}
 
 fn bound_request(
     conn: &Connection,
@@ -1177,34 +1311,19 @@ impl Database {
         priority: i64,
         input_json: &str,
     ) -> Result<i64> {
-        require_json(input_json)?;
-        if !matches!(kind, "assembly" | "materialization" | "project_check") {
-            bail!("document work must be assembly, materialization, or project_check");
-        }
-        let conn = self.connect()?;
-        let same_repository: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM documents d JOIN runs r ON r.repository_id=d.repository_id WHERE d.id=?1 AND r.id=?2)",
-            params![document_id, run_id], |row| row.get(0))?;
-        if !same_repository {
-            bail!("document work must belong to the run's repository");
-        }
-        conn.execute(
-            r#"INSERT INTO work_items(
-                   run_id,document_id,locale,kind,priority,input_json,created_at,updated_at,policy_fingerprint)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?7,
-                       (SELECT policy_fingerprint FROM runs WHERE id=?1))
-               ON CONFLICT(run_id,document_id,locale,kind,COALESCE(json_extract(input_json, '$.effect_key'), '')) WHERE document_id IS NOT NULL DO UPDATE SET
-                 priority=excluded.priority,
-                 input_json=excluded.input_json,
-                 policy_fingerprint=excluded.policy_fingerprint,
-                 updated_at=excluded.updated_at"#,
-            params![run_id, document_id, locale, kind, priority, input_json, now_ms()],
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = enqueue_document_work_item_in_transaction(
+            &tx,
+            run_id,
+            document_id,
+            locale,
+            kind,
+            priority,
+            input_json,
         )?;
-        Ok(conn.query_row(
-            "SELECT id FROM work_items WHERE run_id=?1 AND document_id=?2 AND locale=?3 AND kind=?4 AND COALESCE(json_extract(input_json, '$.effect_key'), '')=COALESCE(json_extract(?5, '$.effect_key'), '')",
-            params![run_id, document_id, locale, kind, input_json],
-            |row| row.get(0),
-        )?)
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt> {
@@ -1648,43 +1767,17 @@ impl Database {
         path: &str,
         active_dedupe_key: &str,
     ) -> Result<usize> {
-        let now = now_ms();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owners = {
-            let mut statement = tx.prepare(
-                r#"SELECT owner FROM materialization_outbox
-                   WHERE dedupe_key<>?3 AND state='processing'
-                     AND json_extract(payload_json,'$.locale')=?1
-                     AND json_extract(payload_json,'$.path')=?2
-                     AND work_item_id IN (SELECT w.id FROM work_items w JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?4)"#,
-            )?;
-            statement
-                .query_map(
-                    params![locale, path, active_dedupe_key, repository_id],
-                    |row| row.get::<_, String>(0),
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        if owners.iter().any(|owner| !dead_process_owner(owner)) {
-            bail!("older materialization for {path} is still owned by a live worker");
-        }
-        tx.execute(
-            "UPDATE work_items SET status='cancelled',updated_at=?4 WHERE id IN (SELECT o.work_item_id FROM materialization_outbox o JOIN work_items w ON w.id=o.work_item_id JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?5 AND o.dedupe_key<>?3 AND o.state<>'done' AND json_extract(o.payload_json,'$.locale')=?1 AND json_extract(o.payload_json,'$.path')=?2)",
-            params![locale, path, active_dedupe_key, now, repository_id],
-        )?;
-        let changed = tx.execute(
-            r#"UPDATE materialization_outbox
-               SET state='done',owner=NULL,lease_expires_at=NULL,
-                   last_error='superseded by newer canonical content',completed_at=?4
-               WHERE dedupe_key<>?3 AND state<>'done'
-                 AND json_extract(payload_json,'$.locale')=?1
-                 AND json_extract(payload_json,'$.path')=?2
-                 AND work_item_id IN (SELECT w.id FROM work_items w JOIN runs r ON r.id=w.run_id WHERE r.repository_id=?5)"#,
-            params![locale, path, active_dedupe_key, now, repository_id],
+        let result = supersede_materializations_in_transaction(
+            &tx,
+            repository_id,
+            locale,
+            path,
+            active_dedupe_key,
         )?;
         tx.commit()?;
-        Ok(changed)
+        Ok(result)
     }
 
     pub fn enqueue_materialization(
@@ -1693,18 +1786,18 @@ impl Database {
         dedupe_key: &str,
         payload_json: &str,
     ) -> Result<i64> {
-        require_json(payload_json)?;
         let now = now_ms();
-        let conn = self.connect()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO materialization_outbox(work_item_id,dedupe_key,payload_json,available_at,created_at) VALUES (?1,?2,?3,?4,?4)",
-            params![work_item_id, dedupe_key, payload_json, now],
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = enqueue_materialization_in_transaction(
+            &tx,
+            work_item_id,
+            dedupe_key,
+            payload_json,
+            now,
         )?;
-        Ok(conn.query_row(
-            "SELECT id FROM materialization_outbox WHERE dedupe_key=?1",
-            [dedupe_key],
-            |row| row.get(0),
-        )?)
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn enqueue_publication(
@@ -1999,6 +2092,25 @@ impl Database {
         input: CanonicalFileInput<'_>,
         translations: &[CanonicalTranslationInput<'_>],
     ) -> Result<CanonicalFile> {
+        self.persist_canonical_document_inner(input, translations, None)
+    }
+
+    pub fn persist_canonical_document(
+        &self,
+        input: CanonicalFileInput<'_>,
+        translations: &[CanonicalTranslationInput<'_>],
+        identity_json: &str,
+    ) -> Result<CanonicalFile> {
+        require_json(identity_json)?;
+        self.persist_canonical_document_inner(input, translations, Some(identity_json))
+    }
+
+    fn persist_canonical_document_inner(
+        &self,
+        input: CanonicalFileInput<'_>,
+        translations: &[CanonicalTranslationInput<'_>],
+        identity_json: Option<&str>,
+    ) -> Result<CanonicalFile> {
         let CanonicalFileInput {
             repository_id,
             locale,
@@ -2232,6 +2344,9 @@ impl Database {
         ).optional()?;
         if let Some(manifest_id) = manifest_id {
             refresh_publication_states(&tx, manifest_id, now)?;
+        }
+        if let Some(identity_json) = identity_json {
+            bind_document_intent_in_transaction(&tx, content_version_id, identity_json)?;
         }
         tx.commit()?;
         Ok(CanonicalFile {
@@ -3312,7 +3427,9 @@ fn new_id(prefix: &str) -> String {
     )
 }
 
-impl StateStore for Database {
+impl StateStore for Database {}
+
+impl DocumentStore for Database {
     fn upsert_repository(
         &self,
         repository_key: &str,
@@ -3378,6 +3495,19 @@ impl StateStore for Database {
         Database::unchanged_document_unit_keys(self, repository_id, path, content_hash)
     }
 
+    fn repository_id(&self, repository_key: &str) -> Result<Option<i64>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT id FROM repositories WHERE repository_key=?1",
+                [repository_key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+}
+
+impl TranslationStore for Database {
     fn translation_candidates(
         &self,
         document_id: i64,
@@ -3477,77 +3607,6 @@ impl StateStore for Database {
         Database::trust_translation(self, input)
     }
 
-    fn begin_run(
-        &self,
-        repository_id: i64,
-        invocation_key: &str,
-        config_path: &Path,
-        metadata_json: &str,
-        policy_fingerprint: &str,
-    ) -> Result<String> {
-        Database::begin_run(
-            self,
-            repository_id,
-            invocation_key,
-            config_path,
-            metadata_json,
-            policy_fingerprint,
-        )
-    }
-
-    fn finish_run(&self, run_id: &str, status: &str) -> Result<bool> {
-        Database::finish_run(self, run_id, status)
-    }
-
-    fn enqueue_work_item(
-        &self,
-        run_id: &str,
-        unit_id: i64,
-        locale: &str,
-        kind: &str,
-        priority: i64,
-        input_json: &str,
-    ) -> Result<i64> {
-        Database::enqueue_work_item(self, run_id, unit_id, locale, kind, priority, input_json)
-    }
-
-    fn enqueue_document_work_item(
-        &self,
-        run_id: &str,
-        document_id: i64,
-        locale: &str,
-        kind: &str,
-        priority: i64,
-        input_json: &str,
-    ) -> Result<i64> {
-        Database::enqueue_document_work_item(
-            self,
-            run_id,
-            document_id,
-            locale,
-            kind,
-            priority,
-            input_json,
-        )
-    }
-
-    fn finish_document_work(
-        &self,
-        work_item_id: i64,
-        succeeded: bool,
-        result_json: &str,
-    ) -> Result<()> {
-        require_json(result_json)?;
-        let conn = self.connect()?;
-        if conn.execute(
-            "UPDATE work_items SET status=?2,result_json=?3,updated_at=?4 WHERE id=?1 AND document_id IS NOT NULL",
-            params![work_item_id, if succeeded { "succeeded" } else { "failed" }, result_json, now_ms()],
-        )? != 1 {
-            bail!("document work completion requires a document-scoped work item");
-        }
-        Ok(())
-    }
-
     fn successful_attempt(
         &self,
         work_item_id: i64,
@@ -3643,11 +3702,86 @@ impl StateStore for Database {
             score,
         )
     }
+}
+
+impl RunStore for Database {
+    fn begin_run(
+        &self,
+        repository_id: i64,
+        invocation_key: &str,
+        config_path: &Path,
+        metadata_json: &str,
+        policy_fingerprint: &str,
+    ) -> Result<String> {
+        Database::begin_run(
+            self,
+            repository_id,
+            invocation_key,
+            config_path,
+            metadata_json,
+            policy_fingerprint,
+        )
+    }
+
+    fn finish_run(&self, run_id: &str, status: &str) -> Result<bool> {
+        Database::finish_run(self, run_id, status)
+    }
+
+    fn enqueue_work_item(
+        &self,
+        run_id: &str,
+        unit_id: i64,
+        locale: &str,
+        kind: &str,
+        priority: i64,
+        input_json: &str,
+    ) -> Result<i64> {
+        Database::enqueue_work_item(self, run_id, unit_id, locale, kind, priority, input_json)
+    }
+
+    fn enqueue_document_work_item(
+        &self,
+        run_id: &str,
+        document_id: i64,
+        locale: &str,
+        kind: &str,
+        priority: i64,
+        input_json: &str,
+    ) -> Result<i64> {
+        Database::enqueue_document_work_item(
+            self,
+            run_id,
+            document_id,
+            locale,
+            kind,
+            priority,
+            input_json,
+        )
+    }
+
+    fn finish_document_work(
+        &self,
+        work_item_id: i64,
+        succeeded: bool,
+        result_json: &str,
+    ) -> Result<()> {
+        require_json(result_json)?;
+        let conn = self.connect()?;
+        if conn.execute(
+            "UPDATE work_items SET status=?2,result_json=?3,updated_at=?4 WHERE id=?1 AND document_id IS NOT NULL",
+            params![work_item_id, if succeeded { "succeeded" } else { "failed" }, result_json, now_ms()],
+        )? != 1 {
+            bail!("document work completion requires a document-scoped work item");
+        }
+        Ok(())
+    }
 
     fn record_finding(&self, input: FindingInput<'_>) -> Result<i64> {
         Database::record_finding(self, input)
     }
+}
 
+impl CanonicalStore for Database {
     fn canonical_file(
         &self,
         repository_id: i64,
@@ -3684,25 +3818,62 @@ impl StateStore for Database {
         require_json(identity_json)?;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO canonical_document_intents(canonical_content_version_id,identity_json,created_at) VALUES (?1,?2,?3)",
-            params![content_version_id, identity_json, now_ms()],
-        )?;
-        let compatible: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM canonical_content_versions v JOIN canonical_files f ON f.id=v.canonical_file_id WHERE v.id=?1 AND v.source_revision=json_extract(?2,'$.source_revision') AND f.path=json_extract(?2,'$.target_path') AND f.locale=json_extract(?2,'$.locale'))",
-            params![content_version_id, identity_json], |row| row.get(0),
-        )?;
-        if !compatible {
-            bail!("canonical document identity conflicts with immutable content");
-        }
-        tx.execute(
-            "INSERT INTO canonical_document_intent_selection(canonical_content_version_id,intent_id) SELECT canonical_content_version_id,id FROM canonical_document_intents WHERE canonical_content_version_id=?1 AND identity_json=?2 ON CONFLICT(canonical_content_version_id) DO UPDATE SET intent_id=excluded.intent_id",
-            params![content_version_id, identity_json],
-        )?;
+        bind_document_intent_in_transaction(&tx, content_version_id, identity_json)?;
         tx.commit()?;
         Ok(())
     }
 
+    fn record_canonical_file_translations(
+        &self,
+        canonical_file_id: i64,
+        translations: &[CanonicalTranslationInput<'_>],
+        locale: &str,
+    ) -> Result<usize> {
+        Database::record_canonical_file_translations(self, canonical_file_id, translations, locale)
+    }
+
+    fn transition_canonical_file(
+        &self,
+        id: i64,
+        transition: CanonicalTransition,
+        materialized_hash: Option<&str>,
+    ) -> Result<()> {
+        Database::transition_canonical_file(self, id, transition, materialized_hash)
+    }
+
+    fn canonical_content_matches(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        source_revision: &str,
+        binding: &crate::application::ports::PublicationManifestFile,
+        file: &crate::application::ports::PublicationFile,
+    ) -> Result<bool> {
+        if format!("{:x}", Sha256::digest(&file.content)) != binding.content_hash {
+            return Ok(false);
+        }
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM canonical_content_versions v JOIN canonical_files f ON f.id=v.canonical_file_id WHERE v.id=?1 AND v.canonical_file_id=?2 AND v.content_hash=?3 AND v.source_revision=?4 AND v.content=?5 AND f.repository_id=?6 AND f.locale=?7 AND f.path=?8)",
+            params![binding.canonical_content_version_id,binding.canonical_file_id,binding.content_hash,source_revision,file.content,repository_id,locale,file.path],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn canonical_compatible(&self, content_version_id: i64) -> Result<bool> {
+        Database::canonical_compatible(self, content_version_id)
+    }
+
+    fn persist_canonical_document(
+        &self,
+        input: CanonicalFileInput<'_>,
+        translations: &[CanonicalTranslationInput<'_>],
+        identity_json: &str,
+    ) -> Result<CanonicalFile> {
+        Database::persist_canonical_document(self, input, translations, identity_json)
+    }
+}
+
+impl EffectStore for Database {
     fn pending_materializations(
         &self,
         repository_id: i64,
@@ -3796,24 +3967,6 @@ impl StateStore for Database {
             .optional()?)
     }
 
-    fn record_canonical_file_translations(
-        &self,
-        canonical_file_id: i64,
-        translations: &[CanonicalTranslationInput<'_>],
-        locale: &str,
-    ) -> Result<usize> {
-        Database::record_canonical_file_translations(self, canonical_file_id, translations, locale)
-    }
-
-    fn transition_canonical_file(
-        &self,
-        id: i64,
-        transition: CanonicalTransition,
-        materialized_hash: Option<&str>,
-    ) -> Result<()> {
-        Database::transition_canonical_file(self, id, transition, materialized_hash)
-    }
-
     fn supersede_materializations(
         &self,
         repository_id: i64,
@@ -3898,6 +4051,85 @@ impl StateStore for Database {
         Database::update_outbox_payload(self, kind, id, owner, payload_json)
     }
 
+    fn schedule_materialization(
+        &self,
+        input: MaterializationIntentInput<'_>,
+    ) -> Result<MaterializationReceipt> {
+        require_json(input.work_input_json)?;
+        require_json(input.payload_json)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx.query_row(
+            "SELECT o.work_item_id,o.state,r.repository_id,w.document_id,w.locale,o.payload_json FROM materialization_outbox o JOIN work_items w ON w.id=o.work_item_id JOIN runs r ON r.id=w.run_id WHERE o.dedupe_key=?1",
+            [input.dedupe_key],
+            |row| Ok(StoredMaterializationIntent {
+                work_item_id: row.get(0)?, state: row.get(1)?, repository_id: row.get(2)?,
+                document_id: row.get(3)?, locale: row.get(4)?, payload_json: row.get(5)?,
+            }),
+        ).optional()?;
+        if let Some(existing) = &existing {
+            if existing.repository_id != input.repository_id
+                || existing.document_id != Some(input.document_id)
+                || existing.locale != input.locale
+                || serde_json::from_str::<serde_json::Value>(&existing.payload_json)?
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(input.path)
+            {
+                bail!("materialization effect key conflicts with an existing durable intent");
+            }
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|existing| existing.state == "done")
+        {
+            bail!("materialization effect key is already terminal; resolve a new effect key");
+        }
+        let compatible: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM documents d JOIN runs r ON r.repository_id=d.repository_id WHERE d.id=?1 AND r.id=?2 AND r.repository_id=?3) AND json_extract(?4,'$.repository_id')=?3 AND json_extract(?4,'$.locale')=?5 AND json_extract(?4,'$.path')=?6 AND json_extract(?7,'$.effect_key')=?8",
+            params![input.document_id,input.run_id,input.repository_id,input.payload_json,input.locale,input.path,input.work_input_json,input.dedupe_key],
+            |row| row.get::<_, Option<bool>>(0),
+        )?.unwrap_or(false);
+        if !compatible {
+            bail!(
+                "materialization intent does not match its repository, document, locale, path or effect key"
+            );
+        }
+        supersede_materializations_in_transaction(
+            &tx,
+            input.repository_id,
+            input.locale,
+            input.path,
+            input.dedupe_key,
+        )?;
+        let work_item_id = match existing {
+            Some(existing) => existing.work_item_id,
+            None => enqueue_document_work_item_in_transaction(
+                &tx,
+                input.run_id,
+                input.document_id,
+                input.locale,
+                "materialization",
+                0,
+                input.work_input_json,
+            )?,
+        };
+        let outbox_id = enqueue_materialization_in_transaction(
+            &tx,
+            work_item_id,
+            input.dedupe_key,
+            input.payload_json,
+            now_ms(),
+        )?;
+        tx.commit()?;
+        Ok(MaterializationReceipt {
+            work_item_id,
+            outbox_id,
+        })
+    }
+}
+
+impl PublicationStore for Database {
     fn pull_request_for_branch(
         &self,
         repository_id: i64,
@@ -3964,28 +4196,6 @@ impl StateStore for Database {
         commit: &str,
     ) -> Result<Vec<crate::application::ports::CanonicalSnapshot>> {
         Database::publication_snapshot(self, repository_id, locale, commit)
-    }
-
-    fn canonical_content_matches(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        source_revision: &str,
-        binding: &crate::application::ports::PublicationManifestFile,
-        file: &crate::application::ports::PublicationFile,
-    ) -> Result<bool> {
-        if format!("{:x}", Sha256::digest(&file.content)) != binding.content_hash {
-            return Ok(false);
-        }
-        Ok(self.connect()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM canonical_content_versions v JOIN canonical_files f ON f.id=v.canonical_file_id WHERE v.id=?1 AND v.canonical_file_id=?2 AND v.content_hash=?3 AND v.source_revision=?4 AND v.content=?5 AND f.repository_id=?6 AND f.locale=?7 AND f.path=?8)",
-            params![binding.canonical_content_version_id,binding.canonical_file_id,binding.content_hash,source_revision,file.content,repository_id,locale,file.path],
-            |row| row.get(0),
-        )?)
-    }
-
-    fn canonical_compatible(&self, content_version_id: i64) -> Result<bool> {
-        Database::canonical_compatible(self, content_version_id)
     }
 
     fn promote_merged_publication(

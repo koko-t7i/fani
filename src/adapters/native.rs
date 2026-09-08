@@ -4,7 +4,7 @@ use crate::adapters::db::Database;
 use crate::adapters::documentation::NativeDocumentationChecker;
 use crate::adapters::github::GithubCodeHost;
 use crate::adapters::gitout::NativeGitPublisher;
-use crate::adapters::lock::RepoLock;
+use crate::adapters::lock::{RepoLock, RepositoryGuard};
 use crate::adapters::materialize::FilesystemMaterializer;
 use crate::adapters::process::current_process_identity;
 use crate::adapters::report;
@@ -293,7 +293,11 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
     let started = Local::now();
     let config = Config::load(&args.selection.config)?;
     config.check_environment()?;
-    let repositories = selected(&config, args.selection.repository.as_deref())?;
+    // Validate the complete selection before any repository can be changed.
+    let repositories = selected(&config, args.selection.repository.as_deref())?
+        .into_iter()
+        .map(|repo| Ok((repo, languages(repo, args.selection.language.as_deref())?)))
+        .collect::<Result<Vec<_>>>()?;
     let report_dir = args
         .report_dir
         .unwrap_or_else(|| PathBuf::from(".fani-report"));
@@ -305,64 +309,72 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
         quiet = args.quiet,
     );
 
-    for repo in repositories {
+    for (repo, selected_languages) in repositories {
         let mut repo = repo.clone();
         repo.reserved_paths.push(report_dir.clone());
-        let repo = match preflight_repo(&repo) {
-            Ok(repo) => repo,
-            Err(error) => {
-                for language in languages(&repo, args.selection.language.as_deref())? {
-                    let mut outcome = LanguageOutcome::new(&repo.path, &language);
-                    outcome.status = Status::Error;
-                    outcome.message = error.to_string();
-                    outcome.transitions.push("error:preflight".into());
-                    outcomes.push(outcome);
-                }
-                continue;
+        let mut stage = "preflight";
+        let mut repository_outcomes = Vec::new();
+        let result = (|| -> Result<()> {
+            let repo = preflight_repo(&repo)?;
+            let repo = &repo;
+            stage = "lock_busy";
+            let guard = RepositoryGuard::acquire(&repo.path)?;
+            stage = "database";
+            let database = open_database(repo)?;
+            database_paths.push(database.path().to_owned());
+            stage = "lock_busy";
+            let mut lock = RepoLock::acquire_guarded(database.clone(), guard)?;
+            stage = "owner_identity";
+            let owner_identity = owner_identity()?;
+            let materializer = FilesystemMaterializer;
+            let agents = RoutedAgentExecutor::new(&config);
+            let documentation = NativeDocumentationChecker;
+            let git = NativeGitPublisher;
+            let code_host = GithubCodeHost;
+            let orchestrator = Orchestrator::new(
+                repo,
+                &database,
+                &materializer,
+                &agents,
+                &documentation,
+                &git,
+                &code_host,
+                &args.selection.config,
+                &owner_identity,
+                crate::adapters::failpoint::reach,
+                output,
+                args.quiet,
+            );
+            for language in &selected_languages {
+                repository_outcomes.push(orchestrator.run_language(language));
             }
-        };
-        let repo = &repo;
-        let database = open_database(repo)?;
-        database_paths.push(database.path().to_owned());
-        let mut lock = match RepoLock::acquire(database.clone(), &repo.path) {
-            Ok(lock) => lock,
-            Err(error) => {
-                for language in languages(repo, args.selection.language.as_deref())? {
-                    let mut outcome = LanguageOutcome::new(&repo.path, &language);
-                    outcome.status = Status::Error;
-                    outcome.message = error.to_string();
-                    outcome.transitions.push("error:lock_busy".into());
-                    outcomes.push(outcome);
-                }
-                continue;
+            stage = "lock_release";
+            lock.release()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if repository_outcomes.is_empty() {
+                repository_outcomes.extend(
+                    selected_languages
+                        .iter()
+                        .map(|language| LanguageOutcome::new(&repo.path, language)),
+                );
             }
-        };
-        let materializer = FilesystemMaterializer;
-        let agents = RoutedAgentExecutor::new(&config);
-        let documentation = NativeDocumentationChecker;
-        let git = NativeGitPublisher;
-        let code_host = GithubCodeHost;
-        let owner_identity = owner_identity()?;
-        let orchestrator = Orchestrator::new(
-            repo,
-            &database,
-            &materializer,
-            &agents,
-            &documentation,
-            &git,
-            &code_host,
-            &args.selection.config,
-            &owner_identity,
-            crate::adapters::failpoint::reach,
-            output,
-            args.quiet,
-        );
-        for language in languages(repo, args.selection.language.as_deref())? {
-            let outcome = orchestrator.run_language(&language);
+            for outcome in &mut repository_outcomes {
+                outcome.status = Status::Error;
+                outcome.message = if outcome.message.is_empty() {
+                    error.to_string()
+                } else {
+                    format!("{}; {stage}: {error}", outcome.message)
+                };
+                outcome.transitions.push(format!("error:{stage}"));
+            }
+        }
+        for outcome in repository_outcomes {
             tracing::info!(
                 event = "locale.run.reported",
-                repository_id = %repository_trace_id(repo),
-                locale = %language,
+                repository_id = %repository_trace_id(&repo),
+                locale = %outcome.lang,
                 run_id = %crate::diagnostics::safe_id(&outcome.run_id),
                 status = outcome.status.as_str(),
                 duration_ms = (outcome.duration_s * 1000.0) as u64,
@@ -377,14 +389,13 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("repo"),
-                    language,
+                    outcome.lang,
                     outcome.status.as_str(),
                     outcome.message
                 ));
             }
             outcomes.push(outcome);
         }
-        lock.release()?;
     }
 
     let data = report::write(
@@ -500,8 +511,14 @@ fn doctor(config_path: PathBuf, output: &dyn OutputReporter) -> Result<CommandOu
                 repo.path.display()
             ));
         }
-        match open_database(repo) {
-            Ok(database) => {
+        // Opening may migrate the authoritative database, so doctor participates
+        // in the same process-lifetime exclusion as sync and reconciliation.
+        let opened = (|| -> Result<_> {
+            let guard = RepositoryGuard::acquire(&repo.path)?;
+            Ok((open_database(repo)?, guard))
+        })();
+        match opened {
+            Ok((database, _guard)) => {
                 if let Err(error) = database.integrity_check() {
                     problems += 1;
                     output.stdout(&format!(
@@ -549,8 +566,9 @@ fn reconcile(
     for repo in selected(&config, args.repository.as_deref())? {
         let repo = preflight_repo(repo)?;
         let repo = &repo;
+        let guard = RepositoryGuard::acquire(&repo.path)?;
         let database = open_database(repo)?;
-        let mut lock = RepoLock::acquire(database.clone(), &repo.path)?;
+        let mut lock = RepoLock::acquire_guarded(database.clone(), guard)?;
         let materializer = FilesystemMaterializer;
         let git = NativeGitPublisher;
         for language in languages(repo, args.language.as_deref())? {
