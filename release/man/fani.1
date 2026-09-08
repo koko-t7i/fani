@@ -1,12 +1,14 @@
 .TH FANI 1 "August 2026" "fani 0.3.0" "User Commands"
 .SH NAME
-fani \- continuous Markdown translation for Git and GitHub
+fani \- continuous Markdown and JSON translation for Git and GitHub
 .SH SYNOPSIS
 .B fani
 .I COMMAND
 .RI [ OPTIONS ]
 .SH DESCRIPTION
-fani reads Markdown from an immutable Git revision, reuses trusted translation memory from SQLite, delegates unresolved units to a built-in model provider or isolated custom Agent command, verifies assembled output, and can publish stable language branches and GitHub pull requests.
+fani reads Markdown and explicitly configured JSON message resources from an immutable Git revision, reuses trusted translation memory from SQLite, delegates unresolved units to a built-in model provider or isolated custom Agent command, verifies assembled output, and can publish stable language branches and GitHub pull requests.
+.PP
+JSON source sets require message_syntax plain or i18next-interpolation-v1. Only decoded string values are translated; keys, structure, nonstrings, and skipped empty or whitespace values are preserved. The interpolation dialect supports named or dotted arguments with fixed default delimiters, not plurals, ICU, formatting, nesting, or rich text. MDX remains unavailable because parser safety gates are blocked. Node is not a runtime dependency.
 .SH COMMANDS
 .TP
 .B init

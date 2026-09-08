@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "fani", version = VERSION, about = "Native continuous Markdown translation for Git and GitHub")]
+#[command(name = "fani", version = VERSION, about = "Native continuous Markdown and JSON translation for Git and GitHub")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

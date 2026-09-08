@@ -7,15 +7,16 @@ use crate::application::ports::{
     StateStore, TrustTranslationInput,
 };
 use crate::application::settings::RepoConfig;
-use crate::domain::markdown::{
-    MarkdownUnit, UnitTranslation, apply_translations, extract_units,
-    repair_leading_strong_separator, validate_translation,
+use crate::domain::document::{
+    DocumentFormat, ParsedDocument, TranslatableUnit, UnitTranslation, assemble_document,
+    repair_leading_strong_separator, unit_metadata, validate_provenance, validate_unit,
+    verify_document,
 };
 use crate::domain::matching::{MatchKind, PreviousUnit, match_units_with_stable_ids};
 use crate::domain::model::{
-    AgentResult, AgentStage, AgentTask, CanonicalTransition, DecisionCode, Finding,
-    FindingSeverity, Freshness, LanguageOutcome, MemoryTier, PlanSummary, PublicationState,
-    ReviewState, Status, TranslationProvenance, ValidationState,
+    AgentResult, AgentStage, AgentTask, CanonicalTransition, DecisionCode, DocumentStatistics,
+    Finding, FindingSeverity, Freshness, LanguageOutcome, MemoryTier, PlanSummary,
+    PublicationState, ReviewState, Status, TranslationProvenance, ValidationState,
 };
 use crate::domain::prompts;
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 const REPAIR_CONTEXT_VERSION: &str = "v6";
@@ -43,30 +44,61 @@ fn content_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn target_path(repo: &RepoConfig, language: &str, source_path: &str) -> Result<PathBuf> {
-    let value = repo
-        .target_pattern
-        .replace("{lang}", language)
-        .replace("{relpath}", source_path);
-    let path = PathBuf::from(value);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        bail!("target path escapes repository: {}", path.display());
+fn reusable_candidate(
+    path: &str,
+    unit: &TranslatableUnit,
+    candidate: &crate::application::ports::TranslationCandidate,
+    allow_candidate: bool,
+) -> bool {
+    !candidate.text.is_empty()
+        && (candidate.trusted
+            || (allow_candidate
+                && candidate.provenance.policy_fingerprint == prompts::policy_fingerprint()
+                && candidate
+                    .deterministic_model
+                    .as_deref()
+                    .is_none_or(|model| model == LEADING_STRONG_SEPARATOR_VERSION)))
+        && validate_provenance(path, unit, &candidate.provenance, &candidate.text).is_ok()
+}
+
+#[derive(Deserialize)]
+struct StoredReviewRequest {
+    schema: String,
+    task: AgentTask,
+}
+
+fn compatible_review_request(
+    receipt: &crate::application::ports::RecoveredAttempt,
+    stage: &str,
+    path: &str,
+    unit: &TranslatableUnit,
+    translated: &str,
+) -> bool {
+    let Ok(request) = serde_json::from_str::<StoredReviewRequest>(&receipt.request_json) else {
+        return false;
+    };
+    let task = request.task;
+    request.schema == crate::application::ports::AGENT_REQUEST_SCHEMA
+        && task.source_format == unit.context.format
+        && task.unit_context == unit.context
+        && task.context_key == unit.memory_context_key(path)
+        && task.message_syntax == crate::domain::document::message_syntax(unit)
+        && task.token_permissions == crate::domain::model::TokenPermissions::for_unit(unit)
+        && task.stage.as_str() == stage
+        && task.source == unit.protected_source
+        && (task.previous_translation.as_deref() == Some(translated)
+            || (stage == "revision"
+                && !receipt.output.trim().eq_ignore_ascii_case("OK")
+                && receipt.output == translated))
+}
+
+fn stable_unit_id(path: &str, unit: &TranslatableUnit, ordinal: usize) -> String {
+    if unit.context.format == DocumentFormat::Json {
+        return format!(
+            "unit-{}",
+            &hash(&[b"json-pointer-v1", path.as_bytes(), unit.id.as_bytes()])[..24]
+        );
     }
-    Ok(path)
-}
-
-fn kind_name(unit: &MarkdownUnit) -> String {
-    format!("{:?}", unit.kind)
-}
-
-fn stable_unit_id(path: &str, unit: &MarkdownUnit, ordinal: usize) -> String {
     format!(
         "unit-{}",
         &hash(&[
@@ -99,6 +131,84 @@ fn stable_unit_hints(
         .collect())
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentIdentity {
+    source_path: String,
+    source_revision: String,
+    source_hash: String,
+    source_set_id: String,
+    mapping_identity: String,
+    locale: String,
+    target_path: String,
+    contract: crate::domain::document::FormatContract,
+    request_schema: String,
+    policy_fingerprint: String,
+    request_identity: String,
+}
+
+impl DocumentIdentity {
+    fn request_hash(&self) -> String {
+        let mut request = self.clone();
+        request.request_identity.clear();
+        content_hash(&serde_json::to_vec(&request).expect("document identity serialization"))
+    }
+
+    fn mapping_hash(&self) -> String {
+        let mut mapping = self.clone();
+        mapping.source_revision.clear();
+        mapping.request_hash()
+    }
+}
+
+fn document_identity(
+    document: &crate::domain::model::SourceDocument,
+    language: &str,
+    parsed: &ParsedDocument,
+) -> DocumentIdentity {
+    let mut identity = DocumentIdentity {
+        source_path: document.path.clone(),
+        source_revision: document.source_revision.clone(),
+        source_hash: document.content_hash.clone(),
+        source_set_id: document.source_set_id.clone(),
+        mapping_identity: document.mapping_identity.clone(),
+        locale: language.into(),
+        target_path: document
+            .target_path(language)
+            .to_string_lossy()
+            .into_owned(),
+        contract: parsed.contract.clone(),
+        request_schema: crate::application::ports::AGENT_REQUEST_SCHEMA.into(),
+        policy_fingerprint: prompts::policy_fingerprint(),
+        request_identity: String::new(),
+    };
+    identity.request_identity = identity.request_hash();
+    identity
+}
+
+fn compatible_document_identity(stored: &DocumentIdentity, current: &DocumentIdentity) -> bool {
+    stored.request_identity == stored.request_hash()
+        && stored.mapping_hash() == current.mapping_hash()
+}
+
+fn count_formats(
+    statistics: &mut DocumentStatistics,
+    documents: &[crate::domain::model::SourceDocument],
+) {
+    statistics.markdown_files = documents
+        .iter()
+        .filter(|d| d.source_format == DocumentFormat::Markdown)
+        .count();
+    statistics.json_files = documents
+        .iter()
+        .filter(|d| d.source_format == DocumentFormat::Json)
+        .count();
+    statistics.mdx_files = documents
+        .iter()
+        .filter(|d| d.source_format == DocumentFormat::Mdx)
+        .count();
+}
+
 fn finding(path: &str, unit_id: Option<String>, code: &str, message: impl Into<String>) -> Finding {
     Finding {
         severity: FindingSeverity::Error,
@@ -111,31 +221,62 @@ fn finding(path: &str, unit_id: Option<String>, code: &str, message: impl Into<S
 
 #[derive(Deserialize)]
 struct UnitContext {
-    kind: String,
+    kind: crate::domain::document::UnitKind,
+    context: Option<crate::domain::document::UnitContext>,
+    contract: Option<crate::domain::document::FormatContract>,
 }
 
-fn previous_units(rows: &[crate::application::ports::UnitHistory]) -> Vec<PreviousUnit> {
+fn previous_units(
+    rows: &[crate::application::ports::UnitHistory],
+    candidates: &[crate::application::ports::TranslationCandidate],
+    path: &str,
+) -> Vec<PreviousUnit> {
+    let mut by_unit = HashMap::<_, Vec<_>>::new();
+    for candidate in candidates {
+        by_unit
+            .entry(candidate.unit_id)
+            .or_default()
+            .push(candidate);
+    }
     rows.iter()
         .filter_map(|row| {
-            let kind = serde_json::from_str::<UnitContext>(&row.context_json)
-                .ok()?
-                .kind;
-            let kind = match kind.as_str() {
-                "Paragraph" => crate::domain::markdown::UnitKind::Paragraph,
-                "Heading" => crate::domain::markdown::UnitKind::Heading,
-                "ListItem" => crate::domain::markdown::UnitKind::ListItem,
-                "TableCell" => crate::domain::markdown::UnitKind::TableCell,
-                "DefinitionTerm" => crate::domain::markdown::UnitKind::DefinitionTerm,
-                "Definition" => crate::domain::markdown::UnitKind::Definition,
-                _ => return None,
-            };
+            let stored = serde_json::from_str::<UnitContext>(&row.context_json).ok()?;
+            let context = stored
+                .context
+                .unwrap_or_else(crate::domain::document::UnitContext::markdown);
+            let compatible = stored.contract.as_ref().is_none_or(|contract| {
+                crate::domain::document::context_contract(&context)
+                    .as_ref()
+                    .ok()
+                    == Some(contract)
+            });
+            let kind = stored.kind;
+            let mut translation = row.translation.clone();
+            if translation.is_none() && context.format == DocumentFormat::Json {
+                if let Some(candidates) = by_unit.get(&row.id) {
+                    translation = candidates.iter().find_map(|candidate| {
+                        let bound = crate::domain::document::UnitProvenance {
+                            document_path: path.into(),
+                            source: row.source_text.clone(),
+                            source_revision: candidate.provenance.source_revision.clone(),
+                            context_json: row.context_json.clone(),
+                            policy_fingerprint: candidate.provenance.policy_fingerprint.clone(),
+                        };
+                        let previous = crate::domain::document::stored_unit(&bound)?;
+                        validate_provenance(path, &previous, &candidate.provenance, &candidate.text)
+                            .is_ok()
+                            .then(|| candidate.text.clone())
+                    });
+                }
+            }
             Some(PreviousUnit {
                 stable_id: row.unit_key.clone(),
                 kind,
+                context,
                 ordinal: row.ordinal,
                 source: row.source_text.clone(),
-                translation: row.translation.clone().unwrap_or_default(),
-                trusted: row.trusted,
+                translation: translation.unwrap_or_default(),
+                trusted: row.trusted && compatible,
             })
         })
         .collect()
@@ -143,7 +284,7 @@ fn previous_units(rows: &[crate::application::ports::UnitHistory]) -> Vec<Previo
 
 #[derive(Clone)]
 struct PlannedUnit {
-    markdown: MarkdownUnit,
+    unit: TranslatableUnit,
     database_id: i64,
     stable_id: String,
     translation: Option<String>,
@@ -153,16 +294,31 @@ struct PlannedUnit {
 }
 
 struct PlannedDocument {
+    identity: DocumentIdentity,
+    document_id: i64,
     source_path: String,
     target_path: String,
-    source: String,
+    parsed: ParsedDocument,
     units: Vec<PlannedUnit>,
     canonical_id: Option<i64>,
     expected_materialized_hash: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MaterializationPayload {
+    repository_id: i64,
+    locale: String,
+    path: String,
+    document_identity: DocumentIdentity,
+    content_hash: String,
+    canonical_content_version_id: i64,
+    canonical_file_id: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PublicationRecord {
+    #[serde(default)]
+    document_identity: Option<DocumentIdentity>,
     canonical_content_version_id: i64,
     canonical_file_id: i64,
     content: String,
@@ -285,24 +441,49 @@ impl<'a> Orchestrator<'a> {
         )
     }
 
+    fn invocation_key(&self, repository_id: i64, language: &str, revision: &str) -> Result<String> {
+        let configuration = json!({
+            "sources": self.repo.sources,
+            "include": self.repo.include,
+            "exclude": self.repo.exclude,
+            "target_pattern": self.repo.target_pattern,
+            "checks": self.repo.documentation.commands,
+            "check_timeout": self.repo.documentation.timeout_s,
+            "revision": self.repo.quality.revision,
+            "proofread": self.repo.quality.proofread,
+            "agent": self.agents.configuration_fingerprint()?,
+        });
+        Ok(format!(
+            "sync:{repository_id}:{language}:{revision}:{}:{}",
+            prompts::policy_fingerprint(),
+            content_hash(configuration.to_string().as_bytes())
+        ))
+    }
+
     pub fn plan_language(&self, language: &str) -> Result<PlanSummary> {
         let source_revision = self.git.resolve_source_revision(self.repo)?;
         let repository_id = self.repository_id()?;
-        let policy_fingerprint = prompts::policy_fingerprint();
-        let mut invocation =
-            format!("sync:{repository_id}:{language}:{source_revision}:{policy_fingerprint}");
-        if let Some(agent_fingerprint) = self.agents.configuration_fingerprint()? {
-            invocation.push(':');
-            invocation.push_str(&agent_fingerprint);
-        }
+        let invocation = self.invocation_key(repository_id, language, &source_revision)?;
         let documents = self.git.discover(self.repo, &source_revision)?;
         let mut pending = 0;
         let mut reused = 0;
         let mut conflicts = 0;
+        let mut document_statistics = DocumentStatistics::default();
+        count_formats(&mut document_statistics, &documents);
         for document in &documents {
-            let text = std::str::from_utf8(&document.bytes)
-                .with_context(|| format!("{} is not UTF-8", document.path))?;
-            let units = extract_units(text);
+            let parsed = match document.parse() {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    conflicts += 1;
+                    document_statistics.parse_failures += 1;
+                    continue;
+                }
+            };
+            let units = &parsed.units;
+            let mut translations = Vec::new();
+            if units.is_empty() {
+                document_statistics.pass_through_documents += 1;
+            }
             let stable_ids = units
                 .iter()
                 .enumerate()
@@ -315,27 +496,24 @@ impl<'a> Orchestrator<'a> {
                 &document.content_hash,
                 &stable_ids,
             )?;
-            let history = match self.database.document_id(repository_id, &document.path)? {
-                Some(document_id) => self.database.unit_history(document_id, language)?,
-                None => Vec::new(),
-            };
-            let matched =
-                match_units_with_stable_ids(&previous_units(&history), &units, &stable_hints);
+            let (history, candidates) =
+                match self.database.document_id(repository_id, &document.path)? {
+                    Some(document_id) => (
+                        self.database.unit_history(document_id, language)?,
+                        self.database
+                            .translation_candidates(document_id, language)?,
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
+            let matched = match_units_with_stable_ids(
+                &previous_units(&history, &candidates, &document.path),
+                units,
+                &stable_hints,
+            );
             for (ordinal, (unit, matched)) in units.iter().zip(matched).enumerate() {
                 match matched.kind {
                     MatchKind::Ambiguous => conflicts += 1,
-                    MatchKind::Exact | MatchKind::Moved
-                        if matched.trusted_reuse
-                            && matched
-                                .previous_translation
-                                .as_ref()
-                                .is_some_and(|text| !text.is_empty()) =>
-                    {
-                        reused += 1
-                    }
                     _ => {
-                        let context = kind_name(unit);
-                        let source_hash = hash(&[unit.source.as_bytes()]);
                         let stable_id = matched.stable_id.as_deref().or_else(|| {
                             (!stable_hints[ordinal].is_empty())
                                 .then_some(stable_hints[ordinal].as_str())
@@ -346,43 +524,47 @@ impl<'a> Orchestrator<'a> {
                                 .find(|row| row.unit_key == stable_id)
                                 .map(|row| row.id)
                         });
-                        let trusted = self.database.trusted_translation(
-                            repository_id,
-                            language,
-                            &source_hash,
-                            &context,
-                        )?;
-                        let candidate = match database_id {
-                            Some(database_id) => self.database.recoverable_invocation_candidate(
-                                &invocation,
-                                database_id,
+                        let candidate = candidates.iter().find(|candidate| {
+                            reusable_candidate(
+                                &document.path,
+                                unit,
+                                candidate,
+                                Some(candidate.unit_id) == database_id
+                                    && (candidate.invocation_key.as_deref()
+                                        == Some(invocation.as_str())
+                                        || !stable_hints[ordinal].is_empty()),
+                            )
+                        });
+                        let compatible = match candidate {
+                            Some(candidate) => self.reviews_compatible(
+                                &document.path,
+                                unit,
+                                candidate,
                                 language,
-                                &policy_fingerprint,
-                                LEADING_STRONG_SEPARATOR_VERSION,
+                                &invocation,
                             )?,
-                            None => None,
+                            None => false,
                         };
-                        let prior_candidate = match database_id {
-                            Some(database_id) if !stable_hints[ordinal].is_empty() => {
-                                self.database.recoverable_unit_candidate(
-                                    database_id,
-                                    language,
-                                    &policy_fingerprint,
-                                    LEADING_STRONG_SEPARATOR_VERSION,
-                                )?
-                            }
-                            _ => None,
-                        };
-                        if trusted.or(candidate).or(prior_candidate).is_some() {
+                        if compatible {
                             reused += 1;
+                            translations.push(UnitTranslation {
+                                id: unit.id.clone(),
+                                text: candidate.expect("compatible candidate").text.clone(),
+                            });
                         } else {
                             pending += 1;
                         }
                     }
                 }
             }
+            if translations.len() == units.len()
+                && assemble_document(&parsed, &translations).is_ok()
+            {
+                document_statistics.verified_documents += 1;
+            }
         }
         Ok(PlanSummary {
+            document_statistics,
             repository: self.repo.path.clone(),
             language: language.into(),
             source_revision,
@@ -400,6 +582,7 @@ impl<'a> Orchestrator<'a> {
         run_id: &str,
         language: &str,
         source_revision: &str,
+        statistics: &mut DocumentStatistics,
     ) -> Result<(Vec<PlannedDocument>, Vec<Finding>, usize, usize)> {
         let mut planned_documents = Vec::new();
         let mut conflicts = Vec::new();
@@ -407,11 +590,34 @@ impl<'a> Orchestrator<'a> {
         let mut scheduled = 0;
         let policy_fingerprint = prompts::policy_fingerprint();
         let documents = self.git.discover(self.repo, source_revision)?;
+        count_formats(statistics, &documents);
         for document in documents {
-            let source_text = String::from_utf8(document.bytes)
-                .with_context(|| format!("{} is not UTF-8", document.path))?;
-            let markdown_units = extract_units(&source_text);
-            let stable_ids = markdown_units
+            let parsed = match document.parse() {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    statistics.parse_failures += 1;
+                    conflicts.push(finding(
+                        &document.path,
+                        None,
+                        if matches!(
+                            error,
+                            crate::domain::document::DocumentError::MessageUnsupported
+                        ) {
+                            "MESSAGE-UNSUPPORTED"
+                        } else {
+                            "DOCUMENT-PARSE"
+                        },
+                        "source document could not be parsed under the configured contract",
+                    ));
+                    continue;
+                }
+            };
+            let identity = document_identity(&document, language, &parsed);
+            let document_units = &parsed.units;
+            if document_units.is_empty() {
+                statistics.pass_through_documents += 1;
+            }
+            let stable_ids = document_units
                 .iter()
                 .enumerate()
                 .map(|(ordinal, unit)| stable_unit_id(&document.path, unit, ordinal))
@@ -423,13 +629,18 @@ impl<'a> Orchestrator<'a> {
                 &document.content_hash,
                 &stable_ids,
             )?;
-            let history = match self.database.document_id(repository_id, &document.path)? {
-                Some(document_id) => self.database.unit_history(document_id, language)?,
-                None => Vec::new(),
-            };
+            let (history, candidates) =
+                match self.database.document_id(repository_id, &document.path)? {
+                    Some(document_id) => (
+                        self.database.unit_history(document_id, language)?,
+                        self.database
+                            .translation_candidates(document_id, language)?,
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
             let matched = match_units_with_stable_ids(
-                &previous_units(&history),
-                &markdown_units,
+                &previous_units(&history, &candidates, &document.path),
+                document_units,
                 &stable_hints,
             );
             if matched
@@ -437,16 +648,16 @@ impl<'a> Orchestrator<'a> {
                 .any(|matched| matched.kind == MatchKind::Ambiguous)
             {
                 conflicts.extend(
-                    markdown_units
+                    document_units
                         .iter()
                         .zip(&matched)
                         .filter(|(_, matched)| matched.kind == MatchKind::Ambiguous)
-                        .map(|(markdown, _)| {
+                        .map(|(unit, _)| {
                             finding(
                                 &document.path,
-                                Some(markdown.id.clone()),
+                                Some(unit.id.clone()),
                                 DecisionCode::AmbiguousMatch.as_str(),
-                                "multiple previous units match this Markdown unit",
+                                "multiple previous units match this document unit",
                             )
                         }),
                 );
@@ -457,58 +668,77 @@ impl<'a> Orchestrator<'a> {
                 &document.path,
                 Some(source_revision),
                 &document.content_hash,
-                "{}",
+                &serde_json::to_string(
+                    &json!({"format": parsed.format, "contract": parsed.contract}),
+                )?,
             )?;
+            self.database
+                .quarantine_incompatible_translations(document_id, language)?;
             let mut units = Vec::new();
-            for (ordinal, (markdown, matched)) in
-                markdown_units.into_iter().zip(matched).enumerate()
+            for (ordinal, (unit, matched)) in
+                document_units.iter().cloned().zip(matched).enumerate()
             {
                 let stable_id = matched
                     .stable_id
                     .clone()
                     .unwrap_or_else(|| stable_ids[ordinal].clone());
-                let source_hash = hash(&[markdown.source.as_bytes()]);
-                let context = kind_name(&markdown);
+                let source_hash = hash(&[unit.source.as_bytes()]);
+                let context = unit.memory_context_key(&document.path);
                 let database_id = self.database.upsert_unit(
                     document_id,
                     &stable_id,
                     ordinal as i64,
-                    &markdown.source,
+                    &unit.source,
                     &source_hash,
-                    &serde_json::to_string(&json!({"kind": context}))?,
+                    &unit_metadata(&unit, &document.path),
                 )?;
-                let candidate = self.database.recoverable_candidate(
-                    run_id,
-                    database_id,
-                    language,
-                    &policy_fingerprint,
-                    LEADING_STRONG_SEPARATOR_VERSION,
-                )?;
-                let prior_candidate = if stable_hints[ordinal].is_empty() {
-                    None
-                } else {
-                    self.database.recoverable_unit_candidate(
-                        database_id,
-                        language,
-                        &policy_fingerprint,
-                        LEADING_STRONG_SEPARATOR_VERSION,
-                    )?
-                };
-                let trusted = self.database.trusted_translation(
-                    repository_id,
-                    language,
-                    &source_hash,
-                    &context,
-                )?;
-                let reusable = trusted.or(candidate).or(prior_candidate).or_else(|| {
-                    (matched.trusted_reuse
-                        && matches!(matched.kind, MatchKind::Exact | MatchKind::Moved))
-                    .then_some(matched.previous_translation.clone())
-                    .flatten()
-                    .filter(|text| !text.is_empty())
+                let reusable = candidates.iter().find(|candidate| {
+                    reusable_candidate(
+                        &document.path,
+                        &unit,
+                        candidate,
+                        candidate.unit_id == database_id
+                            && (candidate.run_id.as_deref() == Some(run_id)
+                                || !stable_hints[ordinal].is_empty()),
+                    )
                 });
+                let reusable = match reusable {
+                    Some(candidate)
+                        if self.reviews_compatible(
+                            &document.path,
+                            &unit,
+                            candidate,
+                            language,
+                            run_id,
+                        )? =>
+                    {
+                        Some(candidate)
+                    }
+                    _ => None,
+                };
+                if let Some(candidate) = reusable.filter(|candidate| !candidate.trusted) {
+                    if crate::domain::document::compatible_metadata(&candidate.provenance)
+                        .is_some_and(|metadata| metadata.needs_markdown_snapshot_upgrade())
+                    {
+                        self.database
+                            .revalidate_candidate(database_id, language, candidate)?;
+                    }
+                }
+                if let Some(candidate) = reusable.filter(|candidate| candidate.trusted) {
+                    self.database.trust_translation(TrustTranslationInput {
+                        repository_id,
+                        unit_id: Some(database_id),
+                        locale: language,
+                        source_hash: &source_hash,
+                        context_key: &context,
+                        target_text: &candidate.text,
+                        provenance: "compatible_memory",
+                        policy_fingerprint: &policy_fingerprint,
+                    })?;
+                }
+                let reusable = reusable.map(|candidate| candidate.text.clone());
                 let mut planned = PlannedUnit {
-                    markdown,
+                    unit,
                     database_id,
                     stable_id,
                     translation: reusable,
@@ -523,6 +753,7 @@ impl<'a> Orchestrator<'a> {
                             "source_revision": source_revision,
                             "path": document.path,
                             "unit": planned.stable_id,
+                            "document_identity": identity,
                         }))?;
                         planned.work_item_id = Some(self.database.enqueue_work_item(
                             run_id,
@@ -538,6 +769,7 @@ impl<'a> Orchestrator<'a> {
                         "source_revision": source_revision,
                         "path": document.path,
                         "unit": planned.stable_id,
+                            "document_identity": identity,
                     }))?;
                     planned.work_item_id = Some(self.database.enqueue_work_item(
                         run_id,
@@ -551,7 +783,7 @@ impl<'a> Orchestrator<'a> {
                 }
                 units.push(planned);
             }
-            let target = target_path(self.repo, language, &document.path)?;
+            let target = document.target_path(language);
             let target_path = target.to_string_lossy().into_owned();
             let canonical = self
                 .database
@@ -561,17 +793,9 @@ impl<'a> Orchestrator<'a> {
                     .materializer
                     .read(&self.repo.path, &target)?
                     .map(|bytes| content_hash(&bytes));
-                if actual.as_deref() == Some(canonical.content_hash.as_str()) {
-                    if canonical.materialized_hash.as_deref()
-                        != Some(canonical.content_hash.as_str())
-                    {
-                        self.database.transition_canonical_file(
-                            canonical.id,
-                            CanonicalTransition::Materialized,
-                            Some(&canonical.content_hash),
-                        )?;
-                    }
-                } else if actual.as_deref() != canonical.materialized_hash.as_deref() {
+                if actual.as_deref() != Some(canonical.content_hash.as_str())
+                    && actual.as_deref() != canonical.materialized_hash.as_deref()
+                {
                     conflicts.push(finding(
                         &target_path,
                         None,
@@ -581,15 +805,90 @@ impl<'a> Orchestrator<'a> {
                 }
             }
             planned_documents.push(PlannedDocument {
+                identity,
+                document_id,
                 source_path: document.path,
                 target_path,
-                source: source_text,
+                parsed,
                 units,
                 canonical_id: canonical.as_ref().map(|value| value.id),
                 expected_materialized_hash: canonical.and_then(|value| value.materialized_hash),
             });
         }
         Ok((planned_documents, conflicts, reused, scheduled))
+    }
+
+    fn reviews_compatible(
+        &self,
+        path: &str,
+        unit: &TranslatableUnit,
+        candidate: &crate::application::ports::TranslationCandidate,
+        language: &str,
+        run_or_invocation: &str,
+    ) -> Result<bool> {
+        if !self.repo.quality.revision && !self.repo.quality.proofread {
+            return Ok(true);
+        }
+        for receipt in
+            self.database
+                .review_attempts(candidate.unit_id, language, run_or_invocation)?
+        {
+            let stage = receipt.dedupe_key.rsplit(':').next().unwrap_or("");
+            if (stage == "revision" && !self.repo.quality.revision)
+                || (stage == "proofread" && !self.repo.quality.proofread)
+            {
+                continue;
+            }
+            if !compatible_review_request(&receipt, stage, path, unit, &candidate.text)
+                || !receipt.provenance.as_ref().is_some_and(|bound| {
+                    bound.policy_fingerprint == prompts::policy_fingerprint()
+                        && validate_provenance(path, unit, bound, &unit.protected_source).is_ok()
+                })
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn recovered_attempt(
+        &self,
+        work_item_id: i64,
+        key: &str,
+        path: &str,
+        unit: &TranslatableUnit,
+        translation: bool,
+        reviewed_translation: Option<&str>,
+    ) -> Result<Option<crate::application::ports::RecoveredAttempt>> {
+        let Some(receipt) = self.database.successful_attempt(work_item_id, key)? else {
+            return Ok(None);
+        };
+        let approval =
+            key.ends_with(":revision") && receipt.output.trim().eq_ignore_ascii_case("OK");
+        let text = if translation && !approval {
+            receipt.output.as_str()
+        } else {
+            unit.protected_source.as_str()
+        };
+        let review_matches = reviewed_translation.is_none_or(|text| {
+            compatible_review_request(
+                &receipt,
+                key.rsplit(':').next().unwrap_or(""),
+                path,
+                unit,
+                text,
+            )
+        });
+        if review_matches
+            && receipt.provenance.as_ref().is_some_and(|provenance| {
+                provenance.policy_fingerprint == prompts::policy_fingerprint()
+                    && validate_provenance(path, unit, provenance, text).is_ok()
+            })
+        {
+            return Ok(Some(receipt));
+        }
+        self.database.retire_attempt(receipt.id)?;
+        Ok(None)
     }
 
     fn dispatch(
@@ -608,18 +907,20 @@ impl<'a> Orchestrator<'a> {
                     continue;
                 }
                 let dedupe_key = format!("{}:translate", unit.stable_id);
-                if let Some(recovered) = self
-                    .database
-                    .successful_attempt(work_item_id, &dedupe_key)?
-                {
-                    validate_translation(&unit.markdown, &recovered.output).map_err(
-                        |findings| {
-                            anyhow!(
-                                "durable Agent output for {} failed validation: {findings:?}",
-                                unit.stable_id
-                            )
-                        },
-                    )?;
+                if let Some(recovered) = self.recovered_attempt(
+                    work_item_id,
+                    &dedupe_key,
+                    &document.source_path,
+                    &unit.unit,
+                    true,
+                    None,
+                )? {
+                    validate_unit(&unit.unit, &recovered.output).map_err(|findings| {
+                        anyhow!(
+                            "durable Agent output for {} failed validation: {findings:?}",
+                            unit.stable_id
+                        )
+                    })?;
                     self.database.select_canonical_candidate(
                         unit.database_id,
                         language,
@@ -639,16 +940,21 @@ impl<'a> Orchestrator<'a> {
                     continue;
                 }
                 tasks.push(AgentTask {
+                    source_format: unit.unit.context.format,
+                    unit_context: unit.unit.context.clone(),
+                    context_key: unit.unit.memory_context_key(&document.source_path),
+                    message_syntax: crate::domain::document::message_syntax(&unit.unit),
+                    token_permissions: crate::domain::model::TokenPermissions::for_unit(&unit.unit),
                     id: unit.stable_id.clone(),
                     stage: AgentStage::Translate,
                     source_language: "auto".into(),
                     target_language: language.into(),
-                    source: unit.markdown.protected_source.clone(),
+                    source: unit.unit.protected_source.clone(),
                     previous_source: unit.previous_source.clone(),
                     previous_translation: unit.previous_translation.clone(),
                     findings: Vec::new(),
                     protected_tokens: unit
-                        .markdown
+                        .unit
                         .protected
                         .iter()
                         .map(|span| span.token.clone())
@@ -667,7 +973,7 @@ impl<'a> Orchestrator<'a> {
         let provider_fingerprint = execution.provider_fingerprint;
         let results = execution.results;
         self.log(&format!(
-            "    dispatched {} native Markdown unit(s) to {}",
+            "    dispatched {} native document unit(s) to {}",
             tasks.len(),
             agent_name
         ));
@@ -685,7 +991,7 @@ impl<'a> Orchestrator<'a> {
                 };
                 let dedupe_key = format!("{}:translate", unit.stable_id);
                 if result.ok {
-                    match validate_translation(&unit.markdown, &result.output) {
+                    match validate_unit(&unit.unit, &result.output) {
                         Ok(_) => {
                             let candidate_key = format!("attempt:{dedupe_key}");
                             self.database
@@ -732,7 +1038,7 @@ impl<'a> Orchestrator<'a> {
                                 status: "failed",
                                 request_json: result.request_json.as_str(),
                                 response_json: result.response_json.as_deref(),
-                                error: Some("deterministic Markdown validation failed"),
+                                error: Some("deterministic document validation failed"),
                             })?;
                             for validation in findings {
                                 self.database.record_finding(FindingInput {
@@ -801,8 +1107,8 @@ impl<'a> Orchestrator<'a> {
                 let Some(rejected) = failed.output.as_deref() else {
                     continue;
                 };
-                let Some(repaired) = repair_leading_strong_separator(&unit.markdown, rejected)
-                    .filter(|output| validate_translation(&unit.markdown, output).is_ok())
+                let Some(repaired) = repair_leading_strong_separator(&unit.unit, rejected)
+                    .filter(|output| validate_unit(&unit.unit, output).is_ok())
                 else {
                     continue;
                 };
@@ -810,10 +1116,14 @@ impl<'a> Orchestrator<'a> {
                     "{}:repair:{REPAIR_CONTEXT_VERSION}:{LEADING_STRONG_SEPARATOR_VERSION}",
                     unit.stable_id
                 );
-                if let Some(recovered) = self
-                    .database
-                    .successful_attempt(work_item_id, &deterministic_key)?
-                {
+                if let Some(recovered) = self.recovered_attempt(
+                    work_item_id,
+                    &deterministic_key,
+                    &document.source_path,
+                    &unit.unit,
+                    true,
+                    None,
+                )? {
                     self.database.select_canonical_candidate(
                         unit.database_id,
                         language,
@@ -890,18 +1200,20 @@ impl<'a> Orchestrator<'a> {
                     };
                     let dedupe_key =
                         format!("{}:repair:{REPAIR_CONTEXT_VERSION}:{round}", unit.stable_id);
-                    if let Some(recovered) = self
-                        .database
-                        .successful_attempt(work_item_id, &dedupe_key)?
-                    {
-                        validate_translation(&unit.markdown, &recovered.output).map_err(
-                            |findings| {
-                                anyhow!(
-                                    "durable repair output for {} failed validation: {findings:?}",
-                                    unit.stable_id
-                                )
-                            },
-                        )?;
+                    if let Some(recovered) = self.recovered_attempt(
+                        work_item_id,
+                        &dedupe_key,
+                        &document.source_path,
+                        &unit.unit,
+                        true,
+                        None,
+                    )? {
+                        validate_unit(&unit.unit, &recovered.output).map_err(|findings| {
+                            anyhow!(
+                                "durable repair output for {} failed validation: {findings:?}",
+                                unit.stable_id
+                            )
+                        })?;
                         self.database.select_canonical_candidate(
                             unit.database_id,
                             language,
@@ -929,7 +1241,7 @@ impl<'a> Orchestrator<'a> {
                     let mut repair_findings = failed
                         .as_ref()
                         .and_then(|context| context.output.as_deref())
-                        .and_then(|output| validate_translation(&unit.markdown, output).err())
+                        .and_then(|output| validate_unit(&unit.unit, output).err())
                         .map(|validation| {
                             validation
                                 .into_iter()
@@ -953,21 +1265,28 @@ impl<'a> Orchestrator<'a> {
                                 .as_ref()
                                 .and_then(|context| context.error.as_deref())
                                 .unwrap_or(
-                                    "previous output failed deterministic Markdown validation",
+                                    "previous output failed deterministic document validation",
                                 ),
                         ));
                     }
                     tasks.push(AgentTask {
+                        source_format: unit.unit.context.format,
+                        unit_context: unit.unit.context.clone(),
+                        context_key: unit.unit.memory_context_key(&document.source_path),
+                        message_syntax: crate::domain::document::message_syntax(&unit.unit),
+                        token_permissions: crate::domain::model::TokenPermissions::for_unit(
+                            &unit.unit,
+                        ),
                         id: unit.stable_id.clone(),
                         stage: AgentStage::Repair,
                         source_language: "auto".into(),
                         target_language: language.into(),
-                        source: unit.markdown.protected_source.clone(),
+                        source: unit.unit.protected_source.clone(),
                         previous_source: unit.previous_source.clone(),
                         previous_translation,
                         findings: repair_findings,
                         protected_tokens: unit
-                            .markdown
+                            .unit
                             .protected
                             .iter()
                             .map(|span| span.token.clone())
@@ -1003,7 +1322,7 @@ impl<'a> Orchestrator<'a> {
                     };
                     let dedupe_key =
                         format!("{}:repair:{REPAIR_CONTEXT_VERSION}:{round}", unit.stable_id);
-                    if result.ok && validate_translation(&unit.markdown, &result.output).is_ok() {
+                    if result.ok && validate_unit(&unit.unit, &result.output).is_ok() {
                         self.database
                             .record_attempt_candidate(AttemptCandidateInput {
                                 attempt: AttemptInput {
@@ -1055,13 +1374,13 @@ impl<'a> Orchestrator<'a> {
                             request_json: result.request_json.as_str(),
                             response_json: result.response_json.as_deref(),
                             error: Some(if result.ok {
-                                "deterministic Markdown validation failed"
+                                "deterministic document validation failed"
                             } else {
                                 result.diagnostic.as_str()
                             }),
                         })?;
                         if result.ok {
-                            for validation in validate_translation(&unit.markdown, &result.output)
+                            for validation in validate_unit(&unit.unit, &result.output)
                                 .expect_err("invalid repair output was checked above")
                             {
                                 self.database.record_finding(FindingInput {
@@ -1117,15 +1436,19 @@ impl<'a> Orchestrator<'a> {
                         continue;
                     };
                     let dedupe_key = format!("{}:{stage_name}", unit.stable_id);
-                    if let Some(recovered) = self
-                        .database
-                        .successful_attempt(work_item_id, &dedupe_key)?
-                    {
+                    if let Some(recovered) = self.recovered_attempt(
+                        work_item_id,
+                        &dedupe_key,
+                        &document.source_path,
+                        &unit.unit,
+                        blocking,
+                        unit.translation.as_deref(),
+                    )? {
                         if recovered.output.trim().eq_ignore_ascii_case("OK") {
                             continue;
                         }
                         if blocking {
-                            validate_translation(&unit.markdown, &recovered.output).map_err(
+                            validate_unit(&unit.unit, &recovered.output).map_err(
                                 |validation| {
                                     anyhow!(
                                         "durable revision output for {} failed validation: {validation:?}",
@@ -1165,16 +1488,23 @@ impl<'a> Orchestrator<'a> {
                         continue;
                     }
                     tasks.push(AgentTask {
+                        source_format: unit.unit.context.format,
+                        unit_context: unit.unit.context.clone(),
+                        context_key: unit.unit.memory_context_key(&document.source_path),
+                        message_syntax: crate::domain::document::message_syntax(&unit.unit),
+                        token_permissions: crate::domain::model::TokenPermissions::for_unit(
+                            &unit.unit,
+                        ),
                         id: unit.stable_id.clone(),
                         stage: stage.clone(),
                         source_language: "auto".into(),
                         target_language: language.into(),
-                        source: unit.markdown.protected_source.clone(),
-                        previous_source: Some(unit.markdown.protected_source.clone()),
+                        source: unit.unit.protected_source.clone(),
+                        previous_source: Some(unit.unit.protected_source.clone()),
                         previous_translation: unit.translation.clone(),
                         findings: Vec::new(),
                         protected_tokens: unit
-                            .markdown
+                            .unit
                             .protected
                             .iter()
                             .map(|span| span.token.clone())
@@ -1262,7 +1592,7 @@ impl<'a> Orchestrator<'a> {
                         continue;
                     }
                     if blocking {
-                        match validate_translation(&unit.markdown, &result.output) {
+                        match validate_unit(&unit.unit, &result.output) {
                             Ok(_) => {
                                 self.database
                                     .record_attempt_candidate(AttemptCandidateInput {
@@ -1308,7 +1638,7 @@ impl<'a> Orchestrator<'a> {
                                     status: "failed",
                                     request_json: result.request_json.as_str(),
                                     response_json: result.response_json.as_deref(),
-                                    error: Some("deterministic Markdown validation failed"),
+                                    error: Some("deterministic document validation failed"),
                                 })?;
                                 findings.push(finding(
                                     &document.source_path,
@@ -1361,7 +1691,7 @@ impl<'a> Orchestrator<'a> {
         let mut written = Vec::new();
         let mut candidates = Vec::new();
         let mut findings = Vec::new();
-        for document in documents {
+        for document in documents.iter() {
             let missing: Vec<_> = document
                 .units
                 .iter()
@@ -1392,26 +1722,92 @@ impl<'a> Orchestrator<'a> {
                 .units
                 .iter()
                 .map(|unit| UnitTranslation {
-                    id: unit.markdown.id.clone(),
+                    id: unit.unit.id.clone(),
                     text: unit.translation.clone().expect("checked translation"),
                 })
                 .collect();
-            let assembled = apply_translations(
-                &document.source,
-                &document
-                    .units
-                    .iter()
-                    .map(|unit| unit.markdown.clone())
-                    .collect::<Vec<_>>(),
-                &translations,
-            )
-            .with_context(|| format!("cannot assemble {}", document.source_path))?;
-            let desired = assembled.into_bytes();
+            let work_item_id = self.database.enqueue_document_work_item(
+                run_id,
+                document.document_id,
+                language,
+                "assembly",
+                0,
+                &serde_json::to_string(&json!({
+                    "source_revision": source_revision,
+                    "path": document.source_path,
+                    "target_path": document.target_path,
+                    "contract": document.parsed.contract,
+                    "document_identity": document.identity,
+                }))?,
+            )?;
+            match assemble_document(&document.parsed, &translations) {
+                Ok(assembled) => {
+                    self.database.finish_document_work(
+                        work_item_id,
+                        true,
+                        &json!({"content_hash": content_hash(assembled.as_bytes())}).to_string(),
+                    )?;
+                    candidates.push(PublicationFile {
+                        path: document.target_path.clone(),
+                        content: assembled.into_bytes(),
+                    });
+                }
+                Err(_) => {
+                    let message = "document assembly or deterministic verification failed";
+                    self.database.record_finding(FindingInput {
+                        work_item_id,
+                        attempt_id: None,
+                        finding_key: "DOCUMENT-VERIFY",
+                        severity: "error",
+                        code: "DOCUMENT-VERIFY",
+                        message,
+                        details_json: "{}",
+                    })?;
+                    self.database.finish_document_work(
+                        work_item_id,
+                        false,
+                        "{\"code\":\"DOCUMENT-VERIFY\"}",
+                    )?;
+                    findings.push(finding(
+                        &document.source_path,
+                        None,
+                        "DOCUMENT-VERIFY",
+                        message,
+                    ));
+                }
+            }
+        }
+        if findings
+            .iter()
+            .any(|item| item.severity == FindingSeverity::Error)
+        {
+            return Ok((written, candidates, findings));
+        }
+        findings.extend(self.check_documentation(
+            run_id,
+            language,
+            source_revision,
+            documents,
+            &candidates,
+        )?);
+        if findings
+            .iter()
+            .any(|item| item.severity == FindingSeverity::Error)
+        {
+            return Ok((written, candidates, findings));
+        }
+        if !candidates.is_empty() {
+            (self.failpoint)("project_checks_completed");
+        }
+        for document in documents {
+            let Some(candidate) = candidates
+                .iter()
+                .find(|file| file.path == document.target_path)
+            else {
+                continue;
+            };
+            let desired = candidate.content.clone();
             let desired_hash = content_hash(&desired);
-            candidates.push(PublicationFile {
-                path: document.target_path.clone(),
-                content: desired.clone(),
-            });
             let exact_translations = document
                 .units
                 .iter()
@@ -1430,7 +1826,11 @@ impl<'a> Orchestrator<'a> {
                     content_hash: &desired_hash,
                     materialized_hash: document.expected_materialized_hash.as_deref(),
                     freshness: Freshness::Exact,
-                    provenance: TranslationProvenance::Ai,
+                    provenance: if document.units.is_empty() {
+                        TranslationProvenance::Imported
+                    } else {
+                        TranslationProvenance::Ai
+                    },
                     validation: ValidationState::Passed,
                     review: ReviewState::Unreviewed,
                     publication: PublicationState::Candidate,
@@ -1439,32 +1839,56 @@ impl<'a> Orchestrator<'a> {
                 },
                 &exact_translations,
             )?;
+            self.database.bind_canonical_document_intent(
+                canonical.content_version_id,
+                &serde_json::to_string(&document.identity)?,
+            )?;
             let canonical_id = canonical.id;
             document.canonical_id = Some(canonical_id);
-            let unit = document.units.first().ok_or_else(|| {
-                anyhow!(
-                    "{} has no translatable Markdown units",
-                    document.source_path
-                )
-            })?;
-            let work_item_id = if let Some(id) = unit.work_item_id {
-                id
-            } else {
-                self.database.enqueue_work_item(
-                    run_id,
-                    unit.database_id,
-                    language,
-                    "materialize",
-                    0,
-                    "{}",
-                )?
-            };
+            (self.failpoint)("canonical_persisted_before_outbox");
             let dedupe = format!(
-                "materialize:{repository_id}:{language}:{}:{desired_hash}",
-                document.target_path
+                "materialize:{repository_id}:{language}:{}:{desired_hash}:{}",
+                document.target_path,
+                document.identity.mapping_hash(),
             );
-            self.database
-                .supersede_materializations(language, &document.target_path, &dedupe)?;
+            let base_dedupe = dedupe;
+            let dedupe = self
+                .database
+                .effect_key(OutboxKind::Materialization, &base_dedupe)?;
+            let pending_work = self.database.materialization_work(&dedupe)?;
+            // Terminal receipts describe history, not the current target bytes.
+            if pending_work.is_none()
+                && dedupe != base_dedupe
+                && self
+                    .materializer
+                    .read(&self.repo.path, Path::new(&document.target_path))?
+                    .is_some_and(|bytes| bytes == desired)
+            {
+                self.database.transition_canonical_file(
+                    canonical_id,
+                    CanonicalTransition::Materialized,
+                    Some(&desired_hash),
+                )?;
+                continue;
+            }
+            self.database.supersede_materializations(
+                repository_id,
+                language,
+                &document.target_path,
+                &dedupe,
+            )?;
+            let work_item_id = match pending_work {
+                Some(id) => id,
+                None => self.database.enqueue_document_work_item(
+                    run_id,
+                    document.document_id,
+                    language,
+                    "materialization",
+                    0,
+                    &json!({"document_identity": document.identity, "content_hash": desired_hash, "effect_key": dedupe})
+                        .to_string(),
+                )?,
+            };
             self.database.enqueue_materialization(
                 work_item_id,
                 &dedupe,
@@ -1472,6 +1896,10 @@ impl<'a> Orchestrator<'a> {
                     "repository_id": repository_id,
                     "locale": language,
                     "path": document.target_path,
+                    "document_identity": document.identity,
+                    "content_hash": desired_hash,
+                    "canonical_content_version_id": canonical.content_version_id,
+                    "canonical_file_id": canonical.id,
                 }))?,
             )?;
             let owner = format!("materialize:{}:{run_id}", self.owner_identity);
@@ -1483,6 +1911,50 @@ impl<'a> Orchestrator<'a> {
                 60_000,
             )?;
             if let Some(entry) = claimed {
+                let payload =
+                    serde_json::from_str::<MaterializationPayload>(&entry.payload_json).ok();
+                let compatible = if let Some(payload) = payload {
+                    payload.repository_id == repository_id
+                        && payload.locale == language
+                        && payload.path == document.target_path
+                        && payload.content_hash == desired_hash
+                        && compatible_document_identity(
+                            &payload.document_identity,
+                            &document.identity,
+                        )
+                        && self.database.canonical_content_matches(
+                            repository_id,
+                            language,
+                            &payload.document_identity.source_revision,
+                            &PublicationManifestFile {
+                                canonical_content_version_id: payload.canonical_content_version_id,
+                                canonical_file_id: payload.canonical_file_id,
+                                content_hash: payload.content_hash.clone(),
+                            },
+                            candidate,
+                        )?
+                        && self
+                            .database
+                            .canonical_compatible(payload.canonical_content_version_id)?
+                } else {
+                    false
+                };
+                if !compatible {
+                    self.database.finish_document_work(
+                        work_item_id,
+                        false,
+                        "{\"code\":\"DOCUMENT-INTENT\"}",
+                    )?;
+                    self.database
+                        .complete_outbox(OutboxKind::Materialization, entry.id, &owner)?;
+                    findings.push(finding(
+                        &document.target_path,
+                        None,
+                        "DOCUMENT-INTENT",
+                        "stored materialization identity failed current validation",
+                    ));
+                    continue;
+                }
                 let outbox_started = Instant::now();
                 tracing::info!(
                     event = "outbox.claimed",
@@ -1552,6 +2024,11 @@ impl<'a> Orchestrator<'a> {
                         return Err(error);
                     }
                 };
+                self.database.finish_document_work(
+                    work_item_id,
+                    operation_status != "human_edit",
+                    &json!({"status": operation_status, "content_hash": desired_hash}).to_string(),
+                )?;
                 (self.failpoint)("materialization_state_transitioned");
                 if !self
                     .database
@@ -1584,22 +2061,35 @@ impl<'a> Orchestrator<'a> {
         if self.repo.documentation.commands.is_empty() || candidates.is_empty() {
             return Ok(Vec::new());
         }
+        let document = documents
+            .iter()
+            .find(|document| document.target_path == candidates[0].path)
+            .ok_or_else(|| anyhow!("project check candidate has no document identity"))?;
+        let manifest = candidates
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "path": candidate.path,
+                    "content_hash": content_hash(&candidate.content),
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest_hash = content_hash(&serde_json::to_vec(&manifest)?);
+        let work_item_id = self.database.enqueue_document_work_item(
+            run_id,
+            document.document_id,
+            language,
+            "project_check",
+            0,
+            &serde_json::to_string(&json!({
+                "source_revision": source_revision,
+                "manifest": manifest,
+                "manifest_hash": manifest_hash,
+            }))?,
+        )?;
         let result = self
             .documentation
             .check(self.repo, source_revision, candidates)?;
-        let unit = documents
-            .iter()
-            .flat_map(|document| &document.units)
-            .next()
-            .ok_or_else(|| anyhow!("documentation checks require a translated Markdown unit"))?;
-        let work_item_id = self.database.enqueue_work_item(
-            run_id,
-            unit.database_id,
-            language,
-            "documentation_check",
-            0,
-            &serde_json::to_string(&json!({"source_revision": source_revision}))?,
-        )?;
         let mut findings = Vec::new();
         for (index, failure) in result.failures {
             let code = if failure.timed_out {
@@ -1623,7 +2113,45 @@ impl<'a> Orchestrator<'a> {
             })?;
             findings.push(finding(".", None, code, message));
         }
+        self.database.finish_document_work(
+            work_item_id,
+            findings.is_empty(),
+            &json!({"manifest_hash": manifest_hash}).to_string(),
+        )?;
         Ok(findings)
+    }
+
+    fn retire_incompatible_materializations(
+        &self,
+        repository_id: i64,
+        language: &str,
+        revision: &str,
+    ) -> Result<()> {
+        let sources = self.git.discover(self.repo, revision)?;
+        for entry in self
+            .database
+            .pending_materializations(repository_id, language)?
+        {
+            let payload = serde_json::from_str::<MaterializationPayload>(&entry.payload_json).ok();
+            let compatible = payload.as_ref().is_some_and(|payload| {
+                payload.repository_id == repository_id
+                    && payload.locale == language
+                    && sources.iter().any(|source| {
+                        source.target_path(language).to_string_lossy() == payload.path
+                            && source.parse().is_ok_and(|parsed| {
+                                compatible_document_identity(
+                                    &payload.document_identity,
+                                    &document_identity(source, language, &parsed),
+                                )
+                            })
+                    })
+            });
+            if !compatible {
+                self.database
+                    .cancel_materialization(repository_id, entry.id)?;
+            }
+        }
+        Ok(())
     }
 
     fn reconcile_pull_request(&self, repository_id: i64, language: &str) -> Result<()> {
@@ -1688,14 +2216,137 @@ impl<'a> Orchestrator<'a> {
                 .head_revision
                 .as_deref()
                 .ok_or_else(|| anyhow!("stored pull request has no candidate head revision"))?;
+            self.promote_verified_publication(repository_id, language, candidate_commit)?;
+        }
+        Ok(())
+    }
+
+    fn promote_verified_publication(
+        &self,
+        repository_id: i64,
+        language: &str,
+        candidate_commit: &str,
+    ) -> Result<()> {
+        let snapshot =
+            self.database
+                .publication_snapshot(repository_id, language, candidate_commit)?;
+        let files = snapshot
+            .iter()
+            .map(|file| PublicationFile {
+                path: file.path.clone(),
+                content: file.content.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut compatible = !snapshot.is_empty();
+        if let Some(first) = snapshot.first() {
+            compatible &= snapshot
+                .iter()
+                .all(|file| file.source_revision == first.source_revision);
+            compatible &=
+                self.verify_publication_files(&first.source_revision, language, &files)?;
+            if compatible {
+                compatible &= self
+                    .documentation
+                    .check(self.repo, &first.source_revision, &files)?
+                    .failures
+                    .is_empty();
+            }
+        }
+        let revision = self.git.resolve_source_revision(self.repo)?;
+        let current_sources = self.git.discover(self.repo, &revision)?;
+        let mut verified_zero_unit_contents = Vec::new();
+        for file in &snapshot {
+            let stored = self
+                .database
+                .canonical_document_intent(file.content_version_id)?
+                .map(|identity| serde_json::from_str::<DocumentIdentity>(&identity))
+                .transpose()?;
+            let current = current_sources
+                .iter()
+                .find(|document| document.target_path(language).to_string_lossy() == file.path);
+            compatible &= match (stored.as_ref(), current) {
+                (Some(stored), Some(current)) => current.parse().is_ok_and(|parsed| {
+                    if parsed.units.is_empty() && current.bytes == file.content {
+                        verified_zero_unit_contents.push(file.content_version_id);
+                    }
+                    stored.source_revision == file.source_revision
+                        && compatible_document_identity(
+                            stored,
+                            &document_identity(current, language, &parsed),
+                        )
+                }),
+                _ => false,
+            };
+            compatible &= self
+                .database
+                .canonical_compatible(file.content_version_id)?;
+        }
+        if compatible {
             self.database.promote_merged_publication(
                 repository_id,
                 language,
                 candidate_commit,
                 "github_merged",
+                &verified_zero_unit_contents,
+            )?;
+        } else if !snapshot.is_empty() {
+            self.database.transition_publication_manifest(
+                repository_id,
+                language,
+                candidate_commit,
+                PublicationState::Superseded,
             )?;
         }
         Ok(())
+    }
+
+    fn verify_publication_files(
+        &self,
+        revision: &str,
+        language: &str,
+        files: &[PublicationFile],
+    ) -> Result<bool> {
+        let sources = self.git.discover(self.repo, revision)?;
+        let mut seen = HashSet::new();
+        for file in files {
+            if !seen.insert(&file.path) {
+                return Ok(false);
+            }
+            let mut source = None;
+            for document in &sources {
+                if document.target_path(language).to_string_lossy() == file.path {
+                    source = Some(document);
+                    break;
+                }
+            }
+            let Some(source) = source else {
+                return Ok(false);
+            };
+            let Ok(parsed) = source.parse() else {
+                return Ok(false);
+            };
+            let Ok(text) = std::str::from_utf8(&file.content) else {
+                return Ok(false);
+            };
+            if verify_document(&parsed, text).is_err() {
+                return Ok(false);
+            }
+            let Ok(target) = source.parse_bytes(&file.content) else {
+                return Ok(false);
+            };
+            if parsed.units.len() != target.units.len()
+                || parsed
+                    .units
+                    .iter()
+                    .zip(&target.units)
+                    .any(|(source, target)| {
+                        crate::domain::document::translated_unit_text(source, target).is_none()
+                    })
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn publish(
@@ -1713,6 +2364,7 @@ impl<'a> Orchestrator<'a> {
         let owner = format!("publish:{}:{run_id}", self.owner_identity);
         let entry = if written.is_empty() {
             self.database.claim_publication_locale(
+                repository_id,
                 language,
                 &owner,
                 Utc::now().timestamp_millis(),
@@ -1729,6 +2381,11 @@ impl<'a> Orchestrator<'a> {
                     format!("canonical publication content is not UTF-8: {path}")
                 })?;
                 files.push(PublicationRecord {
+                    document_identity: self
+                        .database
+                        .canonical_document_intent(canonical.content_version_id)?
+                        .map(|identity| serde_json::from_str(&identity))
+                        .transpose()?,
                     canonical_content_version_id: canonical.content_version_id,
                     canonical_file_id: canonical.id,
                     content,
@@ -1749,6 +2406,7 @@ impl<'a> Orchestrator<'a> {
                 "publish:{repository_id}:{language}:{}",
                 hash(&[payload.as_bytes()])
             );
+            let dedupe = self.database.effect_key(OutboxKind::Publication, &dedupe)?;
             self.database.enqueue_publication(
                 repository_id,
                 Some(run_id),
@@ -1757,6 +2415,7 @@ impl<'a> Orchestrator<'a> {
                 &payload,
             )?;
             self.database.claim_publication_locale(
+                repository_id,
                 language,
                 &owner,
                 Utc::now().timestamp_millis(),
@@ -1813,9 +2472,106 @@ impl<'a> Orchestrator<'a> {
                 content: record.content.as_bytes().to_vec(),
             });
         }
-        outcome.published = if let Some(commit) = payload.commit.as_deref() {
+        let mut compatible = payload.policy_fingerprint == prompts::policy_fingerprint();
+        let current_sources = self.git.discover(self.repo, &outcome.source_revision)?;
+        for record in &records {
+            let current = current_sources
+                .iter()
+                .find(|document| document.target_path(language).to_string_lossy() == record.path);
+            compatible &= match (record.document_identity.as_ref(), current) {
+                (Some(stored), Some(current)) => current.parse().is_ok_and(|parsed| {
+                    stored.source_revision == payload.source_revision
+                        && compatible_document_identity(
+                            stored,
+                            &document_identity(current, language, &parsed),
+                        )
+                }),
+                _ => false,
+            };
+        }
+        for ((record, binding), file) in records.iter().zip(&manifest_files).zip(&durable_files) {
+            compatible &= self.database.canonical_content_matches(
+                repository_id,
+                language,
+                &payload_source_revision,
+                binding,
+                file,
+            )?;
+            compatible &= self
+                .database
+                .canonical_compatible(record.canonical_content_version_id)?;
+        }
+        compatible &=
+            self.verify_publication_files(&payload_source_revision, language, &durable_files)?;
+        if compatible && (written.is_empty() || entry.attempt_count > 1 || payload.run_id != run_id)
+        {
+            compatible &= self
+                .documentation
+                .check(self.repo, &payload_source_revision, &durable_files)?
+                .failures
+                .is_empty();
+        }
+        if !compatible {
+            if let Some(commit) = payload.commit.as_deref() {
+                self.database.transition_publication_authorization(
+                    repository_id,
+                    language,
+                    commit,
+                    &entry.dedupe_key,
+                    PublicationState::Superseded,
+                )?;
+            }
+            let mut rejected = serde_json::to_value(&payload)?;
+            rejected["superseded_reason"] =
+                "document compatibility or current project checks failed".into();
+            self.database.update_outbox_payload(
+                OutboxKind::Publication,
+                entry.id,
+                &owner,
+                &rejected.to_string(),
+            )?;
             self.database
-                .record_publication_manifest(PublicationManifestInput {
+                .complete_outbox(OutboxKind::Publication, entry.id, &owner)?;
+            outcome.published.skipped =
+                "incompatible publication superseded; replan required".into();
+            return Ok(());
+        }
+        if written.is_empty()
+            && outcome.documents.markdown_files
+                + outcome.documents.json_files
+                + outcome.documents.mdx_files
+                == 0
+        {
+            count_formats(&mut outcome.documents, &current_sources);
+            outcome.documents.verified_documents = records.len();
+            for source in &current_sources {
+                match source.parse() {
+                    Ok(parsed) if parsed.units.is_empty() => {
+                        outcome.documents.pass_through_documents += 1
+                    }
+                    Err(error) => {
+                        outcome.documents.parse_failures += 1;
+                        outcome.conflicts.push(finding(
+                            &source.path,
+                            None,
+                            if matches!(
+                                error,
+                                crate::domain::document::DocumentError::MessageUnsupported
+                            ) {
+                                "MESSAGE-UNSUPPORTED"
+                            } else {
+                                "DOCUMENT-PARSE"
+                            },
+                            "source document could not be parsed under the configured contract",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        outcome.published = if let Some(commit) = payload.commit.as_deref() {
+            self.database.record_publication_authorization(
+                PublicationManifestInput {
                     repository_id,
                     run_id: &payload.run_id,
                     locale: language,
@@ -1823,12 +2579,15 @@ impl<'a> Orchestrator<'a> {
                     candidate_commit: commit,
                     policy_fingerprint: &payload.policy_fingerprint,
                     files: &manifest_files,
-                })?;
+                },
+                &entry.dedupe_key,
+            )?;
             if self.repo.publish.push {
-                self.database.transition_publication_manifest(
+                self.database.transition_publication_authorization(
                     repository_id,
                     language,
                     commit,
+                    &entry.dedupe_key,
                     PublicationState::PushPending,
                 )?;
                 let mut published = self.git.publish_pending(
@@ -1870,8 +2629,8 @@ impl<'a> Orchestrator<'a> {
             )? {
                 bail!("publication outbox ownership changed before commit persistence");
             }
-            self.database
-                .record_publication_manifest(PublicationManifestInput {
+            self.database.record_publication_authorization(
+                PublicationManifestInput {
                     repository_id,
                     run_id: &payload.run_id,
                     locale: language,
@@ -1879,13 +2638,16 @@ impl<'a> Orchestrator<'a> {
                     candidate_commit: &prepared.commit,
                     policy_fingerprint: &payload.policy_fingerprint,
                     files: &manifest_files,
-                })?;
+                },
+                &entry.dedupe_key,
+            )?;
             (self.failpoint)("publication_candidate_persisted");
             if self.repo.publish.push {
-                self.database.transition_publication_manifest(
+                self.database.transition_publication_authorization(
                     repository_id,
                     language,
                     &prepared.commit,
+                    &entry.dedupe_key,
                     PublicationState::PushPending,
                 )?;
                 let pushed = self.git.publish_pending(
@@ -1956,26 +2718,32 @@ impl<'a> Orchestrator<'a> {
                 })?;
                 match pr_state {
                     "merged" => {
-                        self.database.promote_merged_publication(
+                        if reconciled.pull_request.head_revision.as_deref()
+                            != Some(outcome.published.commit.as_str())
+                        {
+                            bail!("merged pull request head does not match published candidate");
+                        }
+                        self.promote_verified_publication(
                             repository_id,
                             language,
                             &outcome.published.commit,
-                            "github_merged",
                         )?;
                     }
                     "open" | "draft" => {
-                        self.database.transition_publication_manifest(
+                        self.database.transition_publication_authorization(
                             repository_id,
                             language,
                             &outcome.published.commit,
+                            &entry.dedupe_key,
                             PublicationState::PrOpen,
                         )?;
                     }
                     _ => {
-                        self.database.transition_publication_manifest(
+                        self.database.transition_publication_authorization(
                             repository_id,
                             language,
                             &outcome.published.commit,
+                            &entry.dedupe_key,
                             PublicationState::Superseded,
                         )?;
                     }
@@ -2027,14 +2795,10 @@ impl<'a> Orchestrator<'a> {
             let source_revision = self.git.resolve_source_revision(self.repo)?;
             outcome.source_revision = source_revision.clone();
             let repository_id = self.repository_id()?;
+            self.retire_incompatible_materializations(repository_id, language, &source_revision)?;
             self.reconcile_pull_request(repository_id, language)?;
             let policy_fingerprint = prompts::policy_fingerprint();
-            let mut invocation =
-                format!("sync:{repository_id}:{language}:{source_revision}:{policy_fingerprint}");
-            if let Some(agent_fingerprint) = self.agents.configuration_fingerprint()? {
-                invocation.push(':');
-                invocation.push_str(&agent_fingerprint);
-            }
+            let invocation = self.invocation_key(repository_id, language, &source_revision)?;
             let run_id = self.database.begin_run(
                 repository_id,
                 &invocation,
@@ -2057,14 +2821,27 @@ impl<'a> Orchestrator<'a> {
                     self.publish(repository_id, &run_id, language, &[], &mut outcome)
                 })?;
                 if !outcome.published.commit.is_empty() {
-                    outcome.message = "recovered pending publication".into();
-                    outcome.transitions.push("complete:ok".into());
+                    if outcome.documents.parse_failures > 0 {
+                        outcome.status = Status::NeedsHuman;
+                        outcome.message =
+                            "source document parse failures require human attention".into();
+                        outcome.transitions.push("needs_human:conflict".into());
+                    } else {
+                        outcome.message = "recovered pending publication".into();
+                        outcome.transitions.push("complete:ok".into());
+                    }
                     return Ok(());
                 }
             }
             let (mut documents, conflicts, reused, scheduled) =
                 self.traced_stage(language, &run_id, "planning", || {
-                    self.prepare(repository_id, &run_id, language, &source_revision)
+                    self.prepare(
+                        repository_id,
+                        &run_id,
+                        language,
+                        &source_revision,
+                        &mut outcome.documents,
+                    )
                 })?;
             outcome.reused_units = reused;
             outcome.conflicts = conflicts;
@@ -2126,29 +2903,8 @@ impl<'a> Orchestrator<'a> {
                     )
                 })?;
             outcome.written = written;
+            outcome.documents.verified_documents = candidates.len();
             outcome.findings.append(&mut findings);
-            if outcome
-                .findings
-                .iter()
-                .any(|finding| finding.severity == FindingSeverity::Error)
-            {
-                outcome.status = Status::NeedsHuman;
-                outcome.message = "deterministic findings block publication".into();
-                outcome.transitions.push("needs_human:verification".into());
-                return Ok(());
-            }
-            outcome.transitions.push("checking:documentation".into());
-            let mut documentation_findings =
-                self.traced_stage(language, &run_id, "documentation_check", || {
-                    self.check_documentation(
-                        &run_id,
-                        language,
-                        &source_revision,
-                        &documents,
-                        &candidates,
-                    )
-                })?;
-            outcome.findings.append(&mut documentation_findings);
             if outcome
                 .findings
                 .iter()
@@ -2172,9 +2928,12 @@ impl<'a> Orchestrator<'a> {
                     format!("verified {} translated document(s)", outcome.written.len());
             }
             outcome.transitions.push("publishing".into());
-            let written = outcome.written.clone();
+            let eligible = candidates
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>();
             self.traced_stage(language, &run_id, "publication", || {
-                self.publish(repository_id, &run_id, language, &written, &mut outcome)
+                self.publish(repository_id, &run_id, language, &eligible, &mut outcome)
             })?;
             outcome
                 .transitions
@@ -2221,6 +2980,7 @@ pub fn adopt_human_edit(
     database: &dyn StateStore,
     materializer: &dyn Materializer,
     git: &dyn GitPublisher,
+    documentation: &dyn DocumentationChecker,
     language: &str,
 ) -> Result<usize> {
     let repository_key = repo
@@ -2235,30 +2995,116 @@ pub fn adopt_human_edit(
     )?;
     let source_revision = git.resolve_source_revision(repo)?;
     let documents = git.discover(repo, &source_revision)?;
+    let mut adoption_files = Vec::new();
+    for document in &documents {
+        let target = document
+            .target_path(language)
+            .to_string_lossy()
+            .into_owned();
+        if database
+            .canonical_file(repository_id, language, &target)?
+            .is_none()
+        {
+            continue;
+        }
+        let bytes = materializer
+            .read(&repo.path, Path::new(&target))?
+            .with_context(|| format!("cannot read human target {target}"))?;
+        let source = document.parse()?;
+        let translated = document.parse_bytes(&bytes)?;
+        verify_document(&source, &translated.source)
+            .with_context(|| format!("human target {target} failed validation"))?;
+        if source.units.len() != translated.units.len()
+            || source
+                .units
+                .iter()
+                .zip(&translated.units)
+                .any(|(source, target)| {
+                    crate::domain::document::translated_unit_text(source, target).is_none()
+                })
+        {
+            bail!("human target {target} failed validation");
+        }
+        adoption_files.push(PublicationFile {
+            path: target,
+            content: bytes,
+        });
+    }
+    if adoption_files.is_empty() {
+        return Ok(0);
+    }
+    let manifest = adoption_files
+        .iter()
+        .map(|file| json!({"path": file.path, "content_hash": content_hash(&file.content)}))
+        .collect::<Vec<_>>();
+    let manifest_hash = content_hash(&serde_json::to_vec(&manifest)?);
+    let run_id = database.begin_run(
+        repository_id,
+        &format!("adopt:{repository_id}:{language}:{source_revision}:{manifest_hash}"),
+        Path::new("adopt"),
+        "{}",
+        &prompts::policy_fingerprint(),
+    )?;
+    let anchor = documents
+        .iter()
+        .find(|document| document.target_path(language).to_string_lossy() == adoption_files[0].path)
+        .ok_or_else(|| anyhow!("adoption candidate has no document identity"))?;
+    let anchor_id = database
+        .document_id(repository_id, &anchor.path)?
+        .ok_or_else(|| anyhow!("adoption document is missing"))?;
+    let check_work = if repo.documentation.commands.is_empty() {
+        None
+    } else {
+        Some(database.enqueue_document_work_item(&run_id, anchor_id, language, "project_check", 0, &json!({"source_revision":source_revision,"manifest":manifest,"manifest_hash":manifest_hash}).to_string())?)
+    };
+    let checked = documentation
+        .check(repo, &source_revision, &adoption_files)?
+        .failures
+        .is_empty();
+    if let Some(work) = check_work {
+        database.finish_document_work(
+            work,
+            checked,
+            &json!({"manifest_hash":manifest_hash}).to_string(),
+        )?;
+    }
+    if !checked {
+        database.finish_run(&run_id, "needs_human")?;
+        bail!("human targets failed configured documentation checks; no translations were trusted");
+    }
     let mut adopted = 0;
     for document in documents {
-        let target = target_path(repo, language, &document.path)?
+        let target = document
+            .target_path(language)
             .to_string_lossy()
             .into_owned();
         let Some(canonical) = database.canonical_file(repository_id, language, &target)? else {
             continue;
         };
-        let bytes = materializer
-            .read(&repo.path, Path::new(&target))?
-            .with_context(|| format!("cannot read human target {target}"))?;
+        let bytes = adoption_files
+            .iter()
+            .find(|file| file.path == target)
+            .ok_or_else(|| anyhow!("human target {target} was not checked"))?
+            .content
+            .clone();
         let target_text = std::str::from_utf8(&bytes).context("human target is not UTF-8")?;
-        let source_text =
-            std::str::from_utf8(&document.bytes).context("source Markdown is not UTF-8")?;
-        let source_units = extract_units(source_text);
-        let target_units = extract_units(target_text);
-        if source_units.len() != target_units.len() || source_units.is_empty() {
-            bail!("human target {target} does not preserve the source Markdown unit structure");
+        let source_document = document.parse()?;
+        let target_document = document.parse_bytes(target_text.as_bytes())?;
+        verify_document(&source_document, target_text)
+            .with_context(|| format!("human target {target} failed validation"))?;
+        let source_units = &source_document.units;
+        let target_units = &target_document.units;
+        if source_units.len() != target_units.len() {
+            bail!("human target {target} does not preserve the source document unit structure");
         }
-        for (source_unit, target_unit) in source_units.iter().zip(&target_units) {
-            validate_translation(source_unit, &target_unit.protected_source).map_err(
-                |findings| anyhow!("human target {target} failed validation: {findings:?}"),
-            )?;
-        }
+        let translations = source_units
+            .iter()
+            .zip(target_units)
+            .map(|(source, translated)| {
+                crate::domain::document::translated_unit_text(source, translated)
+                    .ok_or_else(|| anyhow!("human target {target} failed validation"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let stable_ids = source_units
             .iter()
             .enumerate()
@@ -2275,8 +3121,11 @@ pub fn adopt_human_edit(
             Some(document_id) => database.unit_history(document_id, language)?,
             None => Vec::new(),
         };
-        let matched =
-            match_units_with_stable_ids(&previous_units(&history), &source_units, &stable_hints);
+        let matched = match_units_with_stable_ids(
+            &previous_units(&history, &[], &document.path),
+            source_units,
+            &stable_hints,
+        );
         if matched
             .iter()
             .any(|matched| matched.kind == MatchKind::Ambiguous)
@@ -2288,11 +3137,27 @@ pub fn adopt_human_edit(
             &document.path,
             Some(&source_revision),
             &document.content_hash,
-            "{}",
+            &serde_json::to_string(
+                &json!({"format": source_document.format, "contract": source_document.contract}),
+            )?,
         )?;
-        for (ordinal, ((source_unit, target_unit), matched)) in source_units
+        let identity = document_identity(&document, language, &source_document);
+        let assembly_work = database.enqueue_document_work_item(
+            &run_id,
+            document_id,
+            language,
+            "assembly",
+            0,
+            &serde_json::to_string(&identity)?,
+        )?;
+        database.finish_document_work(
+            assembly_work,
+            true,
+            &json!({"content_hash": content_hash(&bytes)}).to_string(),
+        )?;
+        for (ordinal, ((source_unit, translated), matched)) in source_units
             .iter()
-            .zip(&target_units)
+            .zip(&translations)
             .zip(matched)
             .enumerate()
         {
@@ -2300,14 +3165,14 @@ pub fn adopt_human_edit(
                 .stable_id
                 .unwrap_or_else(|| stable_ids[ordinal].clone());
             let source_hash = hash(&[source_unit.source.as_bytes()]);
-            let context = kind_name(source_unit);
+            let context = source_unit.memory_context_key(&document.path);
             let unit_id = database.upsert_unit(
                 document_id,
                 &stable_id,
                 ordinal as i64,
                 &source_unit.source,
                 &source_hash,
-                &serde_json::to_string(&json!({"kind": context}))?,
+                &unit_metadata(source_unit, &document.path),
             )?;
             database.trust_translation(TrustTranslationInput {
                 repository_id,
@@ -2315,7 +3180,7 @@ pub fn adopt_human_edit(
                 locale: language,
                 source_hash: &source_hash,
                 context_key: &context,
-                target_text: &target_unit.protected_source,
+                target_text: translated,
                 provenance: "human_adopted",
                 policy_fingerprint: &prompts::policy_fingerprint(),
             })?;
@@ -2330,20 +3195,45 @@ pub fn adopt_human_edit(
             content_hash: &adopted_hash,
             materialized_hash: Some(&adopted_hash),
             freshness: Freshness::Exact,
-            provenance: TranslationProvenance::Human,
+            provenance: if source_units.is_empty() {
+                TranslationProvenance::Imported
+            } else {
+                TranslationProvenance::Human
+            },
             validation: ValidationState::Passed,
             review: ReviewState::Approved,
             publication: PublicationState::Candidate,
             trust_tier: MemoryTier::Trusted,
             policy_fingerprint: &prompts::policy_fingerprint(),
         })?;
+        let current = database
+            .canonical_file(repository_id, language, &target)?
+            .ok_or_else(|| anyhow!("adopted canonical content is missing"))?;
+        database.bind_canonical_document_intent(
+            current.content_version_id,
+            &serde_json::to_string(&document_identity(&document, language, &source_document))?,
+        )?;
         database.transition_canonical_file(
             canonical.id,
             CanonicalTransition::Adopted,
             Some(&adopted_hash),
         )?;
+        let materialization_work = database.enqueue_document_work_item(
+            &run_id,
+            document_id,
+            language,
+            "materialization",
+            0,
+            &serde_json::to_string(&identity)?,
+        )?;
+        database.finish_document_work(
+            materialization_work,
+            true,
+            &json!({"status":"adopted", "content_hash":adopted_hash}).to_string(),
+        )?;
         adopted += 1;
     }
+    database.finish_run(&run_id, "ok")?;
     Ok(adopted)
 }
 
@@ -2368,7 +3258,8 @@ pub fn discard_human_edit(
     let documents = git.discover(repo, &source_revision)?;
     let mut discarded = 0;
     for document in documents {
-        let target = target_path(repo, language, &document.path)?
+        let target = document
+            .target_path(language)
             .to_string_lossy()
             .into_owned();
         let Some(canonical) = database.canonical_file(repository_id, language, &target)? else {

@@ -246,8 +246,21 @@ fn run_candidate(remote: &Path, provider: &Path, fixture_path: &Path) -> Candida
         .unwrap();
     let request: Value = serde_json::from_str(&request_json).unwrap();
     let response: Value = serde_json::from_str(&response_json).unwrap();
-    assert_eq!(request["schema"], "fani.agent.request.v1");
+    assert_eq!(request["schema"], "fani.agent.request.v2");
     assert_eq!(request["task"]["source"], "Deterministic source bytes.");
+    assert_eq!(request["task"]["source_format"], "markdown");
+    assert_eq!(request["task"]["unit_context"]["format"], "markdown");
+    assert!(
+        request["task"]["context_key"]
+            .as_str()
+            .unwrap()
+            .contains("docs/guide.md")
+    );
+    assert!(request["task"]["message_syntax"].is_null());
+    assert_eq!(
+        request["task"]["token_permissions"]["contract"],
+        "fani-markdown-tokens-v1"
+    );
     assert_eq!(response["schema"], "fani.agent.response.v1");
     assert_eq!(response["task_id"], request["task"]["id"]);
     assert_eq!(response["output"], "Octets source deterministes.");

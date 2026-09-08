@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const AGENT_REQUEST_SCHEMA: &str = "fani.agent.request.v1";
+pub const AGENT_REQUEST_SCHEMA: &str = "fani.agent.request.v2";
 pub const AGENT_RESPONSE_SCHEMA: &str = "fani.agent.response.v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -226,10 +226,24 @@ pub struct AttemptCandidateInput<'a> {
     pub provenance: TranslationProvenance,
 }
 
+#[derive(Clone, Debug)]
+pub struct TranslationCandidate {
+    pub unit_id: i64,
+    pub text: String,
+    pub provenance: crate::domain::document::UnitProvenance,
+    pub trusted: bool,
+    pub run_id: Option<String>,
+    pub invocation_key: Option<String>,
+    pub deterministic_model: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredAttempt {
     pub id: i64,
+    pub dedupe_key: String,
+    pub request_json: String,
     pub output: String,
+    pub provenance: Option<crate::domain::document::UnitProvenance>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -325,6 +339,14 @@ pub struct CanonicalFile {
     pub state: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct CanonicalSnapshot {
+    pub content_version_id: i64,
+    pub source_revision: String,
+    pub path: String,
+    pub content: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredPullRequest {
     pub external_id: String,
@@ -386,6 +408,25 @@ pub trait StateStore {
     ) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+    fn translation_candidates(
+        &self,
+        document_id: i64,
+        locale: &str,
+    ) -> Result<Vec<TranslationCandidate>>;
+    fn review_attempts(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        run_or_invocation: &str,
+    ) -> Result<Vec<RecoveredAttempt>>;
+    fn revalidate_candidate(
+        &self,
+        unit_id: i64,
+        locale: &str,
+        candidate: &TranslationCandidate,
+    ) -> Result<()>;
+    fn retire_attempt(&self, attempt_id: i64) -> Result<()>;
+    fn quarantine_incompatible_translations(&self, document_id: i64, locale: &str) -> Result<()>;
     fn trusted_translation(
         &self,
         repository_id: i64,
@@ -412,6 +453,25 @@ pub trait StateStore {
         priority: i64,
         input_json: &str,
     ) -> Result<i64>;
+    fn enqueue_document_work_item(
+        &self,
+        _run_id: &str,
+        _document_id: i64,
+        _locale: &str,
+        _kind: &str,
+        _priority: i64,
+        _input_json: &str,
+    ) -> Result<i64> {
+        anyhow::bail!("document-scoped work is not supported by this state store")
+    }
+    fn finish_document_work(
+        &self,
+        _work_item_id: i64,
+        _succeeded: bool,
+        _result_json: &str,
+    ) -> Result<()> {
+        anyhow::bail!("document work completion is not supported by this state store")
+    }
     fn successful_attempt(
         &self,
         work_item_id: i64,
@@ -472,6 +532,32 @@ pub trait StateStore {
         input: CanonicalFileInput<'_>,
         translations: &[CanonicalTranslationInput<'_>],
     ) -> Result<CanonicalFile>;
+    fn canonical_document_intent(&self, _content_version_id: i64) -> Result<Option<String>> {
+        anyhow::bail!("document intent identity is not supported by this state store")
+    }
+    fn bind_canonical_document_intent(
+        &self,
+        _content_version_id: i64,
+        _identity_json: &str,
+    ) -> Result<()> {
+        anyhow::bail!("document intent identity is not supported by this state store")
+    }
+    fn pending_materializations(
+        &self,
+        _repository_id: i64,
+        _locale: &str,
+    ) -> Result<Vec<OutboxEntry>> {
+        anyhow::bail!("materialization intent recovery is not supported by this state store")
+    }
+    fn cancel_materialization(&self, _repository_id: i64, _id: i64) -> Result<()> {
+        anyhow::bail!("materialization cancellation is not supported by this state store")
+    }
+    fn effect_key(&self, _kind: OutboxKind, _base: &str) -> Result<String> {
+        anyhow::bail!("effect history is not supported by this state store")
+    }
+    fn materialization_work(&self, _dedupe_key: &str) -> Result<Option<i64>> {
+        anyhow::bail!("materialization work recovery is not supported by this state store")
+    }
     fn record_canonical_file_translations(
         &self,
         canonical_file_id: i64,
@@ -486,6 +572,7 @@ pub trait StateStore {
     ) -> Result<()>;
     fn supersede_materializations(
         &self,
+        repository_id: i64,
         locale: &str,
         path: &str,
         active_dedupe_key: &str,
@@ -523,6 +610,7 @@ pub trait StateStore {
     ) -> Result<i64>;
     fn claim_publication_locale(
         &self,
+        repository_id: i64,
         locale: &str,
         owner: &str,
         now: i64,
@@ -543,6 +631,23 @@ pub trait StateStore {
     ) -> Result<Option<StoredPullRequest>>;
     fn record_pr_state(&self, input: PullRequestStateInput<'_>) -> Result<i64>;
     fn record_publication_manifest(&self, input: PublicationManifestInput<'_>) -> Result<i64>;
+    fn record_publication_authorization(
+        &self,
+        _input: PublicationManifestInput<'_>,
+        _authorization_key: &str,
+    ) -> Result<i64> {
+        anyhow::bail!("publication authorizations are not supported by this state store")
+    }
+    fn transition_publication_authorization(
+        &self,
+        _repository_id: i64,
+        _locale: &str,
+        _candidate_commit: &str,
+        _authorization_key: &str,
+        _state: PublicationState,
+    ) -> Result<()> {
+        anyhow::bail!("publication authorizations are not supported by this state store")
+    }
     fn transition_publication_manifest(
         &self,
         repository_id: i64,
@@ -550,11 +655,29 @@ pub trait StateStore {
         candidate_commit: &str,
         state: PublicationState,
     ) -> Result<()>;
+    fn publication_snapshot(
+        &self,
+        repository_id: i64,
+        locale: &str,
+        commit: &str,
+    ) -> Result<Vec<CanonicalSnapshot>>;
+    fn canonical_content_matches(
+        &self,
+        _repository_id: i64,
+        _locale: &str,
+        _source_revision: &str,
+        _binding: &PublicationManifestFile,
+        _file: &PublicationFile,
+    ) -> Result<bool> {
+        anyhow::bail!("canonical content binding is not supported by this state store")
+    }
+    fn canonical_compatible(&self, content_version_id: i64) -> Result<bool>;
     fn promote_merged_publication(
         &self,
         repository_id: i64,
         locale: &str,
         candidate_commit: &str,
         provenance: &str,
+        verified_zero_unit_contents: &[i64],
     ) -> Result<usize>;
 }

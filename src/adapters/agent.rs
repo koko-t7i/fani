@@ -984,6 +984,14 @@ mod tests {
 
     fn task() -> AgentTask {
         AgentTask {
+            source_format: crate::domain::document::DocumentFormat::Markdown,
+            unit_context: crate::domain::document::UnitContext::markdown(),
+            context_key: "fixture-context".into(),
+            message_syntax: None,
+            token_permissions: crate::domain::model::TokenPermissions {
+                contract: "fani-markdown-tokens-v1".into(),
+                reorderable_tokens: Vec::new(),
+            },
             id: "task".into(),
             stage: crate::domain::model::AgentStage::Translate,
             source_language: "en".into(),

@@ -7,56 +7,16 @@ use std::ops::Range;
 use std::sync::OnceLock;
 use thiserror::Error;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum UnitKind {
-    Paragraph,
-    Heading,
-    ListItem,
-    TableCell,
-    DefinitionTerm,
-    Definition,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ProtectedKind {
-    InlineCode,
-    LinkTarget,
-    Html,
-    Placeholder,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProtectedSpan {
-    pub token: String,
-    pub value: String,
-    pub kind: ProtectedKind,
-    pub range: Range<usize>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MarkdownUnit {
-    pub id: String,
-    pub kind: UnitKind,
-    pub range: Range<usize>,
-    pub source: String,
-    pub protected_source: String,
-    pub protected: Vec<ProtectedSpan>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnitTranslation {
-    pub id: String,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidationFinding {
-    pub code: &'static str,
-    pub message: String,
-}
+use crate::domain::document::UnitContext;
+pub use crate::domain::document::{
+    ProtectedKind, ProtectedSpan, TranslatableUnit as MarkdownUnit, UnitKind, UnitTranslation,
+    ValidationFinding,
+};
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum MarkdownError {
+    #[error("source collides with protected token {0}")]
+    TokenCollision(String),
     #[error("unknown Markdown unit {0:?}")]
     UnknownUnit(String),
     #[error("duplicate translation for Markdown unit {0:?}")]
@@ -90,6 +50,10 @@ struct LocalProtection {
 }
 
 pub fn extract_units(markdown: &str) -> Vec<MarkdownUnit> {
+    extract_units_checked(markdown).unwrap_or_default()
+}
+
+pub fn extract_units_checked(markdown: &str) -> Result<Vec<MarkdownUnit>, MarkdownError> {
     let options = Options::all();
     let events: Vec<_> = Parser::new_ext(markdown, options)
         .into_offset_iter()
@@ -121,10 +85,11 @@ pub fn extract_units(markdown: &str) -> Vec<MarkdownUnit> {
     candidates.dedup_by(|left, right| left.range == right.range);
 
     let mut occurrences = BTreeMap::<String, usize>::new();
-    candidates
+    let units = candidates
         .into_iter()
-        .filter_map(|candidate| build_unit(markdown, &events, candidate, &mut occurrences))
-        .collect()
+        .map(|candidate| build_unit(markdown, &events, candidate, &mut occurrences))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(units.into_iter().flatten().collect())
 }
 
 fn tight_list_candidates(
@@ -372,15 +337,21 @@ fn build_unit(
     events: &[(Event<'_>, Range<usize>)],
     candidate: Candidate,
     occurrences: &mut BTreeMap<String, usize>,
-) -> Option<MarkdownUnit> {
-    let source = markdown.get(candidate.range.clone())?;
+) -> Result<Option<MarkdownUnit>, MarkdownError> {
+    let source =
+        markdown
+            .get(candidate.range.clone())
+            .ok_or_else(|| MarkdownError::InvalidRange {
+                id: "source".into(),
+                range: candidate.range.clone(),
+            })?;
     let has_text = events.iter().any(|(event, range)| {
         range.start >= candidate.range.start
             && range.end <= candidate.range.end
             && matches!(event, Event::Text(text) if !text.trim().is_empty())
     });
     if !has_text {
-        return None;
+        return Ok(None);
     }
 
     let mut protections = Vec::new();
@@ -423,23 +394,28 @@ fn build_unit(
         }
     }
     add_placeholder_protections(markdown, candidate.range.clone(), &mut protections);
-    normalize_protections(&mut protections);
+    normalize_protections(&mut protections)?;
 
     let protected = tokenize(markdown, candidate.range.clone(), protections);
+    if let Some(span) = protected.iter().find(|span| source.contains(&span.token)) {
+        return Err(MarkdownError::TokenCollision(span.token.clone()));
+    }
     let protected_source = apply_tokens(source, &protected);
     let fingerprint = stable_fingerprint(&candidate.kind, &protected_source);
     let occurrence = occurrences.entry(fingerprint.clone()).or_default();
     let id = format!("md-{fingerprint}-{:02}", *occurrence);
     *occurrence += 1;
 
-    Some(MarkdownUnit {
+    Ok(Some(MarkdownUnit {
         id,
         kind: candidate.kind,
         range: candidate.range,
         source: source.to_string(),
         protected_source,
         protected,
-    })
+        parser_source: Some(markdown.to_owned()),
+        context: UnitContext::markdown(),
+    }))
 }
 
 fn add_link_protections(
@@ -480,18 +456,30 @@ fn add_placeholder_protections(
     }
 }
 
-fn normalize_protections(protections: &mut Vec<LocalProtection>) {
-    protections.sort_by_key(|protected| (protected.range.start, protected.range.end));
+fn normalize_protections(protections: &mut Vec<LocalProtection>) -> Result<(), MarkdownError> {
+    protections.sort_by_key(|protected| {
+        (
+            protected.range.start,
+            std::cmp::Reverse(protected.range.end),
+        )
+    });
     let mut normalized: Vec<LocalProtection> = Vec::new();
     for protection in protections.drain(..) {
         if let Some(previous) = normalized.last() {
             if protection.range.start < previous.range.end {
-                continue;
+                if protection.range.end <= previous.range.end {
+                    continue;
+                }
+                return Err(MarkdownError::OverlappingRanges {
+                    first: previous.range.clone(),
+                    second: protection.range,
+                });
             }
         }
         normalized.push(protection);
     }
     *protections = normalized;
+    Ok(())
 }
 
 fn tokenize(
@@ -509,6 +497,9 @@ fn tokenize(
                 ProtectedKind::LinkTarget => "LINK_TARGET",
                 ProtectedKind::Html => "HTML",
                 ProtectedKind::Placeholder => "PLACEHOLDER",
+                ProtectedKind::MdxEsm => "MDX_ESM",
+                ProtectedKind::MdxExpression => "MDX_EXPRESSION",
+                ProtectedKind::MdxJsxSyntax => "MDX_JSX_SYNTAX",
             };
             let digest = short_hash(&value);
             let token = format!("@@FANI_{label}_{index:04}_{digest}@@");
@@ -546,7 +537,7 @@ fn stable_fingerprint(kind: &UnitKind, protected_source: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    short_hash(&format!("{kind:?}\0{normalized}"))
+    short_hash(&format!("{}\0{normalized}", kind.as_str()))
 }
 
 fn short_hash(value: &str) -> String {
@@ -568,6 +559,50 @@ fn inline_code_values(markdown: &str) -> Vec<String> {
         .collect::<Vec<_>>();
     values.sort();
     values
+}
+
+pub(crate) fn document_signature(markdown: &str) -> Vec<String> {
+    let mut signature = structure_signature(markdown)
+        .into_iter()
+        .filter(|part| part != "text")
+        .collect::<Vec<_>>();
+    let mut code_block = false;
+    for event in Parser::new_ext(markdown, Options::all()) {
+        match event {
+            Event::Start(Tag::CodeBlock(_) | Tag::MetadataBlock(_)) => code_block = true,
+            Event::End(TagEnd::CodeBlock | TagEnd::MetadataBlock(_)) => code_block = false,
+            Event::Text(value) if code_block => signature.push(format!("code-text:{value}")),
+            _ => {}
+        }
+    }
+    let parser = Parser::new_ext(markdown, Options::all());
+    let mut definitions = parser
+        .reference_definitions()
+        .iter()
+        .map(|(_, definition)| definition.span.clone())
+        .collect::<Vec<_>>();
+    definitions.sort_by_key(|range| range.start);
+    for range in definitions {
+        signature.push(format!("reference:{}", &markdown[range]));
+    }
+    if let Ok(units) = extract_units_checked(markdown) {
+        let mut end = 0;
+        for unit in units {
+            if unit.range.start >= end {
+                signature.push(format!("immutable:{}", &markdown[end..unit.range.start]));
+            }
+            // Nested definition units can overlap their containing unit.
+            end = end.max(unit.range.end);
+        }
+        signature.push(format!("immutable:{}", &markdown[end..]));
+    }
+    // Prose position is not structural; inline code may move safely within a unit.
+    signature.extend(
+        inline_code_values(markdown)
+            .into_iter()
+            .map(|value| format!("code-value:{value}")),
+    );
+    signature
 }
 
 fn structure_signature(markdown: &str) -> Vec<String> {
@@ -599,7 +634,14 @@ fn structure_signature(markdown: &str) -> Vec<String> {
 fn tag_name(tag: &Tag<'_>) -> String {
     match tag {
         Tag::Paragraph => "paragraph".into(),
-        Tag::Heading { level, .. } => format!("heading:{level:?}"),
+        Tag::Heading {
+            level,
+            id,
+            classes,
+            attrs,
+        } => {
+            format!("heading:{level:?}:{id:?}:{classes:?}:{attrs:?}")
+        }
         Tag::BlockQuote(kind) => format!("blockquote:{kind:?}"),
         Tag::CodeBlock(kind) => format!("code-block:{kind:?}"),
         Tag::HtmlBlock => "html-block".into(),

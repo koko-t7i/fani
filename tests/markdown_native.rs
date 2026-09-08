@@ -415,6 +415,14 @@ fn corpus_rejects_malicious_tokens_links_and_structure_changes() {
 #[test]
 fn prompts_make_the_native_engine_contract_explicit() {
     let rendered = prompts::render(&model::AgentTask {
+        source_format: fani::domain::document::DocumentFormat::Markdown,
+        unit_context: fani::domain::document::UnitContext::markdown(),
+        context_key: "fixture-context".into(),
+        message_syntax: None,
+        token_permissions: fani::domain::model::TokenPermissions {
+            contract: "fani-markdown-tokens-v1".into(),
+            reorderable_tokens: Vec::new(),
+        },
         id: "md-123".into(),
         stage: model::AgentStage::Translate,
         source_language: "en".into(),
@@ -434,7 +442,7 @@ fn prompts_make_the_native_engine_contract_explicit() {
         "Hello @@FANI_INLINE_CODE_0000_deadbeefdeadbeef@@",
     );
     assert!(prompt.contains("copy each token exactly once"));
-    assert!(prompt.contains("Return only the translated Markdown unit"));
+    assert!(prompt.contains("Return only the translated source-format unit"));
     assert!(prompt.contains("Target language: zh-CN"));
 
     let repair = prompts::repair_prompt(

@@ -1,3 +1,4 @@
+use crate::domain::model::MessageSyntax;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -82,19 +83,53 @@ impl Default for PublishConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RepoConfig {
-    pub path: PathBuf,
-    pub languages: Vec<String>,
-    #[serde(default)]
+pub struct SourceSet {
+    pub format: crate::domain::document::DocumentFormat,
     pub include: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    #[serde(default)]
+    pub strip_prefix: Option<String>,
+    pub target_pattern: String,
+    #[serde(default)]
+    pub message_syntax: Option<MessageSyntax>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "RawRepoConfig")]
+pub struct RepoConfig {
+    // Report destinations belong to the invocation, not the source configuration.
+    pub reserved_paths: Vec<PathBuf>,
+    pub path: PathBuf,
+    pub languages: Vec<String>,
+    pub sources: Option<Vec<SourceSet>>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub data_dir: String,
+    pub target_pattern: String,
+    pub max_tasks: usize,
+    pub repair_budget: usize,
+    pub quality: QualityConfig,
+    pub documentation: DocumentationConfig,
+    pub publish: PublishConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRepoConfig {
+    pub path: PathBuf,
+    pub languages: Vec<String>,
+    pub sources: Option<Vec<SourceSet>>,
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-    #[serde(default = "default_target_pattern")]
-    pub target_pattern: String,
+    #[serde(default)]
+    pub target_pattern: Option<String>,
     #[serde(default = "default_max_tasks")]
     pub max_tasks: usize,
     #[serde(default = "default_repair_budget")]
@@ -105,6 +140,38 @@ pub struct RepoConfig {
     pub documentation: DocumentationConfig,
     #[serde(default)]
     pub publish: PublishConfig,
+}
+
+impl TryFrom<RawRepoConfig> for RepoConfig {
+    type Error = String;
+
+    fn try_from(raw: RawRepoConfig) -> Result<Self, Self::Error> {
+        if let Some(sources) = &raw.sources {
+            if sources.is_empty() {
+                return Err("sources must not be empty".into());
+            }
+            if raw.include.is_some() || raw.exclude.is_some() || raw.target_pattern.is_some() {
+                return Err(
+                    "sources is mutually exclusive with include, exclude and target_pattern".into(),
+                );
+            }
+        }
+        Ok(Self {
+            reserved_paths: Vec::new(),
+            sources: raw.sources,
+            path: raw.path,
+            languages: raw.languages,
+            include: raw.include.unwrap_or_default(),
+            exclude: raw.exclude.unwrap_or_default(),
+            data_dir: raw.data_dir,
+            target_pattern: raw.target_pattern.unwrap_or_else(default_target_pattern),
+            max_tasks: raw.max_tasks,
+            repair_budget: raw.repair_budget,
+            quality: raw.quality,
+            documentation: raw.documentation,
+            publish: raw.publish,
+        })
+    }
 }
 
 const fn default_true() -> bool {

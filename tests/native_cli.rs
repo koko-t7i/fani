@@ -236,6 +236,164 @@ fn kill_sync_at_failpoint(config: &Path, reports: &Path, point: &str, marker: &P
 }
 
 #[test]
+fn explicit_source_mappings_work_through_sync_rerun_adopt_and_discard() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("docs/a.md"), "Hello `fani`.\n").unwrap();
+    fs::write(repo.join("README.md"), "Hello world.\n").unwrap();
+    run(&repo, &["init", "-q", "-b", "main"]);
+    run(&repo, &["config", "user.email", "test@example.invalid"]);
+    run(&repo, &["config", "user.name", "Test"]);
+    run(&repo, &["add", "."]);
+    run(&repo, &["commit", "-qm", "source"]);
+    let provider = tmp.path().join("provider.sh");
+    fs::write(&provider, "#!/bin/sh\nset -eu\njq -ce 'if .schema != \"fani.agent.request.v2\" or .task.source_format != \"markdown\" or .task.unit_context.format != \"markdown\" or .task.message_syntax != null or .task.token_permissions.contract != \"fani-markdown-tokens-v1\" then error(\"bad protocol\") else {schema:\"fani.agent.response.v1\",task_id:.task.id,output:(if .task.stage == \"Translate\" then (.task.source | gsub(\"Hello\";\"Bonjour\")) else \"OK\" end)} end'\n").unwrap();
+    let mut permissions = fs::metadata(&provider).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&provider, permissions).unwrap();
+    let config = tmp.path().join("fani.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[[repo]]
+path = "{}"
+languages = ["fr"]
+[repo.quality]
+revision = true
+proofread = true
+[repo.publish]
+enabled = false
+[[repo.sources]]
+format = "markdown"
+include = ["docs/*.md"]
+strip_prefix = "docs/"
+target_pattern = "out/{{lang}}/{{relpath}}"
+[[repo.sources]]
+format = "markdown"
+include = ["README.md"]
+target_pattern = "readme/{{lang}}.md"
+[agents.fixture]
+provider = "fixture"
+model = "fixture"
+adapter = "command-json-v1"
+cmd = ["{}"]
+retries = 0
+"#,
+            repo.display(),
+            provider.display()
+        ),
+    )
+    .unwrap();
+    for command in ["doctor", "status", "check"] {
+        let output = fani(&[command, "--config", config.to_str().unwrap()]);
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let reports = tmp.path().join("reports");
+    for iteration in 0..2 {
+        let output = fani(&[
+            "sync",
+            "--config",
+            config.to_str().unwrap(),
+            "--report-dir",
+            reports.to_str().unwrap(),
+            "--quiet",
+        ]);
+        assert!(
+            output.status.success(),
+            "iteration {iteration}: {}{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(reports.join("report.json")).unwrap_or_default()
+        );
+    }
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["totals"]["agent_calls"], 0, "{report}");
+    assert_eq!(
+        fs::read_to_string(repo.join("out/fr/a.md")).unwrap(),
+        "Bonjour `fani`.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("readme/fr.md")).unwrap(),
+        "Bonjour world.\n"
+    );
+    fs::write(repo.join("readme/fr.md"), "Salut monde.\n").unwrap();
+    let output = fani(&["adopt", "--config", config.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(repo.join("readme/fr.md"), "temporary human edit\n").unwrap();
+    let output = fani(&["discard", "--config", config.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("readme/fr.md")).unwrap(),
+        "Salut monde.\n"
+    );
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("out/{lang}/{relpath}", "reports/{lang}/{relpath}"),
+    )
+    .unwrap();
+    let output = fani(&[
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--report-dir",
+        repo.join("reports").to_str().unwrap(),
+        "--quiet",
+    ]);
+    assert!(!output.status.success());
+    assert!(!repo.join("reports/fr/a.md").exists());
+    let report = fs::read_to_string(repo.join("reports/report.json")).unwrap();
+    assert!(report.contains("reserved"), "{report}");
+
+    let collision = text
+        .replace("languages = [\"fr\"]", "languages = [\"fr\", \"en\"]")
+        .replace("docs/*.md", "docs/a.md")
+        .replace("out/{lang}/{relpath}", "collision/{lang}/en.md")
+        .replace("readme/{lang}.md", "collision/fr/{lang}.md");
+    fs::write(&config, collision).unwrap();
+    for command in ["status", "check"] {
+        let output = fani(&[
+            command,
+            "--config",
+            config.to_str().unwrap(),
+            "--lang",
+            "fr",
+        ]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("collision"));
+    }
+    let output = fani(&[
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--lang",
+        "fr",
+        "--report-dir",
+        reports.to_str().unwrap(),
+        "--quiet",
+    ]);
+    assert!(!output.status.success());
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["totals"]["agent_calls"], 0);
+    assert!(!repo.join("collision").exists());
+}
+
+#[test]
 fn doctor_status_and_repeated_native_sync_need_no_external_skill() {
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -310,7 +468,7 @@ repair = "fixture"
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
-    assert!(String::from_utf8_lossy(&doctor.stdout).contains("native schema 2"));
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("native schema 6"));
 
     let status = fani(&["status", "--config", config.to_str().unwrap()]);
     assert_eq!(status.status.code(), Some(0));
@@ -396,7 +554,7 @@ repair = "fixture"
     assert_eq!(provenance.5.len(), 64);
     assert_eq!(provenance.6, fani::domain::prompts::policy_fingerprint());
     let durable_request: Value = serde_json::from_str(&provenance.7).unwrap();
-    assert_eq!(durable_request["schema"], "fani.agent.request.v1");
+    assert_eq!(durable_request["schema"], "fani.agent.request.v2");
     assert!(durable_request["prompt"]["content"].is_string());
     assert!(!report.to_string().contains("--- SOURCE ---"));
 
@@ -598,7 +756,7 @@ repair = "fixture"
     let third_report: Value =
         serde_json::from_str(&fs::read_to_string(reports.join("report.json")).unwrap()).unwrap();
     assert_eq!(third.status.code(), Some(0), "{third_report}");
-    assert_eq!(third_report["totals"]["agent_calls"], 0);
+    assert_eq!(third_report["totals"]["agent_calls"], 0, "{third_report}");
     assert_eq!(third_report["totals"]["files_written"], 0);
     assert_eq!(
         third_report["languages"][0]["message"],

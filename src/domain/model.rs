@@ -67,11 +67,45 @@ impl DecisionCode {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceDocument {
+    pub source_format: crate::domain::document::DocumentFormat,
+    pub source_set_id: String,
+    pub mapping_identity: String,
+    pub mapped_relpath: String,
+    pub target_pattern: String,
+    pub message_syntax: Option<MessageSyntax>,
     pub repository: String,
     pub source_revision: String,
     pub path: String,
     pub bytes: Vec<u8>,
     pub content_hash: String,
+}
+
+impl SourceDocument {
+    pub fn parse(
+        &self,
+    ) -> Result<crate::domain::document::ParsedDocument, crate::domain::document::DocumentError>
+    {
+        self.parse_bytes(&self.bytes)
+    }
+
+    pub fn parse_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> Result<crate::domain::document::ParsedDocument, crate::domain::document::DocumentError>
+    {
+        crate::domain::document::parse_document_with_syntax(
+            self.source_format,
+            bytes,
+            self.message_syntax,
+        )
+    }
+
+    pub fn target_path(&self, language: &str) -> PathBuf {
+        self.target_pattern
+            .replace("{lang}", language)
+            .replace("{relpath}", &self.mapped_relpath)
+            .into()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -284,9 +318,51 @@ impl AgentStage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum MessageSyntax {
+    #[serde(rename = "plain")]
+    Plain,
+    #[serde(rename = "i18next-interpolation-v1")]
+    I18nextInterpolationV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenPermissions {
+    pub contract: String,
+    pub reorderable_tokens: Vec<String>,
+}
+
+impl TokenPermissions {
+    pub fn for_unit(unit: &crate::domain::document::TranslatableUnit) -> Self {
+        Self {
+            contract: unit.context.token_contract.clone(),
+            reorderable_tokens: unit
+                .protected
+                .iter()
+                .filter(|span| {
+                    matches!(
+                        span.kind,
+                        crate::domain::document::ProtectedKind::InlineCode
+                    ) || (unit.context.format == crate::domain::document::DocumentFormat::Json
+                        && crate::domain::json::syntax(&unit.context)
+                            == Some(MessageSyntax::I18nextInterpolationV1)
+                        && span.kind == crate::domain::document::ProtectedKind::Placeholder)
+                })
+                .map(|span| span.token.clone())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTask {
+    pub source_format: crate::domain::document::DocumentFormat,
+    pub unit_context: crate::domain::document::UnitContext,
+    pub context_key: String,
+    pub message_syntax: Option<MessageSyntax>,
+    pub token_permissions: TokenPermissions,
     pub id: String,
     pub stage: AgentStage,
     pub source_language: String,
@@ -331,8 +407,20 @@ pub struct Published {
     pub error: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentStatistics {
+    pub markdown_files: usize,
+    pub mdx_files: usize,
+    pub json_files: usize,
+    pub parse_failures: usize,
+    pub verified_documents: usize,
+    pub pass_through_documents: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LanguageOutcome {
+    #[serde(flatten)]
+    pub documents: DocumentStatistics,
     pub repo: String,
     pub lang: String,
     pub source_revision: String,
@@ -355,6 +443,7 @@ pub struct LanguageOutcome {
 impl LanguageOutcome {
     pub fn new(repo: &std::path::Path, lang: &str) -> Self {
         Self {
+            documents: DocumentStatistics::default(),
             repo: repo.display().to_string(),
             lang: lang.to_string(),
             source_revision: String::new(),
@@ -377,6 +466,8 @@ impl LanguageOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanSummary {
+    #[serde(flatten)]
+    pub document_statistics: DocumentStatistics,
     pub repository: PathBuf,
     pub language: String,
     pub source_revision: String,

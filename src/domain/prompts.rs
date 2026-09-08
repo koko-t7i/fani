@@ -1,7 +1,7 @@
 use crate::domain::model::{AgentStage, AgentTask};
 use sha2::{Digest, Sha256};
 
-pub const PROMPT_VERSION: &str = "fani-native-markdown-prompts-v3";
+pub const PROMPT_VERSION: &str = "fani-native-document-prompts-v4";
 pub const VERIFIER_VERSION: &str = "fani-markdown-verifier-v3";
 
 pub const TRANSLATE: &str = include_str!("../../prompts/translate.md");
@@ -70,7 +70,14 @@ pub fn policy_fingerprint() -> String {
 }
 
 pub fn render(task: &AgentTask) -> String {
-    let mut context = String::new();
+    let mut context = format!(
+        "\nSource format: {}\nUnit context: {}\nContext key: {}\nMessage syntax: {}\nToken permissions: {}",
+        serde_json::to_string(&task.source_format).expect("serializable format"),
+        serde_json::to_string(&task.unit_context).expect("serializable context"),
+        task.context_key,
+        serde_json::to_string(&task.message_syntax).expect("serializable message syntax"),
+        serde_json::to_string(&task.token_permissions).expect("serializable permissions"),
+    );
     if let Some(previous_source) = &task.previous_source {
         context.push_str("\n\n--- PREVIOUS SOURCE ---\n");
         context.push_str(previous_source);

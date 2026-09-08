@@ -40,7 +40,10 @@ fn fixture() -> Fixture {
             0,
             "Introduction",
             "source-hash",
-            "{}",
+            &fani::domain::document::unit_metadata(
+                &fani::domain::markdown::extract_units("Introduction")[0],
+                "guide.md",
+            ),
         )
         .unwrap();
     let run_id = db
@@ -63,6 +66,140 @@ fn fixture() -> Fixture {
         run_id,
         work_item_id,
     }
+}
+
+#[test]
+fn document_work_is_unique_scoped_and_creates_no_translation_records() {
+    use fani::application::ports::StateStore;
+
+    let fixture = fixture();
+    let store: &dyn StateStore = &fixture.db;
+    let document_id = fixture
+        .db
+        .upsert_document(
+            fixture.repository_id,
+            "empty.md",
+            Some("abc123"),
+            "empty",
+            "{}",
+        )
+        .unwrap();
+    let first = store
+        .enqueue_document_work_item(&fixture.run_id, document_id, "fr", "assembly", 1, "{}")
+        .unwrap();
+    let repeated = store
+        .enqueue_document_work_item(
+            &fixture.run_id,
+            document_id,
+            "fr",
+            "assembly",
+            2,
+            r#"{"retry":true}"#,
+        )
+        .unwrap();
+    assert_eq!(first, repeated);
+    let other = store
+        .enqueue_document_work_item(
+            &fixture.run_id,
+            document_id,
+            "fr",
+            "materialization",
+            1,
+            "{}",
+        )
+        .unwrap();
+    assert_ne!(first, other);
+    assert!(
+        store
+            .enqueue_document_work_item(&fixture.run_id, document_id, "fr", "translate", 1, "{}")
+            .is_err()
+    );
+    assert!(
+        store
+            .enqueue_document_work_item(
+                &fixture.run_id,
+                document_id + 1000,
+                "fr",
+                "assembly",
+                1,
+                "{}"
+            )
+            .is_err()
+    );
+    let conn = fixture.db.connect().unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE work_items SET unit_id=?1 WHERE id=?2",
+            params![fixture.unit_id, first]
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE work_items SET document_id=NULL WHERE id=?1",
+            [first]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT unit_id,document_id,priority,input_json FROM work_items WHERE id=?1",
+            [first],
+            |row| Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?
+            ))
+        )
+        .unwrap(),
+        (None, document_id, 2, r#"{"retry":true}"#.into())
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM units WHERE document_id=?1",
+            [document_id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    for table in [
+        "attempts",
+        "translation_versions",
+        "translation_memory_entries",
+    ] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    let unit_work = fixture
+        .db
+        .enqueue_work_item(
+            &fixture.run_id,
+            fixture.unit_id,
+            "zh-CN",
+            "translate",
+            1,
+            "{}",
+        )
+        .unwrap();
+    assert_eq!(unit_work, fixture.work_item_id);
+    let outbox = fixture
+        .db
+        .enqueue_materialization(other, "empty-document", "{}")
+        .unwrap();
+    assert_eq!(
+        outbox,
+        fixture
+            .db
+            .enqueue_materialization(other, "empty-document", "{}")
+            .unwrap()
+    );
+    fixture.db.integrity_check().unwrap();
 }
 
 #[test]
@@ -144,15 +281,56 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
                 )
             ),
         ),
+        (
+            3,
+            "0003_document_work_items".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    include_str!("../migrations/0003_document_work_items.sql").as_bytes()
+                )
+            ),
+        ),
+        (
+            4,
+            "0004_revision_bound_canonical_content".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    include_str!("../migrations/0004_revision_bound_canonical_content.sql")
+                        .as_bytes()
+                )
+            ),
+        ),
+        (
+            5,
+            "0005_current_intent_effects".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    include_str!("../migrations/0005_current_intent_effects.sql").as_bytes()
+                )
+            ),
+        ),
+        (
+            6,
+            "0006_publication_authorizations".to_string(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    include_str!("../migrations/0006_publication_authorizations.sql").as_bytes()
+                )
+            ),
+        ),
     ];
     assert_eq!(application_id, 0x4641_4e49);
-    assert_eq!(user_version, 2);
+    assert_eq!(user_version, 6);
     assert_eq!(migrations, expected);
     drop(conn);
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 2);
+    assert_eq!(reopened.schema_version().unwrap(), 6);
     let count: i64 = reopened
         .connect()
         .unwrap()
@@ -160,7 +338,7 @@ fn fresh_and_latest_databases_verify_embedded_migration_metadata() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(count, 6);
 }
 
 #[test]
@@ -198,7 +376,7 @@ fn version_one_database_upgrades_transactionally_to_latest() {
     drop(conn);
 
     let upgraded = Database::open(&path).unwrap();
-    assert_eq!(upgraded.schema_version().unwrap(), 2);
+    assert_eq!(upgraded.schema_version().unwrap(), 6);
     let conn = upgraded.connect().unwrap();
     assert!(conn
         .query_row(
@@ -660,7 +838,13 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
     assert_eq!(
         fixture
             .db
-            .trusted_translation(fixture.repository_id, "zh-CN", "source-hash", "heading")
+            .trusted_translation(
+                fixture.repository_id,
+                "zh-CN",
+                "source-hash",
+                &fani::domain::markdown::extract_units("Introduction")[0]
+                    .memory_context_key("guide.md")
+            )
             .unwrap(),
         None
     );
@@ -672,7 +856,8 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
             unit_id: Some(fixture.unit_id),
             locale: "zh-CN",
             source_hash: "source-hash",
-            context_key: "heading",
+            context_key: &fani::domain::markdown::extract_units("Introduction")[0]
+                .memory_context_key("guide.md"),
             target_text: "人工认可译文",
             provenance: "human_adopted",
             policy_fingerprint: &prompts::policy_fingerprint(),
@@ -681,10 +866,169 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
     assert_eq!(
         fixture
             .db
-            .trusted_translation(fixture.repository_id, "zh-CN", "source-hash", "heading")
+            .trusted_translation(
+                fixture.repository_id,
+                "zh-CN",
+                "source-hash",
+                &fani::domain::markdown::extract_units("Introduction")[0]
+                    .memory_context_key("guide.md")
+            )
             .unwrap()
             .as_deref(),
         Some("人工认可译文")
+    );
+}
+
+#[test]
+fn completed_commit_without_authorization_requires_a_new_checked_effect() {
+    use fani::application::ports::StateStore;
+    let fixture = fixture();
+    let key = "publish:orphaned-authorization";
+    let id = fixture
+        .db
+        .enqueue_publication(
+            fixture.repository_id,
+            Some(&fixture.run_id),
+            "zh-CN",
+            key,
+            r#"{"commit":"historical"}"#,
+        )
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    fixture
+        .db
+        .claim_outbox(OutboxKind::Publication, "publisher", now, 1000)
+        .unwrap()
+        .unwrap();
+    fixture
+        .db
+        .complete_outbox(OutboxKind::Publication, id, "publisher")
+        .unwrap();
+    let renewed = fixture.db.effect_key(OutboxKind::Publication, key).unwrap();
+    assert_ne!(renewed, key);
+    assert_eq!(
+        fixture.db.effect_key(OutboxKind::Publication, key).unwrap(),
+        renewed
+    );
+    assert!(
+        fixture
+            .db
+            .publication_snapshot(fixture.repository_id, "zh-CN", "historical")
+            .unwrap()
+            .is_empty()
+    );
+    let retained: (String, String) = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state,payload_json FROM publication_outbox WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        retained,
+        ("done".into(), r#"{"commit":"historical"}"#.into())
+    );
+}
+
+#[test]
+fn superseded_publication_key_creates_new_effect_without_reopening_history() {
+    use fani::application::ports::StateStore;
+    let fixture = fixture();
+    let base = "publish:roundtrip";
+    let old = fixture
+        .db
+        .enqueue_publication(
+            fixture.repository_id,
+            Some(&fixture.run_id),
+            "zh-CN",
+            base,
+            "{}",
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .effect_key(OutboxKind::Publication, base)
+            .unwrap(),
+        base
+    );
+    let now = chrono::Utc::now().timestamp_millis();
+    fixture
+        .db
+        .claim_outbox(OutboxKind::Publication, "publisher", now, 1000)
+        .unwrap()
+        .unwrap();
+    fixture
+        .db
+        .update_outbox_payload(
+            OutboxKind::Publication,
+            old,
+            "publisher",
+            r#"{"superseded_reason":"incompatible"}"#,
+        )
+        .unwrap();
+    fixture
+        .db
+        .complete_outbox(OutboxKind::Publication, old, "publisher")
+        .unwrap();
+    let key = fixture
+        .db
+        .effect_key(OutboxKind::Publication, base)
+        .unwrap();
+    assert_ne!(key, base);
+    let new = fixture
+        .db
+        .enqueue_publication(
+            fixture.repository_id,
+            Some(&fixture.run_id),
+            "zh-CN",
+            &key,
+            "{}",
+        )
+        .unwrap();
+    assert_ne!(new, old);
+    assert_eq!(
+        fixture
+            .db
+            .effect_key(OutboxKind::Publication, base)
+            .unwrap(),
+        key
+    );
+    fixture
+        .db
+        .claim_outbox(OutboxKind::Publication, "publisher", now + 100, 1000)
+        .unwrap()
+        .unwrap();
+    fixture
+        .db
+        .complete_outbox(OutboxKind::Publication, new, "publisher")
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .effect_key(OutboxKind::Publication, base)
+            .unwrap(),
+        key
+    );
+    let retained: (String, String) = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state,payload_json FROM publication_outbox WHERE id=?1",
+            [old],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        retained,
+        (
+            "done".into(),
+            r#"{"superseded_reason":"incompatible"}"#.into()
+        )
     );
 }
 
@@ -817,7 +1161,12 @@ fn newer_materialization_supersedes_stale_processing_content() {
     assert_eq!(
         fixture
             .db
-            .supersede_materializations("zh-CN", "zh-CN/guide.md", active_key)
+            .supersede_materializations(
+                fixture.repository_id,
+                "zh-CN",
+                "zh-CN/guide.md",
+                active_key
+            )
             .unwrap(),
         1
     );
@@ -862,9 +1211,108 @@ fn newer_materialization_supersedes_stale_processing_content() {
         .unwrap();
     let error = fixture
         .db
-        .supersede_materializations("zh-CN", "zh-CN/guide.md", "newest")
+        .supersede_materializations(fixture.repository_id, "zh-CN", "zh-CN/guide.md", "newest")
         .unwrap_err();
     assert!(error.to_string().contains("live worker"), "{error:#}");
+}
+
+#[test]
+fn same_locale_and_path_outboxes_are_repository_scoped() {
+    let fixture = fixture();
+    let other_repo = fixture
+        .db
+        .upsert_repository("other", &fixture._temp.path().join("other"), None, None)
+        .unwrap();
+    let other_document = fixture
+        .db
+        .upsert_document(other_repo, "guide.md", Some("abc123"), "hash", "{}")
+        .unwrap();
+    let other_run = fixture
+        .db
+        .begin_run(
+            other_repo,
+            "other-run",
+            fixture._temp.path().join("config").as_path(),
+            "{}",
+            TEST_FINGERPRINT,
+        )
+        .unwrap();
+    let other_work = fixture
+        .db
+        .enqueue_document_work_item(
+            &other_run,
+            other_document,
+            "zh-CN",
+            "materialization",
+            0,
+            "{}",
+        )
+        .unwrap();
+    for (work, key) in [(fixture.work_item_id, "ours"), (other_work, "theirs")] {
+        fixture
+            .db
+            .enqueue_materialization(work, key, r#"{"locale":"zh-CN","path":"same.md"}"#)
+            .unwrap();
+    }
+    assert_eq!(
+        fixture
+            .db
+            .supersede_materializations(fixture.repository_id, "zh-CN", "same.md", "new")
+            .unwrap(),
+        1
+    );
+    let conn = fixture.db.connect().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM materialization_outbox WHERE dedupe_key='theirs'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT status FROM work_items WHERE id=?1",
+            [fixture.work_item_id],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "cancelled"
+    );
+    let theirs = fixture
+        .db
+        .enqueue_publication(other_repo, Some(&other_run), "zh-CN", "theirs-pub", "{}")
+        .unwrap();
+    let ours = fixture
+        .db
+        .enqueue_publication(
+            fixture.repository_id,
+            Some(&fixture.run_id),
+            "zh-CN",
+            "ours-pub",
+            "{}",
+        )
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis() + 1000;
+    assert_eq!(
+        fixture
+            .db
+            .claim_publication_locale(fixture.repository_id, "zh-CN", "ours-owner", now, 10000)
+            .unwrap()
+            .unwrap()
+            .id,
+        ours
+    );
+    assert_eq!(
+        fixture
+            .db
+            .claim_publication_locale(other_repo, "zh-CN", "other-owner", now, 10000)
+            .unwrap()
+            .unwrap()
+            .id,
+        theirs
+    );
 }
 
 #[test]
@@ -963,7 +1411,10 @@ fn merged_publication_promotes_only_exact_manifest_translation_versions() {
             0,
             "Other",
             "other-source-hash",
-            "{}",
+            &fani::domain::document::unit_metadata(
+                &fani::domain::markdown::extract_units("Other")[0],
+                "other.md",
+            ),
         )
         .unwrap();
     let other_work_item_id = fixture
@@ -1176,7 +1627,8 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
             unit_id: Some(fixture.unit_id),
             locale: "zh-CN",
             source_hash: "source-hash",
-            context_key: "heading",
+            context_key: &fani::domain::markdown::extract_units("Introduction")[0]
+                .memory_context_key("guide.md"),
             target_text: "介绍",
             provenance: "reviewed",
             policy_fingerprint: &prompts::policy_fingerprint(),
@@ -1189,14 +1641,26 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
             unit_id: Some(fixture.unit_id),
             locale: "zh-CN",
             source_hash: "source-hash",
-            context_key: "heading",
+            context_key: &fani::domain::markdown::extract_units("Introduction")[0]
+                .memory_context_key("guide.md"),
             target_text: "简介",
             provenance: "approved",
             policy_fingerprint: &prompts::policy_fingerprint(),
         })
         .unwrap();
 
-    assert_eq!(first_tm, replay_tm);
+    assert_ne!(first_tm, replay_tm);
+    let old_tier: String = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT tier FROM translation_memory_entries WHERE id=?1 AND superseded_at IS NOT NULL",
+            [first_tm],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_tier, "history");
     let conn = fixture.db.connect().unwrap();
     let selected: (i64, String) = conn
         .query_row(
@@ -1208,7 +1672,7 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
     assert_eq!(selected, (1, "简介".into()));
     let tm: (i64, String, String) = conn
         .query_row(
-            "SELECT COUNT(*),target_text,provenance FROM translation_memory_entries WHERE repository_id=?1 AND locale='zh-CN' AND tier='trusted' AND superseded_at IS NULL",
+            "SELECT COUNT(*),target_text,json_extract(provenance,'$.origin') FROM translation_memory_entries WHERE repository_id=?1 AND locale='zh-CN' AND tier='trusted' AND superseded_at IS NULL",
             [fixture.repository_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -1282,7 +1746,7 @@ fn canonical_content_links_trusted_assembled_text_not_stale_selected_candidate()
             unit_id: Some(fixture.unit_id),
             locale: "zh-CN",
             source_hash: "source-hash",
-            context_key: "",
+            context_key: "Paragraph",
             target_text: "可信组装译文",
             provenance: "reviewed",
             policy_fingerprint: &fingerprint,
@@ -1462,7 +1926,156 @@ fn merged_tm_uses_immutable_source_version_after_live_source_mutation() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(tm, ("source-hash".into(), "abc123".into(), "".into()));
+    assert_eq!(
+        tm,
+        (
+            "source-hash".into(),
+            "abc123".into(),
+            fani::domain::markdown::extract_units("Introduction")[0].memory_context_key("guide.md")
+        )
+    );
+}
+
+#[test]
+fn publication_authorizations_bind_run_effect_and_exact_commit_snapshot() {
+    let fixture = fixture();
+    let fingerprint = prompts::policy_fingerprint();
+    let (file, version) = canonical_version(&fixture, "zh-CN/first.md", "first-hash");
+    let (other_file, other_version) = canonical_version(&fixture, "zh-CN/other.md", "other-hash");
+    let files = [PublicationManifestFile {
+        canonical_content_version_id: version,
+        canonical_file_id: file,
+        content_hash: "first-hash".into(),
+    }];
+    let other_files = [PublicationManifestFile {
+        canonical_content_version_id: other_version,
+        canonical_file_id: other_file,
+        content_hash: "other-hash".into(),
+    }];
+    let second_run = fixture
+        .db
+        .begin_run(
+            fixture.repository_id,
+            "second-publication-run",
+            std::path::Path::new("fani.toml"),
+            "{}",
+            &fingerprint,
+        )
+        .unwrap();
+    let input = |run, commit, files| PublicationManifestInput {
+        repository_id: fixture.repository_id,
+        run_id: run,
+        locale: "zh-CN",
+        source_revision: "abc123",
+        candidate_commit: commit,
+        policy_fingerprint: &fingerprint,
+        files,
+    };
+    let first = fixture
+        .db
+        .record_publication_authorization(input(&fixture.run_id, "shared", &files), "effect-a")
+        .unwrap();
+    let second = fixture
+        .db
+        .record_publication_authorization(input(&second_run, "shared", &files), "effect-b")
+        .unwrap();
+    assert_ne!(first, second);
+    assert!(
+        fixture
+            .db
+            .transition_publication_authorization(
+                fixture.repository_id,
+                "zh-CN",
+                "shared",
+                Some("missing-effect"),
+                PublicationState::PushPending
+            )
+            .is_err()
+    );
+    fixture
+        .db
+        .transition_publication_authorization(
+            fixture.repository_id,
+            "zh-CN",
+            "shared",
+            Some("missing-effect"),
+            PublicationState::Superseded,
+        )
+        .unwrap();
+    assert!(
+        fixture
+            .db
+            .record_publication_authorization(
+                input(&second_run, "shared", &other_files),
+                "effect-c"
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .db
+            .record_publication_authorization(input(&fixture.run_id, "shared", &files), "effect-b")
+            .is_err()
+    );
+    assert!(
+        fixture
+            .db
+            .record_publication_authorization(
+                input(&second_run, "different-commit", &files),
+                "effect-b"
+            )
+            .is_err()
+    );
+    fixture
+        .db
+        .transition_publication_authorization(
+            fixture.repository_id,
+            "zh-CN",
+            "shared",
+            Some("effect-b"),
+            PublicationState::Superseded,
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .record_publication_authorization(input(&second_run, "shared", &files), "effect-b")
+            .unwrap(),
+        second
+    );
+    let conn = fixture.db.connect().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM publication_manifests", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM publication_manifests WHERE id=?1",
+            [first],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "commit_created"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM publication_manifests WHERE id=?1",
+            [second],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "superseded"
+    );
+    assert_eq!(
+        fixture
+            .db
+            .publication_snapshot(fixture.repository_id, "zh-CN", "shared")
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

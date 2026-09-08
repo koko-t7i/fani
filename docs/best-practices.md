@@ -92,12 +92,30 @@ Recommended configuration rules:
 - Include only source Markdown that should be translated.
 - Exclude generated target roots such as `i18n/**`; otherwise translated files can be discovered as new sources.
 - Exclude archives, generated API references, vendored content, changelogs, or legal files unless they are intentionally in scope.
-- Keep `{lang}` and `{relpath}` in `target_pattern` so languages and source paths cannot collide.
+- Legacy `target_pattern` requires `{lang}` and `{relpath}`. Explicit source sets may omit `{relpath}` only for one exact non-glob filename; preflight rejects missing inputs and target collisions across all configured languages.
 - Keep `data_dir` inside the repository root but outside publication targets. Do not commit `<data_dir>/fani.db`.
 - Keep reports outside translated target paths. Reports are replaceable views, not state or publication inputs.
 - Use one configuration for related repositories only when they share an operating schedule and credential boundary. Otherwise use separate files and invocations.
 
 fani reads source blobs from `publish.source_ref`, not from mutable worktree source files. Set it to the branch or ref that represents approved source documentation, normally `origin/main` in a continuously fetched checkout.
+
+### Explicit source sets and upgrade safety
+
+For independent directory or filename mappings, replace the repo-level `include`, `exclude`, and `target_pattern` fields with `[[repo.sources]]` tables (see the annotated configuration). Do not leave even empty legacy fields alongside source sets: the two modes are mutually exclusive. Every set declares `format = "markdown"` or `format = "json"`, a nonempty `include`, optional `exclude` and `strip_prefix`, and a target pattern containing `{lang}`. No default set or global exclude is added.
+
+`strip_prefix = "website/docs/"` removes directory components, not a string substring, and every matching input must be below it. `{relpath}` is the remaining full relative filename. A single-file mapping such as `include = ["README.md"]` and `target_pattern = "readme/{lang}.md"` needs no `{relpath}`. More complex filename renaming is expressed with one set per file. Language values are used verbatim: `zh-CN` does **not** become `zh`; locale aliases are not supported.
+
+**Upgrade boundary:** legacy globs that match non-`.md` files now fail preflight with source-set migration guidance instead of parsing arbitrary extensions as Markdown. Narrow or exclude those paths. JSON requires an explicit source set and `message_syntax = "plain"` or `"i18next-interpolation-v1"`. MDX remains unavailable because parser safety gates are blocked. Renaming a file or relying on content sniffing does not enable another format. `fani init` remains Markdown-only.
+
+Preflight rejects generated paths that match any effective source rule, even if the targets do not exist yet. Always exclude generated target roots when using broad includes. It also checks all configured languages, source overlaps, target collisions and input/state/report/Git path protection before database opening, leases, PR reconciliation, recovery, or translation. Selected source files and directories must not alias another filesystem path, even if their Git blobs are valid. The validated commit remains pinned across all languages in the invocation. Custom command providers must upgrade to [request v2](architecture/native-i18n.md#request-v2-upgrade); response v1 and the `command-json-v1` adapter name remain unchanged.
+
+### JSON message resources
+
+Use `plain` only for ordinary prose without template candidates. Braces, printf-style parameters, `$t(...)`, rich tags, and common custom delimiters are rejected rather than silently protected. `i18next-interpolation-v1` supports only `{{name}}` and `{{user.name}}`, with each name segment matching `[A-Za-z_][A-Za-z0-9_]*` and optional leading/trailing ASCII whitespace inside the delimiters. Parameter names, occurrences, and literal delimiter whitespace must remain unchanged; independent arguments may reorder within their own message.
+
+ICU plural/select/selectordinal, i18next plural/ordinal/legacy-number key suffixes, unescaped or formatted parameters, nesting, Trans/rich text, and custom delimiter configurations are unsupported. `MESSAGE-UNSUPPORTED` requires a person to choose a supported resource dialect or exclude the file. Not every application's custom syntax can be inferred: callers must use the fixed declared dialect, not treat it as full i18next support.
+
+JSON Pointer identity is document-scoped and arrays are index-based. A source change at the same pointer requires translation; the previous target is context only. Adopt reparses the complete target and checks immutable structure and parameters before trust. For arrays consisting only of translatable strings, automatic checks cannot prove a human did not exchange their meanings; semantic review remains necessary. Empty/whitespace-only values and documents with no selected strings are exact pass-through with no model calls. Node and the browser consumer fixture are test-only, not binary runtime dependencies.
 
 ## Translation quality and cost
 
@@ -134,7 +152,9 @@ commands = [
 timeout_s = 120
 ```
 
-Each command runs in independent fixed-source staging with the exact candidate targets overlaid and without provider credentials. Make checks deterministic, non-interactive, and independent of mutable local build products.
+Each command runs once per ordered complete candidate set in independent fixed-source staging with the exact candidate targets overlaid and without provider credentials. Incomplete documents are excluded; an empty set runs no commands. A failed or timed-out check returns `needs_human` without replacing canonical content or files, or publishing that set. Make checks deterministic, non-interactive, and independent of mutable local build products.
+
+Zero-unit Markdown passes through byte-identically without model calls or fabricated translation memory. Report schema 4 separates discovered files, parse failures, verified documents, and pass-through from actual writes, so an unchanged rerun can report verified documents and zero writes. Before upgrading, stop all processes and retain the schema-4 upgrader's pre-upgrade backup. Historical pending intents lacking original mapping evidence are superseded and replanned under current rules; do not infer their original mappings from today's configuration.
 
 ## Daily operation
 

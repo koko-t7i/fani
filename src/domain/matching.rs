@@ -1,10 +1,24 @@
-use crate::domain::markdown::{MarkdownUnit, UnitKind};
+use crate::domain::document::{TranslatableUnit, UnitContext, UnitKind};
+use std::collections::{BTreeMap, VecDeque};
 use strsim::normalized_levenshtein;
+
+fn json_identity<'a>(
+    kind: &'a UnitKind,
+    context: &'a UnitContext,
+) -> (&'a str, &'a str, Option<&'a str>, &'a str) {
+    (
+        kind.as_str(),
+        &context.version,
+        context.structural_path.as_deref(),
+        &context.token_contract,
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreviousUnit {
     pub stable_id: String,
     pub kind: UnitKind,
+    pub context: UnitContext,
     pub ordinal: usize,
     pub source: String,
     pub translation: String,
@@ -34,25 +48,68 @@ fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn match_units(previous: &[PreviousUnit], current: &[MarkdownUnit]) -> Vec<UnitMatch> {
+pub fn match_units(previous: &[PreviousUnit], current: &[TranslatableUnit]) -> Vec<UnitMatch> {
     match_units_with_stable_ids(previous, current, &[])
 }
 
 pub fn match_units_with_stable_ids(
     previous: &[PreviousUnit],
-    current: &[MarkdownUnit],
+    current: &[TranslatableUnit],
     stable_ids: &[String],
 ) -> Vec<UnitMatch> {
     let mut used = vec![false; previous.len()];
     let mut matches = Vec::with_capacity(current.len());
+    let mut json_previous = BTreeMap::<_, VecDeque<usize>>::new();
+    for (index, candidate) in previous.iter().enumerate() {
+        if candidate.context.format == crate::domain::document::DocumentFormat::Json {
+            json_previous
+                .entry(json_identity(&candidate.kind, &candidate.context))
+                .or_default()
+                .push_back(index);
+        }
+    }
 
     for (ordinal, unit) in current.iter().enumerate() {
+        if unit.context.format == crate::domain::document::DocumentFormat::Json {
+            let index = json_previous
+                .get_mut(&json_identity(&unit.kind, &unit.context))
+                .and_then(VecDeque::pop_front);
+            matches.push(if let Some(index) = index {
+                let candidate = &previous[index];
+                used[index] = true;
+                let unchanged = candidate.source == unit.source;
+                UnitMatch {
+                    current_id: unit.id.clone(),
+                    stable_id: Some(candidate.stable_id.clone()),
+                    previous_source: Some(candidate.source.clone()),
+                    previous_translation: (!candidate.translation.is_empty())
+                        .then(|| candidate.translation.clone()),
+                    trusted_reuse: unchanged && candidate.trusted,
+                    kind: if unchanged {
+                        MatchKind::Exact
+                    } else {
+                        MatchKind::Fuzzy(0.0)
+                    },
+                }
+            } else {
+                UnitMatch {
+                    current_id: unit.id.clone(),
+                    stable_id: None,
+                    previous_source: None,
+                    previous_translation: None,
+                    trusted_reuse: false,
+                    kind: MatchKind::New,
+                }
+            });
+            continue;
+        }
         if let Some(stable_id) = stable_ids.get(ordinal) {
             if let Some((index, candidate)) =
                 previous.iter().enumerate().find(|(index, candidate)| {
                     !used[*index]
                         && candidate.stable_id == *stable_id
                         && candidate.kind == unit.kind
+                        && candidate.context == unit.context
                         && normalized(&candidate.source) == normalized(&unit.source)
                 })
             {
@@ -62,7 +119,7 @@ pub fn match_units_with_stable_ids(
                     stable_id: Some(candidate.stable_id.clone()),
                     previous_source: Some(candidate.source.clone()),
                     previous_translation: Some(candidate.translation.clone()),
-                    trusted_reuse: candidate.trusted,
+                    trusted_reuse: candidate.trusted && candidate.source == unit.source,
                     kind: MatchKind::Exact,
                 });
                 continue;
@@ -74,6 +131,7 @@ pub fn match_units_with_stable_ids(
             .filter(|(index, candidate)| {
                 !used[*index]
                     && candidate.kind == unit.kind
+                    && candidate.context == unit.context
                     && normalized(&candidate.source) == normalized(&unit.source)
             })
             .collect();
@@ -85,7 +143,7 @@ pub fn match_units_with_stable_ids(
                 stable_id: Some(candidate.stable_id.clone()),
                 previous_source: Some(candidate.source.clone()),
                 previous_translation: Some(candidate.translation.clone()),
-                trusted_reuse: candidate.trusted,
+                trusted_reuse: candidate.trusted && candidate.source == unit.source,
                 kind: if candidate.ordinal == ordinal {
                     MatchKind::Exact
                 } else {
@@ -110,7 +168,9 @@ pub fn match_units_with_stable_ids(
         let mut candidates: Vec<_> = previous
             .iter()
             .enumerate()
-            .filter(|(index, candidate)| !used[*index] && candidate.kind == unit.kind)
+            .filter(|(index, candidate)| {
+                !used[*index] && candidate.kind == unit.kind && candidate.context == unit.context
+            })
             .map(|(index, candidate)| {
                 let text_score = normalized_levenshtein(&normalized(&candidate.source), &source);
                 let distance = candidate.ordinal.abs_diff(ordinal) as f64;
@@ -172,6 +232,7 @@ mod tests {
         PreviousUnit {
             stable_id: id.into(),
             kind: UnitKind::Paragraph,
+            context: UnitContext::markdown(),
             ordinal,
             source: source.into(),
             translation: format!("translated {id}"),
@@ -184,7 +245,7 @@ mod tests {
         let current = extract_units("First paragraph!\n\nSame text.\n");
         let result = match_units(
             &[
-                previous("same", 0, "Same text.\n"),
+                previous("same", 0, "Same text."),
                 previous("changed", 1, "First paragraph.\n"),
             ],
             &current,
@@ -193,6 +254,18 @@ mod tests {
         assert!(!result[0].trusted_reuse);
         assert_eq!(result[1].kind, MatchKind::Moved);
         assert!(result[1].trusted_reuse);
+    }
+
+    #[test]
+    fn context_changes_do_not_match_and_whitespace_changes_do_not_reuse() {
+        let current = extract_units("Same text.\n");
+        let mut old = previous("same", 0, "Same text.");
+        old.context.version = "unknown".into();
+        assert_eq!(match_units(&[old], &current)[0].kind, MatchKind::New);
+        let result = match_units(&[previous("same", 0, "Same  text.")], &current);
+        assert_eq!(result[0].kind, MatchKind::Exact);
+        assert_eq!(result[0].stable_id.as_deref(), Some("same"));
+        assert!(!result[0].trusted_reuse);
     }
 
     #[test]

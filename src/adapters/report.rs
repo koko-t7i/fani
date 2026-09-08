@@ -30,7 +30,7 @@ pub fn build(
     let failures = agent_calls.filter(|call| !call.ok).count();
     let status = overall(outcomes);
     json!({
-        "schema": 3,
+        "schema": 4,
         "config": config.display().to_string(),
         "databases": database_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "started_at": started.to_rfc3339(),
@@ -39,6 +39,12 @@ pub fn build(
         "exit_code": status.exit_code(),
         "totals": {
             "languages": outcomes.len(),
+            "markdown_files": outcomes.iter().map(|outcome| outcome.documents.markdown_files).sum::<usize>(),
+            "mdx_files": outcomes.iter().map(|outcome| outcome.documents.mdx_files).sum::<usize>(),
+            "json_files": outcomes.iter().map(|outcome| outcome.documents.json_files).sum::<usize>(),
+            "parse_failures": outcomes.iter().map(|outcome| outcome.documents.parse_failures).sum::<usize>(),
+            "verified_documents": outcomes.iter().map(|outcome| outcome.documents.verified_documents).sum::<usize>(),
+            "pass_through_documents": outcomes.iter().map(|outcome| outcome.documents.pass_through_documents).sum::<usize>(),
             "files_written": outcomes.iter().map(|outcome| outcome.written.len()).sum::<usize>(),
             "conflicts": outcomes.iter().map(|outcome| outcome.conflicts.len()).sum::<usize>(),
             "findings": outcomes.iter().map(|outcome| outcome.findings.len()).sum::<usize>(),
@@ -72,6 +78,15 @@ pub fn render(data: &Value) -> String {
         format!(
             "- files written: {} · conflicts: {} · findings: {}",
             totals["files_written"], totals["conflicts"], totals["findings"]
+        ),
+        format!(
+            "- Markdown: {} · MDX: {} · JSON: {} · parse failures: {} · verified: {} · pass-through: {}",
+            totals["markdown_files"],
+            totals["mdx_files"],
+            totals["json_files"],
+            totals["parse_failures"],
+            totals["verified_documents"],
+            totals["pass_through_documents"]
         ),
         format!(
             "- Agent calls: {} · attempts: {} · failures: {} · reused units: {}",
@@ -201,7 +216,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(data["schema"], 3);
+        assert_eq!(data["schema"], 4);
         assert_eq!(data["status"], "partial");
         assert!(tmp.path().join("report.md").is_file());
     }

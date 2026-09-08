@@ -20,7 +20,7 @@ set -eu
 request=''
 IFS= read -r request || [ -n "$request" ] || exit 56
 case "$request" in
-  *'"schema":"fani.agent.request.v1"'*'"source":"Deterministic source bytes."'*) ;;
+  *'"schema":"fani.agent.request.v2"'*'"source_format":"markdown"'*'"token_permissions":'*'"source":"Deterministic source bytes."'*) ;;
   *) exit 64 ;;
 esac
 remainder=${request#*\"id\":\"}
