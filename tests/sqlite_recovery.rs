@@ -439,18 +439,20 @@ fn cli_crash_recovery_preserves_atomicity_and_never_duplicates_provider_calls() 
         fs::read_to_string(&fixture.target).unwrap(),
         "# 你好 after-state-transition\n"
     );
-    let before_recovery: (String, String) = db
+    let before_recovery: (String, String, String) = db
         .connect()
         .unwrap()
         .query_row(
-            "SELECT cf.state,mo.state FROM canonical_files cf JOIN materialization_outbox mo ON json_extract(mo.payload_json,'$.path')=cf.path ORDER BY mo.id DESC LIMIT 1",
+            "SELECT cf.state,mo.state,w.status FROM canonical_files cf JOIN materialization_outbox mo ON json_extract(mo.payload_json,'$.path')=cf.path JOIN work_items w ON w.id=mo.work_item_id ORDER BY mo.id DESC LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
+    // The file write survives, while state and work completion roll back together
+    // because the failpoint now runs inside the settlement transaction.
     assert_eq!(
         before_recovery,
-        ("materialized".into(), "processing".into())
+        ("candidate".into(), "processing".into(), "pending".into())
     );
     fixture.recover("4");
 

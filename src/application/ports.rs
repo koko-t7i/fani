@@ -1,3 +1,10 @@
+pub mod read_io;
+pub use read_io::{SourceReader, TargetReader};
+mod verification;
+pub use verification::*;
+mod transactions;
+pub use transactions::*;
+
 use crate::application::settings::RepoConfig;
 use crate::domain::model::{
     AgentResult, AgentTask, CanonicalTransition, Freshness, MemoryTier, PublicationState,
@@ -208,7 +215,7 @@ pub struct AttemptInput<'a> {
     pub prompt_version: &'a str,
     pub prompt_hash: &'a str,
     pub policy_fingerprint: &'a str,
-    pub status: &'a str,
+    pub status: crate::application::contracts::AttemptStatus,
     pub request_json: &'a str,
     pub response_json: Option<&'a str>,
     pub error: Option<&'a str>,
@@ -387,32 +394,34 @@ pub struct MaterializationReceipt {
     pub outbox_id: i64,
 }
 
-pub trait DocumentStore {
-    fn upsert_repository(
-        &self,
-        repository_key: &str,
-        root_path: &Path,
-        default_branch: Option<&str>,
-        remote_url: Option<&str>,
-    ) -> Result<i64>;
-    fn upsert_document(
+pub trait RunStore {
+    fn begin_run(
         &self,
         repository_id: i64,
-        path: &str,
-        source_revision: Option<&str>,
-        content_hash: &str,
+        invocation_key: &str,
+        config_path: &Path,
         metadata_json: &str,
-    ) -> Result<i64>;
+        policy_fingerprint: &str,
+    ) -> Result<String>;
+    fn finish_run(&self, run_id: &str, status: &str) -> Result<bool>;
+}
+
+/// Aggregate required storage capabilities for the application composition root.
+pub trait StateStore {
+    fn planning(&self) -> &dyn PlanningStore;
+    fn runs(&self) -> &dyn RunStore;
+    fn verification(&self) -> &dyn VerificationStore;
+    fn repositories(&self) -> &dyn RepositoryStore;
+    fn preparation(&self) -> &dyn PreparationStore;
+    fn pipeline(&self) -> &dyn PipelineStore;
+    fn materialization(&self) -> &dyn MaterializationStore;
+    fn publication(&self) -> &dyn PublicationWorkflowStore;
+    fn reconciliation(&self) -> &dyn ReconciliationStore;
+}
+
+pub trait PlanningStore {
+    fn repository_id(&self, repository_key: &str) -> Result<Option<i64>>;
     fn document_id(&self, repository_id: i64, path: &str) -> Result<Option<i64>>;
-    fn upsert_unit(
-        &self,
-        document_id: i64,
-        unit_key: &str,
-        ordinal: i64,
-        source_text: &str,
-        source_hash: &str,
-        context_json: &str,
-    ) -> Result<i64>;
     fn unit_history(&self, document_id: i64, locale: &str) -> Result<Vec<UnitHistory>>;
     fn unchanged_document_unit_keys(
         &self,
@@ -420,10 +429,6 @@ pub trait DocumentStore {
         path: &str,
         content_hash: &str,
     ) -> Result<Vec<String>>;
-    fn repository_id(&self, repository_key: &str) -> Result<Option<i64>>;
-}
-
-pub trait TranslationStore {
     fn translation_candidates(
         &self,
         document_id: i64,
@@ -435,265 +440,21 @@ pub trait TranslationStore {
         locale: &str,
         run_or_invocation: &str,
     ) -> Result<Vec<RecoveredAttempt>>;
-    fn revalidate_candidate(
-        &self,
-        unit_id: i64,
-        locale: &str,
-        candidate: &TranslationCandidate,
-    ) -> Result<()>;
-    fn retire_attempt(&self, attempt_id: i64) -> Result<()>;
-    fn quarantine_incompatible_translations(&self, document_id: i64, locale: &str) -> Result<()>;
-    fn trusted_translation(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        source_hash: &str,
-        context_key: &str,
-    ) -> Result<Option<String>>;
-    fn trust_translation(&self, input: TrustTranslationInput<'_>) -> Result<i64>;
-    fn successful_attempt(
-        &self,
-        work_item_id: i64,
-        dedupe_key: &str,
-    ) -> Result<Option<RecoveredAttempt>>;
-    fn attempt_status(&self, work_item_id: i64, dedupe_key: &str) -> Result<Option<String>>;
-    fn failed_attempt_context(&self, work_item_id: i64) -> Result<Option<FailedAttemptContext>>;
-    fn recoverable_candidate(
-        &self,
-        run_id: &str,
-        unit_id: i64,
-        locale: &str,
-        policy_fingerprint: &str,
-        deterministic_repair_version: &str,
-    ) -> Result<Option<String>>;
-    fn recoverable_invocation_candidate(
-        &self,
-        invocation_key: &str,
-        unit_id: i64,
-        locale: &str,
-        policy_fingerprint: &str,
-        deterministic_repair_version: &str,
-    ) -> Result<Option<String>>;
-    fn recoverable_unit_candidate(
-        &self,
-        unit_id: i64,
-        locale: &str,
-        policy_fingerprint: &str,
-        deterministic_repair_version: &str,
-    ) -> Result<Option<String>>;
-    fn record_attempt(&self, input: AttemptInput<'_>) -> Result<AttemptReceipt>;
-    fn record_attempt_candidate(&self, input: AttemptCandidateInput<'_>) -> Result<AttemptReceipt>;
-    fn select_canonical_candidate(
-        &self,
-        unit_id: i64,
-        locale: &str,
-        candidate_key: &str,
-        target_text: &str,
-        source_attempt_id: Option<i64>,
-        score: Option<f64>,
-    ) -> Result<i64>;
-}
-
-pub trait RunStore {
-    fn begin_run(
-        &self,
-        repository_id: i64,
-        invocation_key: &str,
-        config_path: &Path,
-        metadata_json: &str,
-        policy_fingerprint: &str,
-    ) -> Result<String>;
-    fn finish_run(&self, run_id: &str, status: &str) -> Result<bool>;
-    fn enqueue_work_item(
-        &self,
-        run_id: &str,
-        unit_id: i64,
-        locale: &str,
-        kind: &str,
-        priority: i64,
-        input_json: &str,
-    ) -> Result<i64>;
-    fn enqueue_document_work_item(
-        &self,
-        run_id: &str,
-        document_id: i64,
-        locale: &str,
-        kind: &str,
-        priority: i64,
-        input_json: &str,
-    ) -> Result<i64>;
-    fn finish_document_work(
-        &self,
-        work_item_id: i64,
-        succeeded: bool,
-        result_json: &str,
-    ) -> Result<()>;
-    fn record_finding(&self, input: FindingInput<'_>) -> Result<i64>;
-}
-
-pub trait CanonicalStore {
     fn canonical_file(
         &self,
         repository_id: i64,
         locale: &str,
         path: &str,
     ) -> Result<Option<CanonicalFile>>;
-    fn upsert_canonical_file(&self, input: CanonicalFileInput<'_>) -> Result<i64>;
-    fn persist_canonical_file(
-        &self,
-        input: CanonicalFileInput<'_>,
-        translations: &[CanonicalTranslationInput<'_>],
-    ) -> Result<CanonicalFile>;
-    fn canonical_document_intent(&self, content_version_id: i64) -> Result<Option<String>>;
-    fn bind_canonical_document_intent(
-        &self,
-        content_version_id: i64,
-        identity_json: &str,
-    ) -> Result<()>;
-    fn record_canonical_file_translations(
-        &self,
-        canonical_file_id: i64,
-        translations: &[CanonicalTranslationInput<'_>],
-        locale: &str,
-    ) -> Result<usize>;
-    fn transition_canonical_file(
-        &self,
-        id: i64,
-        transition: CanonicalTransition,
-        materialized_hash: Option<&str>,
-    ) -> Result<()>;
-    fn canonical_content_matches(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        source_revision: &str,
-        binding: &PublicationManifestFile,
-        file: &PublicationFile,
-    ) -> Result<bool>;
-    fn canonical_compatible(&self, content_version_id: i64) -> Result<bool>;
-    fn persist_canonical_document(
-        &self,
-        input: CanonicalFileInput<'_>,
-        translations: &[CanonicalTranslationInput<'_>],
-        identity_json: &str,
-    ) -> Result<CanonicalFile>;
 }
 
-pub trait EffectStore {
-    fn pending_materializations(
+pub trait RepositoryStore {
+    fn upsert_repository(
         &self,
-        repository_id: i64,
-        locale: &str,
-    ) -> Result<Vec<OutboxEntry>>;
-    fn cancel_materialization(&self, repository_id: i64, id: i64) -> Result<()>;
-    fn effect_key(&self, kind: OutboxKind, base: &str) -> Result<String>;
-    fn materialization_work(&self, dedupe_key: &str) -> Result<Option<i64>>;
-    fn supersede_materializations(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        path: &str,
-        active_dedupe_key: &str,
-    ) -> Result<usize>;
-    fn enqueue_materialization(
-        &self,
-        work_item_id: i64,
-        dedupe_key: &str,
-        payload_json: &str,
+        repository_key: &str,
+        root_path: &Path,
+        default_branch: Option<&str>,
+        remote_url: Option<&str>,
     ) -> Result<i64>;
-    fn claim_outbox_key(
-        &self,
-        kind: OutboxKind,
-        dedupe_key: &str,
-        owner: &str,
-        now: i64,
-        lease_ms: i64,
-    ) -> Result<Option<OutboxEntry>>;
-    fn retry_outbox(
-        &self,
-        kind: OutboxKind,
-        id: i64,
-        owner: &str,
-        error: &str,
-        available_at: i64,
-    ) -> Result<bool>;
-    fn complete_outbox(&self, kind: OutboxKind, id: i64, owner: &str) -> Result<bool>;
-    fn enqueue_publication(
-        &self,
-        repository_id: i64,
-        run_id: Option<&str>,
-        locale: &str,
-        dedupe_key: &str,
-        payload_json: &str,
-    ) -> Result<i64>;
-    fn claim_publication_locale(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        owner: &str,
-        now: i64,
-        lease_ms: i64,
-    ) -> Result<Option<OutboxEntry>>;
-    fn update_outbox_payload(
-        &self,
-        kind: OutboxKind,
-        id: i64,
-        owner: &str,
-        payload_json: &str,
-    ) -> Result<bool>;
-    fn schedule_materialization(
-        &self,
-        input: MaterializationIntentInput<'_>,
-    ) -> Result<MaterializationReceipt>;
-}
-
-pub trait PublicationStore {
-    fn pull_request_for_branch(
-        &self,
-        repository_id: i64,
-        provider: &str,
-        branch: &str,
-    ) -> Result<Option<StoredPullRequest>>;
-    fn record_pr_state(&self, input: PullRequestStateInput<'_>) -> Result<i64>;
-    fn record_publication_manifest(&self, input: PublicationManifestInput<'_>) -> Result<i64>;
-    fn record_publication_authorization(
-        &self,
-        input: PublicationManifestInput<'_>,
-        authorization_key: &str,
-    ) -> Result<i64>;
-    fn transition_publication_authorization(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        candidate_commit: &str,
-        authorization_key: &str,
-        state: PublicationState,
-    ) -> Result<()>;
-    fn transition_publication_manifest(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        candidate_commit: &str,
-        state: PublicationState,
-    ) -> Result<()>;
-    fn publication_snapshot(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        commit: &str,
-    ) -> Result<Vec<CanonicalSnapshot>>;
-    fn promote_merged_publication(
-        &self,
-        repository_id: i64,
-        locale: &str,
-        candidate_commit: &str,
-        provenance: &str,
-        verified_zero_unit_contents: &[i64],
-    ) -> Result<usize>;
-}
-
-/// Aggregate required storage capabilities for the application composition root.
-pub trait StateStore:
-    DocumentStore + TranslationStore + RunStore + CanonicalStore + EffectStore + PublicationStore
-{
+    fn repository_id(&self, repository_key: &str) -> Result<Option<i64>>;
 }

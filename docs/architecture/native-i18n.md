@@ -154,4 +154,26 @@ Push and pull-request operations have durable idempotency keys and reconciliatio
 
 ## Module direction
 
-The project remains one Cargo package and a modular monolith. `main` delegates to `cli`; command handlers compose application operations; pure Markdown/domain functions do not depend on SQLite, GitHub, or subprocesses; adapters implement coarse state, Agent, materialization, Git, and code-host boundaries. A workspace is reconsidered only when a separately versioned/published artifact exists.
+The project remains one Cargo package and a modular monolith. `main` delegates to `cli`; command handlers compose application operations; pure Markdown/domain functions do not depend on SQLite, GitHub, or subprocesses; adapters implement application-owned query, transaction, Agent, materialization, Git, and code-host boundaries. A workspace is reconsidered only when a separately versioned/published artifact exists.
+
+
+### Application capabilities and transactions
+
+The coordinator constructs separate preparation, translation, repair, review, verification, materialization, publication, and human-reconciliation services. Each receives its own storage capability and required external ports. `StateStore` is an accessor aggregate used at composition and coordination boundaries; workflow services cannot use it to reach other stores.
+
+`Planner` receives only `PlanningStore`, `SourceReader`, `TargetReader`, and an already computed provider fingerprint. Status/check construct it directly against the SQLite snapshot. It cannot dispatch an Agent, update state, modify targets, or publish. Execution reuses the same planning decisions before committing preparation.
+
+Verification creates an immutable `VerifiedBatch` snapshot containing the checked documents and bytes. Only that snapshot can enter materialization. Project-check failures produce findings without a batch. Work requests, document identities, verification results, materialization results, and publication preparation states have typed contracts; their codecs preserve durable JSON compatibility and historical hash ordering.
+
+SQLite is divided into schema, document queries, preparation, attempts, leases, canonical content, effects, publication, and workflow transaction modules. Business operations share one connection and transaction for each of the following:
+
+- Document/unit preparation, compatible reuse, and scheduled work.
+- Canonical bytes, immutable translation links, identity, and materialization intent.
+- Verification findings and work completion.
+- Materialization state, work result, and outbox acknowledgement.
+- Publication candidate payload, authorization, and pending state; final PR/state/promotion and receipt completion.
+- Each adopted document's units, trusted memory, canonical content, identity, and completed work.
+
+Filesystem, Git, model, and GitHub calls remain outside database transactions. Durable outboxes bridge those effects. Discard records the originally observed target hash and uses compare-and-swap on recovery, preventing an interrupted discard from overwriting a subsequent human edit. Adoption checks the candidate set first and commits each document atomically; repository-wide atomic adoption is not claimed.
+
+See [service-boundary acceptance](2026-09-08-service-boundaries.md) for the refactor's verification record. No database migration, configuration change, or Agent-protocol change accompanies these boundaries.

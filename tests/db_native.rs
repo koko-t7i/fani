@@ -70,10 +70,8 @@ fn fixture() -> Fixture {
 
 #[test]
 fn document_work_is_unique_scoped_and_creates_no_translation_records() {
-    use fani::application::ports::StateStore;
-
     let fixture = fixture();
-    let store: &dyn StateStore = &fixture.db;
+    let store = &fixture.db;
     let document_id = fixture
         .db
         .upsert_document(
@@ -579,7 +577,7 @@ fn attempt_recording_is_idempotent_by_work_item_and_dedupe_key() {
             prompt_version: prompts::PROMPT_VERSION,
             prompt_hash: TEST_FINGERPRINT,
             policy_fingerprint: TEST_FINGERPRINT,
-            status: "succeeded",
+            status: fani::application::contracts::AttemptStatus::Succeeded,
             request_json: r#"{"prompt":"translate"}"#,
             response_json: Some(r#"{"text":"介绍"}"#),
             error: None,
@@ -598,7 +596,7 @@ fn attempt_recording_is_idempotent_by_work_item_and_dedupe_key() {
             prompt_version: prompts::PROMPT_VERSION,
             prompt_hash: TEST_FINGERPRINT,
             policy_fingerprint: TEST_FINGERPRINT,
-            status: "failed",
+            status: fani::application::contracts::AttemptStatus::Failed,
             request_json: r#"{"prompt":"different replay"}"#,
             response_json: None,
             error: Some("must not overwrite the durable first result"),
@@ -639,7 +637,7 @@ fn successful_attempt_and_candidate_commit_atomically_and_are_recoverable() {
                 prompt_version: prompts::PROMPT_VERSION,
                 prompt_hash: TEST_FINGERPRINT,
                 policy_fingerprint: TEST_FINGERPRINT,
-                status: "succeeded",
+                status: fani::application::contracts::AttemptStatus::Succeeded,
                 request_json: r#"{"prompt":"translate"}"#,
                 response_json: Some(response),
                 error: None,
@@ -684,7 +682,7 @@ fn successful_attempt_and_candidate_commit_atomically_and_are_recoverable() {
                 prompt_version: prompts::PROMPT_VERSION,
                 prompt_hash: TEST_FINGERPRINT,
                 policy_fingerprint: TEST_FINGERPRINT,
-                status: "succeeded",
+                status: fani::application::contracts::AttemptStatus::Succeeded,
                 request_json: r#"{"prompt":"translate"}"#,
                 response_json: Some(response),
                 error: None,
@@ -719,7 +717,7 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
                 prompt_version: prompts::PROMPT_VERSION,
                 prompt_hash: TEST_FINGERPRINT,
                 policy_fingerprint: TEST_FINGERPRINT,
-                status: "succeeded",
+                status: fani::application::contracts::AttemptStatus::Succeeded,
                 request_json: r#"{"task":"candidate-only"}"#,
                 response_json: Some(r#"{"output":"候选译文"}"#),
                 error: None,
@@ -881,7 +879,6 @@ fn candidate_memory_is_not_reused_until_explicitly_trusted() {
 
 #[test]
 fn completed_commit_without_authorization_requires_a_new_checked_effect() {
-    use fani::application::ports::EffectStore;
     let fixture = fixture();
     let key = "publish:orphaned-authorization";
     let id = fixture
@@ -935,7 +932,6 @@ fn completed_commit_without_authorization_requires_a_new_checked_effect() {
 
 #[test]
 fn superseded_publication_key_creates_new_effect_without_reopening_history() {
-    use fani::application::ports::EffectStore;
     let fixture = fixture();
     let base = "publish:roundtrip";
     let old = fixture
@@ -1378,7 +1374,7 @@ fn merged_publication_promotes_only_exact_manifest_translation_versions() {
                 prompt_version: prompts::PROMPT_VERSION,
                 prompt_hash: TEST_FINGERPRINT,
                 policy_fingerprint: TEST_FINGERPRINT,
-                status: "succeeded",
+                status: fani::application::contracts::AttemptStatus::Succeeded,
                 request_json: r#"{"task":"published"}"#,
                 response_json: Some(r#"{"output":"已发布译文"}"#),
                 error: None,
@@ -1442,7 +1438,7 @@ fn merged_publication_promotes_only_exact_manifest_translation_versions() {
                 prompt_version: prompts::PROMPT_VERSION,
                 prompt_hash: TEST_FINGERPRINT,
                 policy_fingerprint: TEST_FINGERPRINT,
-                status: "succeeded",
+                status: fani::application::contracts::AttemptStatus::Succeeded,
                 request_json: r#"{"task":"unpublished"}"#,
                 response_json: Some(r#"{"output":"未发布译文"}"#),
                 error: None,
@@ -1592,7 +1588,7 @@ fn canonical_selection_and_trusted_tm_have_single_authoritative_rows() {
             prompt_version: prompts::PROMPT_VERSION,
             prompt_hash: TEST_FINGERPRINT,
             policy_fingerprint: TEST_FINGERPRINT,
-            status: "succeeded",
+            status: fani::application::contracts::AttemptStatus::Succeeded,
             request_json: "{}",
             response_json: Some("{}"),
             error: None,
@@ -1725,7 +1721,7 @@ fn canonical_content_links_trusted_assembled_text_not_stale_selected_candidate()
                 prompt_version: prompts::PROMPT_VERSION,
                 prompt_hash: TEST_FINGERPRINT,
                 policy_fingerprint: TEST_FINGERPRINT,
-                status: "succeeded",
+                status: fani::application::contracts::AttemptStatus::Succeeded,
                 request_json: "{}",
                 response_json: Some(r#"{"output":"陈旧候选"}"#),
                 error: None,
@@ -1819,7 +1815,7 @@ fn merged_tm_uses_immutable_source_version_after_live_source_mutation() {
                 prompt_version: prompts::PROMPT_VERSION,
                 prompt_hash: TEST_FINGERPRINT,
                 policy_fingerprint: TEST_FINGERPRINT,
-                status: "succeeded",
+                status: fani::application::contracts::AttemptStatus::Succeeded,
                 request_json: "{}",
                 response_json: Some(r#"{"output":"不可变来源译文"}"#),
                 error: None,
@@ -2133,7 +2129,7 @@ fn merged_publication_remains_terminal_under_manifest_replay() {
                 prompt_version: prompts::PROMPT_VERSION,
                 prompt_hash: TEST_FINGERPRINT,
                 policy_fingerprint: TEST_FINGERPRINT,
-                status: "succeeded",
+                status: fani::application::contracts::AttemptStatus::Succeeded,
                 request_json: "{}",
                 response_json: Some(r#"{"output":"终态译文"}"#),
                 error: None,
