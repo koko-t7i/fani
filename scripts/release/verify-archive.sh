@@ -96,4 +96,4 @@ if ! file "$binary" | grep -q 'ELF 64-bit.*x86-64'; then
     exit 1
 fi
 "$binary" --version | grep -Fx "fani 0.3.0"
-"$binary" --help | grep -q 'Native continuous Markdown translation'
+"$binary" --help | grep -q 'Native continuous Markdown and JSON translation'
