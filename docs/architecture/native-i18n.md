@@ -92,11 +92,23 @@ Migration 0006 separates run/effect authorization from deterministic Git commit 
 
 Effect-time rejection and push/PR transitions target only that effect's authorization. Commit-based snapshot and promotion consumers select one eligible manifest (merged first, otherwise latest), so shared commits neither duplicate snapshot files nor hide renewed authorization behind rejected history. Canonical/translation publication status reflects the strongest remaining authorization, including after an idempotent replan; cancelling one effect does not downgrade another successful one. A completed outbox with a commit but no eligible bound manifest requires a new checked effect rather than acting as publication proof.
 
-`StateStore::enqueue_document_work_item` connects `assembly`, `materialization`, and `project_check` to the pipeline and adoption; `finish_document_work` records success/failure and exact result hashes. Unit enqueue signatures remain unchanged. Materialization recovery locates the original outbox work ID before enqueueing equivalent document work. Repository IDs scope both `supersede_materializations` and `claim_publication_locale`; cancellation retains the original work/outbox rows using supported `cancelled`/`done` states.
+`RunStore::enqueue_document_work_item` connects `assembly`, `materialization`, and `project_check` to the pipeline and adoption; `finish_document_work` records success/failure and exact result hashes. Unit enqueue signatures remain unchanged. Materialization recovery locates the original outbox work ID before enqueueing equivalent document work. Repository IDs scope both `supersede_materializations` and `claim_publication_locale`; cancellation retains the original work/outbox rows using supported `cancelled`/`done` states.
 
 The model covers repositories and languages, source revisions, documents and unit occurrences, translation versions and trusted memory, runs and work items, completed attempts, findings and transitions, canonical candidate blobs, materialization/publication outboxes, pull-request lifecycle, and renewable leases.
 
+`StateStore` aggregates six required capabilities: `DocumentStore`, `TranslationStore`, `RunStore`, `CanonicalStore`, `EffectStore`, and `PublicationStore`. Implementations must provide every operation; missing recovery support cannot silently return empty history or fail only after a run starts. `persist_canonical_document` commits canonical content, immutable translation links, and the current document identity in one transaction. `schedule_materialization` commits supersession, document work, and its outbox together, preserving compatible pending receipts. Canonical persistence can still precede effect creation; that crash boundary is recovered by reassembly under current rules.
+
+Repository mutation commands acquire a Linux `flock` on the canonical repository directory before opening or migrating the authoritative database. The descriptor remains held through the operation and is close-on-exec. SQLite leases remain recovery metadata: expiration cannot admit a second cooperating process while the first is alive, including while it is paused. Process exit releases the kernel lock. This contract requires a local filesystem supporting `flock`; stop older fani processes before upgrading. Different configured data directories for the same directory share the process lock.
+
 Connection policy is `foreign_keys=ON`, rollback journal, `synchronous=FULL`, and a bounded busy timeout. Transactions contain only local state transitions. Agent, filesystem, Git, and network operations occur after durable intent commits and before short completion transactions.
+
+## Planning and batch boundaries
+
+Preview and execution share document parsing, unit matching, reuse eligibility, and target-divergence decisions in `application/sync/planning.rs`. Preview reads repository identity without an upsert and uses a temporary database snapshot. A changed or removed materialized target is a conflict in `status`, `check`, and `sync`; an existing target without canonical history is accepted only when it already equals the fully verified candidate. The materializer rechecks target bytes before writing.
+
+Synchronization validates repository/language selection before processing the batch. Repository preflight, database opening, lock acquisition, and lock release failures become repository outcomes. Other selected repositories continue, and the final report aggregates their actual results with `error > needs_human > partial > ok` precedence. A report-directory write failure remains a command-level error.
+
+Publication recovery and publication checks live in `application/sync/publication.rs`; human adoption and discard live in `application/sync/reconciliation.rs`. Architecture tests enforce dependency direction and required ports across modules without imposing minimum file sizes or database-call counts.
 
 ## Agent boundary
 

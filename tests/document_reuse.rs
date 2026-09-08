@@ -295,7 +295,7 @@ fn json_current_candidate_history_is_stable_and_prior_output_is_context_only() {
 
 #[test]
 fn json_zero_unit_merge_reconciles_without_translation_history() {
-    use fani::application::ports::{PullRequestStateInput, StateStore};
+    use fani::application::ports::PullRequestStateInput;
     for scenario in [
         "observed",
         "published",
@@ -340,7 +340,7 @@ fn json_zero_unit_merge_reconciles_without_translation_history() {
             )
             .unwrap();
             assert!(
-                StateStore::promote_merged_publication(
+                fani::application::ports::PublicationStore::promote_merged_publication(
                     &db, repository, "zh-CN", &commit, "verified", &contents
                 )
                 .is_err()
@@ -354,7 +354,7 @@ fn json_zero_unit_merge_reconciles_without_translation_history() {
             )
             .unwrap();
             assert!(
-                StateStore::promote_merged_publication(
+                fani::application::ports::PublicationStore::promote_merged_publication(
                     &db, repository, "zh-CN", &commit, "verified", &contents
                 )
                 .is_err()
@@ -1494,7 +1494,7 @@ fn publication_recovery_reports_new_parse_failure_on_first_rerun() {
 
 #[test]
 fn intent_binding_roundtrip_selects_current_identity_without_mutating_history() {
-    use fani::application::ports::StateStore;
+    use fani::application::ports::CanonicalStore;
     let fixture = Fixture::new("Hello world.\n");
     fixture.sync(0);
     let db = fixture.db();
