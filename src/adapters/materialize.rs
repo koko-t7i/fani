@@ -118,6 +118,12 @@ impl Materializer for FilesystemMaterializer {
     }
 }
 
+impl crate::application::ports::TargetReader for FilesystemMaterializer {
+    fn read(&self, root: &Path, relative: &Path) -> Result<Option<Vec<u8>>> {
+        <Self as Materializer>::read(self, root, relative)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

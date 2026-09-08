@@ -340,7 +340,7 @@ fn json_zero_unit_merge_reconciles_without_translation_history() {
             )
             .unwrap();
             assert!(
-                fani::application::ports::PublicationStore::promote_merged_publication(
+                Database::promote_verified_publication(
                     &db, repository, "zh-CN", &commit, "verified", &contents
                 )
                 .is_err()
@@ -354,7 +354,7 @@ fn json_zero_unit_merge_reconciles_without_translation_history() {
             )
             .unwrap();
             assert!(
-                fani::application::ports::PublicationStore::promote_merged_publication(
+                Database::promote_verified_publication(
                     &db, repository, "zh-CN", &commit, "verified", &contents
                 )
                 .is_err()
@@ -1263,8 +1263,10 @@ fn blocking_project_checks_never_persist_or_materialize_candidates() {
         fs::write(fixture.repo.join("docs/guide.md"), "Hello changed world.\n").unwrap();
         fixture.commit();
         let command = if timed_out { "sleep 1" } else { "exit 1" };
+        // Keep the explicit-exit case independent of scheduler startup delays.
+        let timeout_s = if timed_out { 0.05 } else { 5.0 };
         let checks = format!(
-            "[repo.documentation]\ncommands = [[\"sh\", \"-c\", \"{command}\"]]\ntimeout_s = 0.05\n[repo.quality]"
+            "[repo.documentation]\ncommands = [[\"sh\", \"-c\", \"{command}\"]]\ntimeout_s = {timeout_s}\n[repo.quality]"
         );
         let config = fs::read_to_string(&fixture.config)
             .unwrap()
@@ -1494,7 +1496,6 @@ fn publication_recovery_reports_new_parse_failure_on_first_rerun() {
 
 #[test]
 fn intent_binding_roundtrip_selects_current_identity_without_mutating_history() {
-    use fani::application::ports::CanonicalStore;
     let fixture = Fixture::new("Hello world.\n");
     fixture.sync(0);
     let db = fixture.db();
@@ -2748,6 +2749,18 @@ fn compatible_adopted_publication_without_links_revalidates_reordered_code() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
+    let links: i64 = conn.query_row("SELECT COUNT(*) FROM canonical_file_translations WHERE canonical_content_version_id=?1", [version], |row| row.get(0)).unwrap();
+    assert_eq!(
+        links, 1,
+        "new adoption persists its immutable translation link"
+    );
+    // Recreate a historical adoption receipt that predates atomic link persistence.
+    // Its publication must still be validated and recovered under current rules.
+    conn.execute(
+        "DELETE FROM canonical_file_translations WHERE canonical_content_version_id=?1",
+        [version],
+    )
+    .unwrap();
     let links: i64 = conn.query_row("SELECT COUNT(*) FROM canonical_file_translations WHERE canonical_content_version_id=?1", [version], |row| row.get(0)).unwrap();
     assert_eq!(links, 0);
     let mut payload: Value = serde_json::from_str(&raw).unwrap();

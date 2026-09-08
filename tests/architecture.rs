@@ -96,7 +96,6 @@ fn application_owns_ports_without_concrete_adapters() {
         "src/application",
         &[
             "pub struct Orchestrator",
-            "database: &'a dyn StateStore",
             "materializer: &'a dyn Materializer",
             "agents: &'a dyn AgentExecutor",
             "documentation: &'a dyn DocumentationChecker",
@@ -121,7 +120,7 @@ fn adapters_implement_and_native_composes_application_ports() {
         "src/adapters/agent.rs",
         &["impl AgentExecutor for RoutedAgentExecutor"],
     );
-    assert_contains_all("src/adapters/db.rs", &["impl StateStore for Database"]);
+    assert_contains_all("src/adapters", &["impl StateStore for Database"]);
     assert_contains_all(
         "src/adapters/documentation.rs",
         &["impl DocumentationChecker for NativeDocumentationChecker"],
@@ -241,4 +240,82 @@ fn library_surface_keeps_implementation_layers_private() {
             "{private_module} must not be exposed as a public module"
         );
     }
+}
+
+#[test]
+fn workflow_services_do_not_share_the_coordinator_or_aggregate_store() {
+    assert_absent(
+        "src/application/sync",
+        &["impl Orchestrator", "use super::*", "dyn StateStore"],
+    );
+}
+
+#[test]
+fn preview_io_capabilities_cannot_mutate_targets_or_publish() {
+    assert_absent(
+        "src/application/ports/read_io.rs",
+        &[
+            "fn apply",
+            "fn restore",
+            "fn prepare",
+            "fn publish",
+            "fn execute",
+        ],
+    );
+    assert_absent(
+        "src/application/sync/planning.rs",
+        &[
+            "dyn StateStore",
+            "dyn Materializer",
+            "dyn GitPublisher",
+            "dyn AgentExecutor",
+            ".upsert_",
+            ".enqueue_",
+            ".record_",
+            ".finish_",
+            ".execute(",
+        ],
+    );
+}
+
+#[test]
+fn obsolete_crud_ports_cannot_reenter_application_services() {
+    assert_absent(
+        "src/application",
+        &[
+            "pub trait DocumentStore",
+            "pub trait TranslationStore",
+            "pub trait CanonicalStore",
+            "pub trait EffectStore",
+            "pub trait PublicationStore",
+        ],
+    );
+    assert_absent(
+        "src/application/sync/materialization.rs",
+        &[
+            ".persist_canonical_document(",
+            ".enqueue_materialization(",
+            ".complete_outbox(",
+            ".finish_document_work(",
+        ],
+    );
+    assert_absent(
+        "src/application/sync/publication.rs",
+        &[
+            ".record_publication_authorization(",
+            ".update_outbox_payload(",
+            ".complete_outbox(",
+            ".record_pr_state(",
+        ],
+    );
+    assert_absent(
+        "src/application/sync/reconciliation.rs",
+        &[
+            ".upsert_document(",
+            ".upsert_unit(",
+            ".trust_translation(",
+            ".persist_canonical_document(",
+            ".finish_document_work(",
+        ],
+    );
 }

@@ -1,14 +1,45 @@
-use super::*;
+use crate::application::contracts::{PublicationPayload, PublicationRecord};
+use crate::application::ports::{
+    CodeHost, DocumentationChecker, EnsurePullRequest, GitPublisher, OutboxKind,
+    PublicationCandidateInput, PublicationFile, PublicationIntentInput, PublicationManifestFile,
+    PublicationManifestInput, PublicationObservationInput, PublicationSettlementInput,
+    PublicationWorkflowStore, PullRequestStateInput,
+};
+use crate::application::settings::RepoConfig;
+use crate::application::sync::context::{
+    compatible_document_identity, content_hash, count_formats, document_identity, finding, hash,
+};
+use crate::domain::document::verify_document;
+use crate::domain::model::{LanguageOutcome, PublicationState};
+use crate::domain::prompts;
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
+use std::collections::HashSet;
+use std::time::Instant;
 
-impl Orchestrator<'_> {
+mod codec;
+mod lifecycle;
+use lifecycle::{MergeAssessment, Preparation, PullRequestLifecycle, preparation};
+
+pub(crate) struct PublicationService<'a> {
+    pub repo: &'a RepoConfig,
+    pub store: &'a dyn PublicationWorkflowStore,
+    pub git: &'a dyn GitPublisher,
+    pub code_host: &'a dyn CodeHost,
+    pub documentation: &'a dyn DocumentationChecker,
+    pub owner_identity: &'a str,
+    pub failpoint: fn(&str),
+}
+
+impl PublicationService<'_> {
     pub(super) fn reconcile_pull_request(&self, repository_id: i64, language: &str) -> Result<()> {
         if !self.repo.publish.github.enabled {
             return Ok(());
         }
         let branch = self.git.branch(self.repo, language)?;
-        let Some(stored) =
-            self.database
-                .pull_request_for_branch(repository_id, "github", &branch)?
+        let Some(stored) = self
+            .store
+            .pull_request_for_branch(repository_id, "github", &branch)?
         else {
             return Ok(());
         };
@@ -20,16 +51,8 @@ impl Orchestrator<'_> {
             &self.repo.publish.github.repository,
             &number.to_string(),
         )?;
-        let state = if pull.state.eq_ignore_ascii_case("merged") {
-            "merged"
-        } else if pull.state.eq_ignore_ascii_case("open") && pull.draft {
-            "draft"
-        } else if pull.state.eq_ignore_ascii_case("open") {
-            "open"
-        } else {
-            "closed"
-        };
-        if state == "merged" {
+        let state = PullRequestLifecycle::observed(&pull.state, pull.draft);
+        if state == PullRequestLifecycle::Merged {
             let expected = stored
                 .head_revision
                 .as_deref()
@@ -43,39 +66,51 @@ impl Orchestrator<'_> {
                 );
             }
         }
-        self.database.record_pr_state(PullRequestStateInput {
-            repository_id,
-            provider: "github",
-            external_id: &stored.external_id,
-            number: stored.number,
-            branch: &branch,
-            url: Some(&pull.url),
-            state,
-            head_revision: stored.head_revision.as_deref(),
-            event_key: &format!(
-                "observe:{state}:{}",
-                pull.head_revision.as_deref().unwrap_or("unknown")
-            ),
-            payload_json: &pull.payload_json,
-        })?;
-        if state == "merged" {
-            let candidate_commit = stored
-                .head_revision
-                .as_deref()
-                .ok_or_else(|| anyhow!("stored pull request has no candidate head revision"))?;
-            self.promote_verified_publication(repository_id, language, candidate_commit)?;
-        }
+        let assessment = if state == PullRequestLifecycle::Merged {
+            self.assess_merged_publication(
+                repository_id,
+                language,
+                stored
+                    .head_revision
+                    .as_deref()
+                    .expect("merged head checked"),
+            )?
+        } else {
+            MergeAssessment::Unchanged
+        };
+        self.store
+            .observe_publication(PublicationObservationInput {
+                pull_request: PullRequestStateInput {
+                    repository_id,
+                    provider: "github",
+                    external_id: &stored.external_id,
+                    number: stored.number,
+                    branch: &branch,
+                    url: Some(&pull.url),
+                    state: state.as_str(),
+                    head_revision: stored.head_revision.as_deref(),
+                    event_key: &format!(
+                        "observe:{}:{}",
+                        state.as_str(),
+                        pull.head_revision.as_deref().unwrap_or("unknown")
+                    ),
+                    payload_json: &pull.payload_json,
+                },
+                locale: language,
+                promotion: assessment.promotion(stored.head_revision.as_deref().unwrap_or("")),
+                state: assessment.state(),
+            })?;
         Ok(())
     }
 
-    fn promote_verified_publication(
+    fn assess_merged_publication(
         &self,
         repository_id: i64,
         language: &str,
         candidate_commit: &str,
-    ) -> Result<()> {
+    ) -> Result<MergeAssessment> {
         let snapshot =
-            self.database
+            self.store
                 .publication_snapshot(repository_id, language, candidate_commit)?;
         let files = snapshot
             .iter()
@@ -104,9 +139,9 @@ impl Orchestrator<'_> {
         let mut verified_zero_unit_contents = Vec::new();
         for file in &snapshot {
             let stored = self
-                .database
+                .store
                 .canonical_document_intent(file.content_version_id)?
-                .map(|identity| serde_json::from_str::<DocumentIdentity>(&identity))
+                .map(|identity| codec::decode_identity(&identity))
                 .transpose()?;
             let current = current_sources
                 .iter()
@@ -124,27 +159,15 @@ impl Orchestrator<'_> {
                 }),
                 _ => false,
             };
-            compatible &= self
-                .database
-                .canonical_compatible(file.content_version_id)?;
+            compatible &= self.store.canonical_compatible(file.content_version_id)?;
         }
-        if compatible {
-            self.database.promote_merged_publication(
-                repository_id,
-                language,
-                candidate_commit,
-                "github_merged",
-                &verified_zero_unit_contents,
-            )?;
+        Ok(if compatible {
+            MergeAssessment::Verified(verified_zero_unit_contents)
         } else if !snapshot.is_empty() {
-            self.database.transition_publication_manifest(
-                repository_id,
-                language,
-                candidate_commit,
-                PublicationState::Superseded,
-            )?;
-        }
-        Ok(())
+            MergeAssessment::Superseded
+        } else {
+            MergeAssessment::Unchanged
+        })
     }
 
     fn verify_publication_files(
@@ -204,13 +227,27 @@ impl Orchestrator<'_> {
         written: &[String],
         outcome: &mut LanguageOutcome,
     ) -> Result<()> {
+        if self.publish_next(repository_id, run_id, language, written, outcome)? {
+            while self.publish_next(repository_id, run_id, language, &[], outcome)? {}
+        }
+        Ok(())
+    }
+
+    fn publish_next(
+        &self,
+        repository_id: i64,
+        run_id: &str,
+        language: &str,
+        written: &[String],
+        outcome: &mut LanguageOutcome,
+    ) -> Result<bool> {
         if !self.repo.publish.enabled {
             outcome.published.skipped = "publication is disabled".into();
-            return Ok(());
+            return Ok(false);
         }
         let owner = format!("publish:{}:{run_id}", self.owner_identity);
         let entry = if written.is_empty() {
-            self.database.claim_publication_locale(
+            self.store.claim_publication_locale(
                 repository_id,
                 language,
                 &owner,
@@ -221,7 +258,7 @@ impl Orchestrator<'_> {
             let mut files = Vec::with_capacity(written.len());
             for path in written {
                 let canonical = self
-                    .database
+                    .store
                     .canonical_file(repository_id, language, path)?
                     .ok_or_else(|| anyhow!("missing canonical publication content for {path}"))?;
                 let content = String::from_utf8(canonical.content).with_context(|| {
@@ -229,9 +266,9 @@ impl Orchestrator<'_> {
                 })?;
                 files.push(PublicationRecord {
                     document_identity: self
-                        .database
+                        .store
                         .canonical_document_intent(canonical.content_version_id)?
-                        .map(|identity| serde_json::from_str(&identity))
+                        .map(|identity| codec::decode_identity(&identity))
                         .transpose()?,
                     canonical_content_version_id: canonical.content_version_id,
                     canonical_file_id: canonical.id,
@@ -240,7 +277,7 @@ impl Orchestrator<'_> {
                     path: path.clone(),
                 });
             }
-            let payload = serde_json::to_string(&PublicationPayload {
+            let payload = PublicationPayload {
                 commit: None,
                 expected_remote_tip: None,
                 files,
@@ -248,20 +285,20 @@ impl Orchestrator<'_> {
                 policy_fingerprint: prompts::policy_fingerprint(),
                 run_id: run_id.to_owned(),
                 source_revision: outcome.source_revision.clone(),
-            })?;
+                superseded_reason: None,
+            };
             let dedupe = format!(
                 "publish:{repository_id}:{language}:{}",
-                hash(&[payload.as_bytes()])
+                hash(&[codec::encode(&payload)?.as_bytes()])
             );
-            let dedupe = self.database.effect_key(OutboxKind::Publication, &dedupe)?;
-            self.database.enqueue_publication(
+            self.store.schedule_publication(PublicationIntentInput {
                 repository_id,
-                Some(run_id),
-                language,
-                &dedupe,
-                &payload,
-            )?;
-            self.database.claim_publication_locale(
+                run_id,
+                locale: language,
+                base_dedupe_key: &dedupe,
+                payload: &payload,
+            })?;
+            self.store.claim_publication_locale(
                 repository_id,
                 language,
                 &owner,
@@ -274,7 +311,7 @@ impl Orchestrator<'_> {
                 outcome.published.skipped =
                     "no file changed and no publication recovery is pending".into();
             }
-            return Ok(());
+            return Ok(false);
         };
         let outbox_started = Instant::now();
         tracing::info!(
@@ -284,9 +321,9 @@ impl Orchestrator<'_> {
             run_id = %crate::diagnostics::safe_id(run_id),
             locale = language,
         );
-        let mut payload: PublicationPayload = serde_json::from_str(&entry.payload_json)?;
+        let mut payload: PublicationPayload = codec::decode(&entry.payload_json)?;
         if payload.language != language {
-            self.database.retry_outbox(
+            self.store.retry_outbox(
                 OutboxKind::Publication,
                 entry.id,
                 &owner,
@@ -294,7 +331,7 @@ impl Orchestrator<'_> {
                 Utc::now().timestamp_millis(),
             )?;
             outcome.published.skipped = "another locale has pending publication recovery".into();
-            return Ok(());
+            return Ok(false);
         }
         let payload_source_revision = payload.source_revision.clone();
         let records = payload.files.clone();
@@ -319,7 +356,8 @@ impl Orchestrator<'_> {
                 content: record.content.as_bytes().to_vec(),
             });
         }
-        let mut compatible = payload.policy_fingerprint == prompts::policy_fingerprint();
+        let mut compatible = payload.superseded_reason.is_none()
+            && payload.policy_fingerprint == prompts::policy_fingerprint();
         let current_sources = self.git.discover(self.repo, &outcome.source_revision)?;
         for record in &records {
             let current = current_sources
@@ -337,7 +375,7 @@ impl Orchestrator<'_> {
             };
         }
         for ((record, binding), file) in records.iter().zip(&manifest_files).zip(&durable_files) {
-            compatible &= self.database.canonical_content_matches(
+            compatible &= self.store.canonical_content_matches(
                 repository_id,
                 language,
                 &payload_source_revision,
@@ -345,7 +383,7 @@ impl Orchestrator<'_> {
                 file,
             )?;
             compatible &= self
-                .database
+                .store
                 .canonical_compatible(record.canonical_content_version_id)?;
         }
         compatible &=
@@ -359,29 +397,22 @@ impl Orchestrator<'_> {
                 .is_empty();
         }
         if !compatible {
-            if let Some(commit) = payload.commit.as_deref() {
-                self.database.transition_publication_authorization(
-                    repository_id,
-                    language,
-                    commit,
-                    &entry.dedupe_key,
-                    PublicationState::Superseded,
-                )?;
-            }
-            let mut rejected = serde_json::to_value(&payload)?;
-            rejected["superseded_reason"] =
-                "document compatibility or current project checks failed".into();
-            self.database.update_outbox_payload(
-                OutboxKind::Publication,
-                entry.id,
-                &owner,
-                &rejected.to_string(),
-            )?;
-            self.database
-                .complete_outbox(OutboxKind::Publication, entry.id, &owner)?;
+            let rejected = codec::rejected(&payload);
+            self.store.settle_publication(PublicationSettlementInput {
+                repository_id,
+                locale: language,
+                candidate_commit: payload.commit.as_deref(),
+                authorization_key: &entry.dedupe_key,
+                outbox_id: entry.id,
+                owner: &owner,
+                payload: Some(&rejected),
+                state: Some(PublicationState::Superseded),
+                pull_request: None,
+                promotion: None,
+            })?;
             outcome.published.skipped =
                 "incompatible publication superseded; replan required".into();
-            return Ok(());
+            return Ok(false);
         }
         if written.is_empty()
             && outcome.documents.markdown_files
@@ -416,100 +447,98 @@ impl Orchestrator<'_> {
                 }
             }
         }
-        outcome.published = if let Some(commit) = payload.commit.as_deref() {
-            self.database.record_publication_authorization(
-                PublicationManifestInput {
-                    repository_id,
-                    run_id: &payload.run_id,
-                    locale: language,
-                    source_revision: &payload_source_revision,
-                    candidate_commit: commit,
-                    policy_fingerprint: &payload.policy_fingerprint,
-                    files: &manifest_files,
-                },
-                &entry.dedupe_key,
-            )?;
-            if self.repo.publish.push {
-                self.database.transition_publication_authorization(
-                    repository_id,
-                    language,
-                    commit,
-                    &entry.dedupe_key,
-                    PublicationState::PushPending,
-                )?;
-                let mut published = self.git.publish_pending(
-                    self.repo,
-                    language,
-                    commit,
-                    payload
-                        .expected_remote_tip
-                        .as_ref()
-                        .and_then(|tip| tip.as_deref()),
-                )?;
-                published.paths = records.iter().map(|record| record.path.clone()).collect();
-                published
-            } else {
-                crate::domain::model::Published {
-                    branch: self.git.branch(self.repo, language)?,
-                    commit: commit.to_owned(),
-                    paths: records.iter().map(|record| record.path.clone()).collect(),
-                    ..Default::default()
+        outcome.published = match preparation(&payload)? {
+            Preparation::Prepared {
+                commit,
+                expected_remote_tip,
+            } => {
+                self.store
+                    .persist_publication_candidate(PublicationCandidateInput {
+                        manifest: PublicationManifestInput {
+                            repository_id,
+                            run_id: &payload.run_id,
+                            locale: language,
+                            source_revision: &payload_source_revision,
+                            candidate_commit: commit,
+                            policy_fingerprint: &payload.policy_fingerprint,
+                            files: &manifest_files,
+                        },
+                        authorization_key: &entry.dedupe_key,
+                        outbox_id: entry.id,
+                        owner: &owner,
+                        payload: &payload,
+                        state: if self.repo.publish.push {
+                            PublicationState::PushPending
+                        } else {
+                            PublicationState::CommitCreated
+                        },
+                    })?;
+                if self.repo.publish.push {
+                    let mut published = self.git.publish_pending(
+                        self.repo,
+                        language,
+                        commit,
+                        expected_remote_tip,
+                    )?;
+                    published.paths = records.iter().map(|record| record.path.clone()).collect();
+                    published
+                } else {
+                    crate::domain::model::Published {
+                        branch: self.git.branch(self.repo, language)?,
+                        commit: commit.to_owned(),
+                        paths: records.iter().map(|record| record.path.clone()).collect(),
+                        ..Default::default()
+                    }
                 }
             }
-        } else {
-            let prepared_publication = self.git.prepare(
-                self.repo,
-                language,
-                &payload_source_revision,
-                &durable_files,
-            )?;
-            let mut prepared = prepared_publication.published;
-            let expected_remote_tip = prepared_publication.expected_remote_tip;
-            payload.commit = Some(prepared.commit.clone());
-            payload.expected_remote_tip = Some(expected_remote_tip.clone());
-            let durable_payload = serde_json::to_string(&payload)?;
-            if !self.database.update_outbox_payload(
-                OutboxKind::Publication,
-                entry.id,
-                &owner,
-                &durable_payload,
-            )? {
-                bail!("publication outbox ownership changed before commit persistence");
-            }
-            self.database.record_publication_authorization(
-                PublicationManifestInput {
-                    repository_id,
-                    run_id: &payload.run_id,
-                    locale: language,
-                    source_revision: &payload_source_revision,
-                    candidate_commit: &prepared.commit,
-                    policy_fingerprint: &payload.policy_fingerprint,
-                    files: &manifest_files,
-                },
-                &entry.dedupe_key,
-            )?;
-            (self.failpoint)("publication_candidate_persisted");
-            if self.repo.publish.push {
-                self.database.transition_publication_authorization(
-                    repository_id,
-                    language,
-                    &prepared.commit,
-                    &entry.dedupe_key,
-                    PublicationState::PushPending,
-                )?;
-                let pushed = self.git.publish_pending(
+            Preparation::Unprepared => {
+                let prepared_publication = self.git.prepare(
                     self.repo,
                     language,
-                    &prepared.commit,
-                    expected_remote_tip.as_deref(),
+                    &payload_source_revision,
+                    &durable_files,
                 )?;
-                prepared.pushed = pushed.pushed;
-                prepared.error = pushed.error;
+                let mut prepared = prepared_publication.published;
+                let expected_remote_tip = prepared_publication.expected_remote_tip;
+                payload.commit = Some(prepared.commit.clone());
+                payload.expected_remote_tip = Some(expected_remote_tip.clone());
+                self.store
+                    .persist_publication_candidate(PublicationCandidateInput {
+                        manifest: PublicationManifestInput {
+                            repository_id,
+                            run_id: &payload.run_id,
+                            locale: language,
+                            source_revision: &payload_source_revision,
+                            candidate_commit: &prepared.commit,
+                            policy_fingerprint: &payload.policy_fingerprint,
+                            files: &manifest_files,
+                        },
+                        authorization_key: &entry.dedupe_key,
+                        outbox_id: entry.id,
+                        owner: &owner,
+                        payload: &payload,
+                        state: if self.repo.publish.push {
+                            PublicationState::PushPending
+                        } else {
+                            PublicationState::CommitCreated
+                        },
+                    })?;
+                (self.failpoint)("publication_candidate_persisted");
+                if self.repo.publish.push {
+                    let pushed = self.git.publish_pending(
+                        self.repo,
+                        language,
+                        &prepared.commit,
+                        expected_remote_tip.as_deref(),
+                    )?;
+                    prepared.pushed = pushed.pushed;
+                    prepared.error = pushed.error;
+                }
+                prepared
             }
-            prepared
         };
         if !outcome.published.error.is_empty() {
-            self.database.retry_outbox(
+            self.store.retry_outbox(
                 OutboxKind::Publication,
                 entry.id,
                 &owner,
@@ -540,66 +569,71 @@ impl Orchestrator<'_> {
                 )?;
                 outcome.published.pr_number = Some(reconciled.pull_request.number);
                 outcome.published.pr_url = Some(reconciled.pull_request.url.clone());
-                let pr_state = if reconciled.pull_request.state.eq_ignore_ascii_case("merged") {
-                    "merged"
-                } else if reconciled.pull_request.state.eq_ignore_ascii_case("open")
-                    && reconciled.pull_request.draft
-                {
-                    "draft"
-                } else if reconciled.pull_request.state.eq_ignore_ascii_case("open") {
-                    "open"
+                let pr_state = PullRequestLifecycle::observed(
+                    &reconciled.pull_request.state,
+                    reconciled.pull_request.draft,
+                );
+                let assessment = if pr_state == PullRequestLifecycle::Merged {
+                    if reconciled.pull_request.head_revision.as_deref()
+                        != Some(outcome.published.commit.as_str())
+                    {
+                        bail!("merged pull request head does not match published candidate");
+                    }
+                    self.assess_merged_publication(
+                        repository_id,
+                        language,
+                        &outcome.published.commit,
+                    )?
                 } else {
-                    "closed"
+                    MergeAssessment::Unchanged
                 };
-                self.database.record_pr_state(PullRequestStateInput {
+                self.store.settle_publication(PublicationSettlementInput {
                     repository_id,
-                    provider: "github",
-                    external_id: &reconciled.pull_request.number.to_string(),
-                    number: Some(reconciled.pull_request.number as i64),
-                    branch: &branch,
-                    url: Some(&reconciled.pull_request.url),
-                    state: pr_state,
-                    head_revision: Some(&outcome.published.commit),
-                    event_key: &format!("ensure:{}", outcome.published.commit),
-                    payload_json: &reconciled.payload_json,
-                })?;
-                match pr_state {
-                    "merged" => {
-                        if reconciled.pull_request.head_revision.as_deref()
-                            != Some(outcome.published.commit.as_str())
-                        {
-                            bail!("merged pull request head does not match published candidate");
+                    locale: language,
+                    candidate_commit: Some(&outcome.published.commit),
+                    authorization_key: &entry.dedupe_key,
+                    outbox_id: entry.id,
+                    owner: &owner,
+                    payload: None,
+                    state: match pr_state {
+                        PullRequestLifecycle::Merged => assessment.state(),
+                        PullRequestLifecycle::Open | PullRequestLifecycle::Draft => {
+                            Some(PublicationState::PrOpen)
                         }
-                        self.promote_verified_publication(
-                            repository_id,
-                            language,
-                            &outcome.published.commit,
-                        )?;
-                    }
-                    "open" | "draft" => {
-                        self.database.transition_publication_authorization(
-                            repository_id,
-                            language,
-                            &outcome.published.commit,
-                            &entry.dedupe_key,
-                            PublicationState::PrOpen,
-                        )?;
-                    }
-                    _ => {
-                        self.database.transition_publication_authorization(
-                            repository_id,
-                            language,
-                            &outcome.published.commit,
-                            &entry.dedupe_key,
-                            PublicationState::Superseded,
-                        )?;
-                    }
-                }
+                        _ => Some(PublicationState::Superseded),
+                    },
+                    pull_request: Some(PullRequestStateInput {
+                        repository_id,
+                        provider: "github",
+                        external_id: &reconciled.pull_request.number.to_string(),
+                        number: Some(reconciled.pull_request.number as i64),
+                        branch: &branch,
+                        url: Some(&reconciled.pull_request.url),
+                        state: pr_state.as_str(),
+                        head_revision: Some(&outcome.published.commit),
+                        event_key: &format!("ensure:{}", outcome.published.commit),
+                        payload_json: &reconciled.payload_json,
+                    }),
+                    promotion: assessment.promotion(&outcome.published.commit),
+                })?;
+            } else {
+                self.store.settle_publication(PublicationSettlementInput {
+                    repository_id,
+                    locale: language,
+                    candidate_commit: Some(&outcome.published.commit),
+                    authorization_key: &entry.dedupe_key,
+                    outbox_id: entry.id,
+                    owner: &owner,
+                    payload: None,
+                    state: None,
+                    pull_request: None,
+                    promotion: None,
+                })?;
             }
             Ok(())
         })();
         if let Err(error) = reconcile {
-            self.database.retry_outbox(
+            self.store.retry_outbox(
                 OutboxKind::Publication,
                 entry.id,
                 &owner,
@@ -607,12 +641,6 @@ impl Orchestrator<'_> {
                 Utc::now().timestamp_millis() + 5_000,
             )?;
             return Err(error);
-        }
-        if !self
-            .database
-            .complete_outbox(OutboxKind::Publication, entry.id, &owner)?
-        {
-            bail!("publication outbox lease was lost before completion");
         }
         tracing::info!(
             event = "outbox.completed",
@@ -625,6 +653,6 @@ impl Orchestrator<'_> {
             pushed = outcome.published.pushed,
             duration_ms = outbox_started.elapsed().as_millis() as u64,
         );
-        self.publish(repository_id, run_id, language, &[], outcome)
+        Ok(true)
     }
 }

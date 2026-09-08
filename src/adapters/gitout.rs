@@ -5,6 +5,7 @@ use crate::adapters::process::{
 use crate::application::ports::{GitPublisher, PreparedPublication, PublicationFile};
 use crate::application::settings::RepoConfig;
 use crate::domain::model::Published;
+use crate::domain::model::SourceDocument;
 use anyhow::{Context, Result, anyhow, bail};
 use nix::unistd::{Pid, setpgid};
 use serde::{Deserialize, Serialize};
@@ -649,5 +650,15 @@ impl GitPublisher for NativeGitPublisher {
         expected_remote_tip: Option<&str>,
     ) -> Result<Published> {
         publish_pending_with_expected(repo, language, commit, expected_remote_tip)
+    }
+}
+
+impl crate::application::ports::SourceReader for NativeGitPublisher {
+    fn resolve_source_revision(&self, repo: &RepoConfig) -> Result<String> {
+        <Self as GitPublisher>::resolve_source_revision(self, repo)
+    }
+
+    fn discover(&self, repo: &RepoConfig, source_revision: &str) -> Result<Vec<SourceDocument>> {
+        <Self as GitPublisher>::discover(self, repo, source_revision)
     }
 }

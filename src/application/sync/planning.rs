@@ -1,9 +1,23 @@
 //! Read-only source, reuse, and target decisions shared by preview and execution.
-use super::*;
+use crate::application::contracts::DocumentIdentity;
 use crate::application::ports::{CanonicalFile, TranslationCandidate};
+use crate::application::ports::{PlanningStore, SourceReader, TargetReader};
+use crate::application::settings::RepoConfig;
+use crate::application::sync::context::{
+    compatible_review_request, content_hash, count_formats, document_identity, finding, hash,
+    previous_units, reusable_candidate, stable_unit_hints, stable_unit_id,
+};
+use crate::domain::document::{
+    ParsedDocument, TranslatableUnit, UnitTranslation, assemble_document, validate_provenance,
+};
+use crate::domain::matching::{MatchKind, match_units_with_stable_ids};
 use crate::domain::model::SourceDocument;
+use crate::domain::model::{DecisionCode, DocumentStatistics, Finding, PlanSummary};
+use crate::domain::prompts;
+use anyhow::Result;
+use serde_json::json;
 
-pub(super) struct UnitPlan {
+pub(crate) struct UnitPlan {
     pub unit: TranslatableUnit,
     pub stable_id: String,
     pub candidate: Option<TranslationCandidate>,
@@ -11,7 +25,7 @@ pub(super) struct UnitPlan {
     pub previous_translation: Option<String>,
 }
 
-pub(super) struct DocumentPlan {
+pub(crate) struct DocumentPlan {
     pub parsed: ParsedDocument,
     pub identity: DocumentIdentity,
     pub units: Vec<UnitPlan>,
@@ -20,7 +34,96 @@ pub(super) struct DocumentPlan {
     pub assembled: Option<String>,
 }
 
-impl Orchestrator<'_> {
+pub struct Planner<'a> {
+    pub repo: &'a RepoConfig,
+    pub database: &'a dyn PlanningStore,
+    pub materializer: &'a dyn TargetReader,
+    pub git: &'a dyn SourceReader,
+    pub agent_fingerprint: Option<String>,
+}
+
+impl Planner<'_> {
+    pub(crate) fn invocation_key(
+        &self,
+        repository_id: i64,
+        language: &str,
+        revision: &str,
+    ) -> Result<String> {
+        let configuration = json!({
+            "sources": self.repo.sources,
+            "include": self.repo.include,
+            "exclude": self.repo.exclude,
+            "target_pattern": self.repo.target_pattern,
+            "checks": self.repo.documentation.commands,
+            "check_timeout": self.repo.documentation.timeout_s,
+            "revision": self.repo.quality.revision,
+            "proofread": self.repo.quality.proofread,
+            "agent": self.agent_fingerprint,
+        });
+        Ok(format!(
+            "sync:{repository_id}:{language}:{revision}:{}:{}",
+            prompts::policy_fingerprint(),
+            content_hash(configuration.to_string().as_bytes())
+        ))
+    }
+
+    pub fn plan_language(&self, language: &str) -> Result<PlanSummary> {
+        let source_revision = self.git.resolve_source_revision(self.repo)?;
+        let key = self
+            .repo
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| self.repo.path.clone());
+        let repository_id = self
+            .database
+            .repository_id(&hash(&[key.to_string_lossy().as_bytes()]))?;
+        let invocation =
+            self.invocation_key(repository_id.unwrap_or(0), language, &source_revision)?;
+        let documents = self.git.discover(self.repo, &source_revision)?;
+        let mut pending = 0;
+        let mut reused = 0;
+        let mut conflicts = Vec::new();
+        let mut document_statistics = DocumentStatistics::default();
+        count_formats(&mut document_statistics, &documents);
+        for document in &documents {
+            let Some(plan) = self.inspect_document(
+                repository_id,
+                language,
+                &invocation,
+                document,
+                &mut document_statistics,
+                &mut conflicts,
+            )?
+            else {
+                continue;
+            };
+            reused += plan
+                .units
+                .iter()
+                .filter(|unit| unit.candidate.is_some())
+                .count();
+            pending += plan
+                .units
+                .iter()
+                .filter(|unit| unit.candidate.is_none())
+                .count();
+            if plan.assembled.is_some() {
+                document_statistics.verified_documents += 1;
+            }
+        }
+        Ok(PlanSummary {
+            document_statistics,
+            repository: self.repo.path.clone(),
+            language: language.into(),
+            source_revision,
+            documents: documents.len(),
+            pending_units: pending.min(self.repo.max_tasks),
+            reused_units: reused,
+            conflicts: conflicts.len(),
+            deferred_units: pending.saturating_sub(self.repo.max_tasks),
+        })
+    }
+
     fn reviews_compatible(
         &self,
         path: &str,
@@ -54,7 +157,7 @@ impl Orchestrator<'_> {
         Ok(true)
     }
 
-    pub(super) fn inspect_document(
+    pub(crate) fn inspect_document(
         &self,
         repository_id: Option<i64>,
         language: &str,

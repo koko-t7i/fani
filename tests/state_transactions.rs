@@ -1,6 +1,4 @@
-use fani::application::ports::{
-    CanonicalStore, DocumentStore, EffectStore, MaterializationIntentInput, OutboxKind,
-};
+use fani::application::ports::{MaterializationIntentInput, OutboxKind};
 use fani::domain::{
     model::{
         Freshness, MemoryTier, PublicationState, ReviewState, TranslationProvenance,

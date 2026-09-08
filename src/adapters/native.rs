@@ -12,7 +12,9 @@ use crate::application::command::{
     CommandOperations, CommandOutput, InitRequest, OutputReporter, REASONING_EFFORTS,
     ReconcileMode, Selection, SyncRequest,
 };
+use crate::application::ports::{AgentExecutor, StateStore};
 use crate::application::settings::RepoConfig;
+use crate::application::sync::planning::Planner;
 use crate::application::sync::{Orchestrator, adopt_human_edit, discard_human_edit};
 use crate::domain::model::{LanguageOutcome, Status};
 use anyhow::{Result, anyhow};
@@ -214,27 +216,17 @@ fn status(args: Selection, output: &dyn OutputReporter) -> Result<CommandOutput>
         let database = Database::open(&snapshot_path)?;
         let materializer = FilesystemMaterializer;
         let agents = RoutedAgentExecutor::new(&config);
-        let documentation = NativeDocumentationChecker;
         let git = NativeGitPublisher;
-        let code_host = GithubCodeHost;
-        let owner_identity = owner_identity()?;
-        let orchestrator = Orchestrator::new(
+        let planner = Planner {
             repo,
-            &database,
-            &materializer,
-            &agents,
-            &documentation,
-            &git,
-            &code_host,
-            &args.config,
-            &owner_identity,
-            crate::adapters::failpoint::reach,
-            output,
-            true,
-        );
+            database: database.planning(),
+            materializer: &materializer,
+            git: &git,
+            agent_fingerprint: agents.configuration_fingerprint()?,
+        };
         for language in languages(repo, args.language.as_deref())? {
             let started = std::time::Instant::now();
-            let plan = orchestrator.plan_language(&language)?;
+            let plan = planner.plan_language(&language)?;
             let status = if plan.conflicts > 0 {
                 Status::NeedsHuman
             } else if plan.deferred_units > 0 {
@@ -344,6 +336,8 @@ fn sync(args: SyncRequest, output: &dyn OutputReporter) -> Result<CommandOutput>
                 crate::adapters::failpoint::reach,
                 output,
                 args.quiet,
+                &git,
+                &materializer,
             );
             for language in &selected_languages {
                 repository_outcomes.push(orchestrator.run_language(language));
@@ -575,15 +569,20 @@ fn reconcile(
             count += match mode {
                 ReconcileMode::Adopt => adopt_human_edit(
                     repo,
-                    &database,
+                    database.reconciliation(),
+                    database.verification(),
                     &materializer,
                     &git,
                     &NativeDocumentationChecker,
                     &language,
                 )?,
-                ReconcileMode::Discard => {
-                    discard_human_edit(repo, &database, &materializer, &git, &language)?
-                }
+                ReconcileMode::Discard => discard_human_edit(
+                    repo,
+                    database.reconciliation(),
+                    &materializer,
+                    &git,
+                    &language,
+                )?,
             };
         }
         lock.release()?;
