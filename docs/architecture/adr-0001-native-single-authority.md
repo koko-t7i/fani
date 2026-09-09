@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-08-30
 - **Decision owners:** fani maintainers
-- **Supersedes:** the experimental external-skill/Python compatibility architecture documented in [`compatibility-baseline.md`](compatibility-baseline.md) and [`rust-sqlite-rewrite.md`](rust-sqlite-rewrite.md)
+- **Supersedes:** the unreleased external-skill/Python compatibility architecture
 
 ## Context
 
@@ -46,7 +46,7 @@ Numbered SQL migrations and versioned prompts are embedded into the binary. Expe
 ### Costs and constraints
 
 - Existing experimental state must be discarded through the explicit reset path.
-- The initial product remains Linux-first, Markdown/CommonMark/GFM-only, GitHub-only, and CLI-only.
+- The product remains Linux-first, GitHub-only, and CLI-only. Markdown is native; explicit JSON message resources are added under the separate constraints in [`ADR-0002`](adr-0002-json-resources.md).
 - Schema migrations and prompt resources are append-only/versioned release inputs and must be reviewed like code.
 - SQLite remains deployment-local authority; hosted persistence requires a separately protected state-ref protocol rather than a cache.
 
@@ -56,6 +56,7 @@ Numbered SQL migrations and versioned prompts are embedded into the binary. Expe
 - **Import old JSON/JSONL or experimental SQLite state:** rejected because fani was unreleased and migration would encode unstable semantics.
 - **Let the Agent edit the repository:** rejected because model output cannot be trusted with paths, state, or publication decisions.
 - **Create a multi-crate workspace or general plugin runtime now:** rejected because no independently versioned artifact or second production frontend exists.
+- **Adopt an async runtime by default:** rejected because fani's bounded provider, process, Git, and SQLite workloads do not justify another runtime layer; explicit concurrency and timeouts remain easier to audit.
 - **Use mutable worktree content as the source plan:** rejected because source identity and publication would be race-prone.
 
 ## Enforcement

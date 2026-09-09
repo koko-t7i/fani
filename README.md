@@ -16,7 +16,7 @@ The shipped binary is fully native Rust. Running fani does not require Node, Pyt
 
 ## Install
 
-For Intel/AMD 64-bit Linux with glibc 2.31 or newer:
+For prebuilt Intel/AMD 64-bit GNU/Linux releases:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -73,7 +73,7 @@ fani sync
 | Command | Purpose |
 | --- | --- |
 | `fani init` | Create a conservative starter configuration for one built-in provider. |
-| `fani doctor` | Validate configuration, repositories, provider credentials or custom commands, SQLite, and optional GitHub prerequisites. |
+| `fani doctor` | Validate configuration, repository directories, required executables, provider credentials, SQLite, and the presence of `gh` when GitHub publication is enabled. It may create or migrate `fani.db`; it does not verify Git revisions, `gh` authentication, or remote permissions. |
 | `fani status` | Plan from the fixed source revision without model calls. |
 | `fani check` | Run the same read-only planning path with a CI-oriented name. |
 | `fani sync` | Resume or perform translation, verification, materialization, and optional publication. |
@@ -120,7 +120,7 @@ Important rules:
 
 - `publish.source_ref` selects the fixed source revision for planning and synchronization even when publication is disabled;
 - exclude generated translation directories so they are not translated recursively;
-- keep `{lang}` and `{relpath}` in `target_pattern`—for example, `i18n/{lang}/{relpath}` maps `docs/start.md` to `i18n/zh-CN/docs/start.md`;
+- legacy repo-level `target_pattern` must contain both `{lang}` and `{relpath}`; an explicit source set always requires `{lang}`, but one exact non-glob filename may omit `{relpath}`—for example, `README.md` can map to `readme/{lang}.md`;
 - configure documentation checks as argv arrays, not shell strings;
 - begin with low `max_tasks`, `concurrency = 1`, revision disabled, and publication disabled;
 - use one stable publication branch per language when publication is enabled.
@@ -146,5 +146,4 @@ They include safe identifiers, durations, statuses, and provider/publication met
 - [Release process and asset contract](docs/release.md) — installation verification, release assets, reproducibility, and maintainer gates.
 - [Native architecture contract](docs/architecture/native-i18n.md) — active behavior and authority boundaries.
 - [ADR-0001](docs/architecture/adr-0001-native-single-authority.md) — why fani uses native Rust and one SQLite authority.
-
-Historical design documents are labeled as superseded in the [documentation map](docs/README.md#historical-records) and are not usage guides.
+- [ADR-0002](docs/architecture/adr-0002-json-resources.md) — why JSON resources use explicit dialects and byte-span verification.

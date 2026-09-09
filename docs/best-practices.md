@@ -170,7 +170,7 @@ fani sync --report-dir ./reports
 Operational rules:
 
 - Fetch the configured source ref before planning; fani intentionally resolves the local Git view of that ref.
-- Read `report.md` after every nonzero exit and retain `report.json` when automation needs structured results.
+- After a nonzero `sync` exit, read stderr first. If this run produced `report.md` and `report.json`, use them for per-language details; early configuration, selection, or report-write failures may produce no new report, so do not mistake an older report for the current result.
 - Re-run `fani sync` after exit 3. Completed attempts and canonical state are durable, so the next run resumes instead of starting over.
 - Treat exit 1 as a decision queue, not an infrastructure incident.
 - Treat exit 2 as an operational failure that should alert and stop publication automation.
@@ -233,13 +233,13 @@ A timer is not a substitute for alerting. Monitor exit 2 and repeated exit 1 res
 
 ## CI and trusted automation
 
-Use `fani check` in ordinary pull-request CI when you need deterministic planning without model calls. Configuration validation still requires the configured provider credential variable to be present, so supply a non-secret placeholder only for this read-only command:
+Use `fani check` in ordinary pull-request CI when you need deterministic planning without model calls:
 
 ```bash
-ANTHROPIC_API_KEY=check-only-placeholder fani check --config ./fani.toml
+fani check --config ./fani.toml
 ```
 
-Use the variable matching the configured official provider. This placeholder is safe only because `check` never contacts the provider; never reuse this pattern with `sync`.
+Like `status`, `check` does not contact the provider and does not require provider credentials. Do not inject real or placeholder provider keys into untrusted pull-request jobs. `doctor` checks configured credentials, and `sync` uses them.
 
 Keep model-backed `fani sync` out of workflows triggered by untrusted pull requests. Such workflows can expose secrets, spend provider quota, publish attacker-controlled branches, or run repository-defined documentation commands with trusted credentials.
 
@@ -273,8 +273,8 @@ Treat `fani-state` as protected application state rather than a cache. Restrict 
 
 When a run fails, diagnose in this order:
 
-1. `fani doctor` for configuration, credentials, Git, SQLite, custom Agent, and GitHub prerequisites.
-2. `fani status` for the resolved source revision and deterministic planning conflicts.
+1. `fani doctor` for configuration, repository directories, required executables, credentials, SQLite, custom Agents, and whether `gh` is installed. It may create or migrate `fani.db`; it does not verify `gh` authentication or remote permissions.
+2. `fani status` for the resolved source revision, source discovery, target mappings, and deterministic planning conflicts.
 3. `report.md` and `report.json` for the stage and decision code.
 4. `FANI_LOG=info` for redacted operational diagnostics.
 5. Git remote and `gh auth status` for publication-only failures.

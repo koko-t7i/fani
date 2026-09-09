@@ -186,11 +186,12 @@ fn adapters_do_not_depend_on_cli() {
 }
 
 #[test]
-fn accepted_decision_supersedes_compatibility_documents() {
+fn accepted_decision_replaces_compatibility_documents() {
     assert_contains_all(
         "docs/architecture/adr-0001-native-single-authority.md",
         &[
             "**Status:** Accepted",
+            "**Supersedes:** the unreleased external-skill/Python compatibility architecture",
             "One fani-identified SQLite database is the sole fani-owned authority",
             "StateStore",
             "AgentExecutor",
@@ -200,17 +201,13 @@ fn accepted_decision_supersedes_compatibility_documents() {
             "No runtime path imports old JSON/JSONL state",
         ],
     );
-    for historical in [
+    for removed in [
         "docs/architecture/compatibility-baseline.md",
         "docs/architecture/rust-sqlite-rewrite.md",
     ] {
-        assert_contains_all(
-            historical,
-            &[
-                "superseded",
-                "historical context",
-                "adr-0001-native-single-authority.md",
-            ],
+        assert!(
+            !Path::new(removed).exists(),
+            "{removed} must remain removed"
         );
     }
     assert_contains_all(
