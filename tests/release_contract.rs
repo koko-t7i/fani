@@ -185,7 +185,7 @@ fn cargo_dist_is_linux_gnu_only_and_pins_release_inputs() {
 #[test]
 fn readme_uses_a_human_facing_prebuilt_install_path() {
     let readme = fs::read_to_string(root().join("README.md")).unwrap();
-    assert!(readme.contains("For Intel/AMD 64-bit Linux with glibc 2.31 or newer:"));
+    assert!(readme.contains("For prebuilt Intel/AMD 64-bit GNU/Linux releases:"));
     assert!(
         readme.contains(
             "https://github.com/koko-t7i/fani/releases/latest/download/fani-installer.sh"

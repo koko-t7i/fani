@@ -2,7 +2,7 @@
 
 [English](../../README.md)
 
-fani 是一款 Linux 优先的命令行工具，用于持续翻译 Markdown 文档。它从固定的 Git 提交中读取源文件，复用 SQLite 中可信的翻译，仅将未解决的单元发送给内置模型提供商或严格的自定义 Agent，验证翻译结果，并可为每种语言发布一个稳定分支和一个 GitHub 拉取请求。
+fani 是一款 Linux 优先的命令行工具，用于持续翻译 Markdown 文档和显式配置的 JSON 消息资源。它从固定的 Git 提交中读取源文件，复用 SQLite 中可信的翻译，仅将未解决的单元发送给内置模型提供商或严格的自定义 Agent，验证翻译结果，并可为每种语言发布一个稳定分支和一个 GitHub 拉取请求。
 
 发布的二进制文件完全由原生 Rust 编写。运行 fani 不需要 Python、`uv`、外部 i18n 技能或提供商适配器脚本。
 
@@ -16,14 +16,14 @@ fani 是一款 Linux 优先的命令行工具，用于持续翻译 Markdown 文�
 
 ## 安装
 
-对于使用 glibc 2.31 或更高版本的 Intel/AMD 64 位 Linux：
+预构建版本面向 Intel/AMD 64 位 GNU/Linux：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/koko-t7i/fani/releases/latest/download/fani-installer.sh | sh
 ```
 
-无需安装 Rust 工具链。有关经过验证的下载或源码安装，请参阅[发布与安装](docs/release.md)。
+无需安装 Rust 工具链。有关经过验证的下载或源码安装，请参阅[发布与安装（英文）](../../docs/release.md)。
 
 ## 五分钟启动法
 
@@ -58,7 +58,7 @@ fani sync
 
 OpenAI 和 OpenAI 兼容的原生 Agent 可以选择在 `[agents.<name>]` 下设置 `reasoning_effort = "medium"`，也可以使用 `fani init --provider openai --reasoning-effort medium`。可接受的值为 `none`、`minimal`、`low`、`medium`、`high` 和 `xhigh`；所选提供商和模型必须支持该值。未配置时，fani 不会在请求中发送 `reasoning_effort`。对于其他提供商或子进程适配器，`fani doctor` 会拒绝此选项。
 
-有关这两种方式，请参阅[最佳实践](docs/best-practices.md#提供商和凭据)和[带注释的配置](../../examples/fani.toml)。
+有关这两种方式，请参阅[最佳实践（英文）](../../docs/best-practices.md#providers-and-credentials)和[带注释的配置](../../examples/fani.toml)。
 
 ## 核心工作流程
 
@@ -71,7 +71,7 @@ fani sync
 |命令|目的|
 | --- | --- |
 | `fani init` |为一个内置提供商创建一套保守的初始配置。|
-| `fani doctor` |验证配置、代码仓库、提供商凭据或自定义命令、SQLite，以及可选的 GitHub 先决条件。|
+| `fani doctor` | 验证配置、仓库目录、所需程序、提供商凭据和 SQLite；启用 GitHub 发布时检查是否安装 `gh`。它可能创建或迁移 `fani.db`，但不验证 Git 修订、`gh` 登录或远程权限。 |
 | `fani status` |无需调用模型，根据固定的源修订进行规划。|
 | `fani check` |使用面向 CI 的名称运行相同的只读规划路径。|
 | `fani sync` |恢复或执行翻译、验证、具体化以及可选的发布。|
@@ -116,12 +116,12 @@ fani adopt --repo PATH_OR_BASENAME --lang zh-CN
 
 - `publish.source_ref` 选择用于规划和同步的固定源修订版本，即使发布功能已禁用；
 - 排除生成的翻译目录，以免对其进行递归翻译；
-- 在 `target_pattern` 中保留 `{lang}` 和 `{relpath}`——例如，`i18n/{lang}/{relpath}` 会将 `docs/start.md` 映射到 `i18n/zh-CN/docs/start.md`；
+- 仓库级 `target_pattern` 必须同时包含 `{lang}` 和 `{relpath}`；显式 source set 始终需要 `{lang}`，但单个精确文件可省略 `{relpath}`；
 - 将文档检查配置为 argv 数组，而不是 shell 字符串；
 - 从较低的 `max_tasks`、`concurrency = 1`、禁用修订和禁用发布开始；
 - 启用发布时，每种语言使用一个稳定的发布分支。
 
-分阶段发布和运维指南请参阅[最佳实践](docs/best-practices.md)。
+分阶段发布和运维指南请参阅[最佳实践（英文）](../../docs/best-practices.md)。
 
 ## 诊断
 
@@ -136,11 +136,12 @@ FANI_LOG=info FANI_LOG_FORMAT=json fani sync --quiet
 
 ## 文档
 
-- [文档导航](docs/README.md) — 说明应使用哪些文档以及哪些契约是最新的。
-- [最佳实践](docs/best-practices.md) — 提供商、凭据、仓库布局、日常操作、人工编辑、发布、调度和 CI。
-- [带注释的配置](../../examples/fani.toml) — 完整的配置字段和示例。
-- [发布流程与资产约定](docs/release.md) — 安装验证、发布资产、可复现性及维护者审核关卡。
-- [原生架构契约](docs/architecture/native-i18n.md) — 有效行为和权限边界。
-- [ADR-0001](docs/architecture/adr-0001-native-single-authority.md) — fani 为何使用原生 Rust 和单一 SQLite 权威源。
+详细文档以英文版本为准，避免并行维护的译文落后于代码：
 
-历史设计文档在[文档索引](docs/README.md#历史记录)中被标记为已取代，不作为使用指南。
+- [文档导航](../../docs/README.md)
+- [最佳实践](../../docs/best-practices.md)
+- [带注释的配置](../../examples/fani.toml)
+- [发布流程与资产约定](../../docs/release.md)
+- [原生架构契约](../../docs/architecture/native-i18n.md)
+- [ADR-0001：原生 Rust 与单一 SQLite 权威源](../../docs/architecture/adr-0001-native-single-authority.md)
+- [ADR-0002：JSON 资源与字节区间验证](../../docs/architecture/adr-0002-json-resources.md)

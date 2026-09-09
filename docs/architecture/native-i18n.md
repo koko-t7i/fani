@@ -176,4 +176,4 @@ SQLite is divided into schema, document queries, preparation, attempts, leases, 
 
 Filesystem, Git, model, and GitHub calls remain outside database transactions. Durable outboxes bridge those effects. Discard records the originally observed target hash and uses compare-and-swap on recovery, preventing an interrupted discard from overwriting a subsequent human edit. Adoption checks the candidate set first and commits each document atomically; repository-wide atomic adoption is not claimed.
 
-See [service-boundary acceptance](2026-09-08-service-boundaries.md) for the refactor's verification record. No database migration, configuration change, or Agent-protocol change accompanies these boundaries.
+Low-level database entrypoints used by integration fixtures remain adapter details. Historical linkless adoption receipts and legacy null publication fields remain readable, while contradictory concrete receipts are rejected. These service boundaries require no database migration, configuration change, or Agent-protocol change.

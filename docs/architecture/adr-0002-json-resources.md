@@ -1,6 +1,6 @@
 # ADR-0002: Explicit JSON resources with byte-span verification
 
-**Status:** Implemented; independent PR3A review required.
+**Status:** Accepted and implemented.
 
 ## Decision
 

@@ -1,29 +1,21 @@
 # Documentation map
 
-Use this page to choose the right fani document. The root [`README.md`](../README.md) is the installation and first-run path; it intentionally does not duplicate every configuration, operations, architecture, or release detail.
+The root [`README.md`](../README.md) covers installation, first run, commands, exit codes, and the safety model. Use the focused documents below for details instead of treating every file as a setup guide.
 
-## User guides
+## User and operator guides
 
-- [`README.md`](../README.md): product overview, installation, five-minute start, core commands, exit codes, and safety summary.
-- [`best-practices.md`](best-practices.md): staged rollout, provider and credential handling, repository layout, daily operation, human edits, publication, scheduling, and CI.
-- [`examples/fani.toml`](../examples/fani.toml): complete annotated configuration reference. Copy and adapt it after the starter configuration is working.
+- [`best-practices.md`](best-practices.md): rollout, credentials, repository layout, daily operation, publication, scheduling, and CI.
+- [`examples/fani.toml`](../examples/fani.toml): complete annotated configuration reference.
 - [`systemd/`](../systemd/): user service and timer templates for unattended synchronization.
 
-## Maintainer guides
+## Maintainer guide
 
-- [`release.md`](release.md): release archive contract, verification and installation, reproducibility scope, and pre-tag checks.
-- [`research/2026-rust-cli-stack.md`](research/2026-rust-cli-stack.md): recorded technology research supporting the native implementation.
+- [`release.md`](release.md): release assets, installation verification, reproducibility, and pre-release checks.
 
-## Active architecture
+## Architecture
 
-- [`architecture/adr-0001-native-single-authority.md`](architecture/adr-0001-native-single-authority.md): accepted decision for the native Rust engine and one SQLite authority.
-- [`architecture/native-i18n.md`](architecture/native-i18n.md): current fani 0.3 product and implementation contract.
+- [`architecture/native-i18n.md`](architecture/native-i18n.md): current product and implementation contract.
+- [`architecture/adr-0001-native-single-authority.md`](architecture/adr-0001-native-single-authority.md): native Rust and one SQLite authority.
+- [`architecture/adr-0002-json-resources.md`](architecture/adr-0002-json-resources.md): explicit JSON dialects and byte-span verification.
 
-When a user guide and an architecture document differ in level of detail, the architecture contract defines system behavior while the user guide defines the recommended operating path.
-
-## Historical records
-
-The following documents describe superseded pre-release designs. They are retained for decision history and must not be used as setup or compatibility instructions:
-
-- [`architecture/compatibility-baseline.md`](architecture/compatibility-baseline.md)
-- [`architecture/rust-sqlite-rewrite.md`](architecture/rust-sqlite-rewrite.md)
+Architecture decision records explain why a boundary exists; `native-i18n.md` defines current behavior. Pull requests and Git history retain completed implementation plans and validation records.
